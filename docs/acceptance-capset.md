@@ -5,6 +5,11 @@ Date: 2026-10-05 UTC. Acceptance bead: `mc-h4zx.11`; rig:
 beads, and completion mail. It does **not** satisfy the epic's acceptance gate.
 The acceptance bead remains open; successors must not be dispatched.
 
+Latest diagnosis: the instrumented rerun below exited with **SIGBUS (7)**
+inside SQLite `get_state`; the OOM-kill counter remained **3 → 3**.
+This rerun does not support the OOM hypothesis. The underlying SIGBUS cause
+and the original uninstrumented death remain unresolved.
+
 ## Run and outcome
 
 The pack was imported beside gasvillage in the math-experiments rig after
@@ -208,3 +213,176 @@ or math-experiments commit was made. `kurt` received the blocker, corrected
 diagnosis, and final acceptance summary. Keep `mc-h4zx.11` open until an
 unattended improving run and fresh-session measurements pass; do not advance
 the close-out or review beads on the strength of these offline tests.
+
+## Instrumented rerun: SIGBUS in SQLite, no OOM counter increase
+
+Kurt requested one instrumented rerun in the bead's 23:30/23:33 UTC notes.
+Local pack commit `dc8778c` adds flushed UTC lifecycle events, logged
+SIGTERM/SIGHUP/SIGINT handlers that request normal shutdown, and Python
+faulthandler fatal-signal traces. A small detached observer waits for the
+engine and records its exact exit code/signal in `engine-exit.json`, including
+SIGKILL. The observer owns no evaluator workers or database connection.
+Fatal traces and exit evidence require the relevant processes to survive long
+enough to write; they cannot by themselves establish an OOM cause.
+
+The unchanged-parameter launch was:
+
+```sh
+gc sling math-experiments/codex funsearch-run --formula \
+  --var problem=/home/jjgarzella/Developer/ai/city/math-city/packs/funsearch/examples/cap-set \
+  --var instance=n=6 --var notify=kurt \
+  --var 'overrides=stop.duration_s=3600 stop.max_children=100 search.mutators=3'
+```
+
+Workflow `mx-jms`, start step `mx-n51`, launched run
+`20261005-234002-641c` using pack `dc8778c`. Its run bead is `mx-0da`;
+slots are `mx-0da.1`, `.2`, and `.3`. `run.json` confirms N=1,
+`search.workers=2`, and `evaluator.memory_mb=4096`. The actual worker count
+key is `search.workers`, not `evaluator.workers`; the daemon creates separate
+submit and try pools, so this means four evaluator workers. The seed preflight
+again returned OK 64, signature `[16,32,64]`.
+
+Before dispatch, `/tmp/fs-mc-h4zx.11-instrument-baseline.log` recorded
+`oom_kill=3` at 23:37:15 UTC. One detached shell sampler attached to the new
+run directory and appended UTC time, cgroup memory events, `free -m`, the ten
+largest RSS processes, and engine PID/liveness to `mem.log` every 15 seconds.
+It stopped after crash cleanup produced `summary.json`. A separate single
+120-second shell monitor waited for that summary, with a 100-minute deadline
+and status output every ten minutes; it completed normally after cleanup.
+
+Engine PID 66099 started at 23:40:06 UTC, with observer parent 66098, and
+reported its worker pools ready at 23:40:11. It died at
+**23:43:39.513216 UTC**, 213.293 seconds after the persisted run start.
+The observer's durable record is:
+
+```json
+{
+  "pid": 66099,
+  "ended_at": 1791243819.513216,
+  "exitcode": -7,
+  "signal": 7
+}
+```
+
+The corresponding `engine.log` contains:
+
+```text
+Fatal Python error: Bus error
+Current thread ... (most recent call first):
+  File ".../engine/funsearch/db.py", line 318 in get_state
+  File ".../engine/funsearch/daemon.py", line 166 in serve
+  File ".../engine/funsearch/daemon.py", line 331 in daemonize
+  File ".../engine/funsearch/cli.py", line 128 in start_run
+2026-10-05T23:43:39Z pid=66098 engine pid=66099 exited exitcode=-7 signal=7
+```
+
+`get_state` was executing `SELECT value FROM state WHERE key=?`. The other
+reported Python thread was idle in `concurrent.futures.thread._worker`.
+No caught TERM/HUP/INT event precedes the failure.
+
+The sampler excerpt bracketing the death is summarized below; memory columns
+are the MiB values printed by `free -m`. `mem.log` retains the full process
+lists and cgroup counters.
+
+| UTC sample | oom_kill | RAM used | RAM available | Swap used | Engine alive |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 23:43:01 | 3 | 10,936 | 5,035 | 1,023 | yes |
+| 23:43:16 | 3 | 11,125 | 4,846 | 1,023 | yes |
+| 23:43:31 | 3 | 11,387 | 4,584 | 1,023 | yes |
+| 23:43:46 | 3 | 10,492 | 5,479 | 1,023 | no |
+
+Relevant literal lines from those two `mem.log` samples (intervening memory
+and process lines omitted):
+
+```text
+2026-10-05T23:43:31Z
+oom_kill 3
+engine_pid=66099 alive=yes
+2026-10-05T23:43:46Z
+oom_kill 3
+engine_pid=66099 alive=no
+```
+
+All samples kept `oom_kill=3`: **delta 0**. Thus this observed engine death
+was SIGBUS, not an OOM-killer SIGKILL. This evidence does not retrospectively
+identify the original run's uninstrumented death. The requested reduced-worker
+retry was conditional on an increased OOM-kill counter, so it was not run.
+
+The run database enables SQLite WAL. `findmnt -T <run_dir>` reports the
+`fakeowner` mount at `/home/jjgarzella/Developer/ai`, backed by
+`/run/host_mark/Users[/jjgarzella/Developer/ai]`. There was 385 GB disk space
+available and `/dev/shm` used only 8 KiB of 64 MiB. A WAL shared-memory mapping
+or host-filesystem problem is a plausible investigation target given the
+SQLite stack, **not a demonstrated root cause**. No database placement or
+journaling changes were made during this diagnosis.
+
+### Rerun metrics and verification
+
+| Metric | Value |
+| --- | ---: |
+| Best / seed score | 64 / 64 |
+| Submitted children scored / OK | 0 / 0 |
+| Summary OK rate / throughput per hour | 0 / 0 |
+| Allocated / completed tasks | 3 / 0 |
+| Reserved tries | 6 |
+| Recorded trials | 1, OK 64 |
+| Mean reserved tries per allocated task | 2.0 |
+| Mean recorded trials per allocated task | 0.333 |
+| Mean tries per completed task | undefined |
+| Queued requests at cleanup | 8: five tries, three submissions |
+
+The eight unscored requests were enqueued after the engine's recorded death;
+they do not represent scored results. Real Haiku sessions and restricted
+launch settings were confirmed through `gc session list`. Initial creation
+to first next-task costs, using initial claim actors from slot history and
+SQLite task timestamps, were:
+
+| Slot | Session | Created UTC | First next-task UTC | Seconds |
+| --- | --- | --- | --- | ---: |
+| 1 | `mc-wisp-db77a3` | 23:42:16 | 23:43:17.486566 | 61.487 |
+| 2 | `mc-wisp-4yxsb9` | 23:42:16 | 23:43:21.181924 | 65.182 |
+| 3 | `mc-wisp-hzzxi5` | 23:42:16 | 23:43:24.055762 | 68.056 |
+
+Mean initial startup was **64.908 seconds**. No accepted-task boundary or
+fresh replacement occurred; actual slot-release-to-fresh-next-task cost is
+still unavailable. The provisional N=5 recommendation remains a hypothesis:
+it would amortize this startup proxy to about 13 seconds per task, but cannot
+be validated without successful completed tasks and replacement measurements.
+
+`funsearch best <run_dir> -k 10` again returned only seed program 0.
+`funsearch rescore <run_dir> best --instance n=6` and rescore of ID 0 both
+returned OK 64, signature `[16,32,64]`. The sole completed trial's immutable
+request source was independently recompiled with the final compiler and
+rescored in a fresh normal worker; status, score, and signature matched.
+All nine verification dumps passed the independent checker at the actual
+repository path, `python3 tools/check_cap.py <run_dir>/rescore-caps`.
+The best function remains the seed shown earlier. Verification records are
+`acceptance-rescore.json`, `acceptance-trial-rescore.json`, and
+`acceptance-metrics.json` inside the ignored run directory.
+
+### Cleanup, checks, and disposition
+
+`gc order run funsearch-sweep --rig math-experiments` exited 0. Recovered
+`summary.json` is failed / engine died; the run bead closed with its summary,
+all three slots closed, `mail_sent=true` and `finished=true` were checkpointed,
+and the registry entry was removed. The engine, observer, evaluator workers,
+sampler, and monitor no longer remained alive. The earlier explicit SIGKILL
+crash test remains valid; this run additionally verifies recovery from a real
+SIGBUS failure.
+
+Before local landing of `dc8778c`, the exact gate
+`make worker && make -C examples/cap-set/evaluator && make test` passed:
+102 Python tests, 21 Julia assertions, nine cap-set checks, the skill-template
+check, and 13 worker checks. The real CLI diagnostic suite also passed
+separately (13 tests), exercising graceful TERM/HUP/INT shutdown, SIGKILL
+exit evidence, and fatal ABRT stack traces. Logs are
+`/tmp/fs-mc-h4zx.11-instrument-make-test.log` and
+`/tmp/fs-mc-h4zx.11-instrument-tests.log`; `git diff --check` passed.
+These prescribed direct/embedded Julia gates remain necessary because this
+worktree is outside Kaimon's managed-project allow-list.
+
+Acceptance remains **FAIL**: no unattended successful stop, no improvement,
+and no fresh replacement measurement. Kurt was mailed the SIGBUS evidence
+and OOM-counter delta. Keep the acceptance bead open and do not dispatch
+successors. Only local pack commits were made; the city import remains in
+place and nothing was pushed or committed in math-city/math-experiments.
