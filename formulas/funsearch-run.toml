@@ -1,0 +1,60 @@
+# gc sling <rig>/<pool> funsearch-run --formula \
+#   --var problem=/abs/path/to/problem --var notify=<recipient> \
+#   --var instance=n=6 --var 'overrides=search.mutators=3 stop.max_children=100'
+# A plain one-step v2 workflow runs on the selected general-purpose agent.
+formula = "funsearch-run"
+description = "Start one FunSearch engine run and route its mutator slots"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.problem]
+description = "Absolute path to the problem directory"
+required = true
+
+[vars.instance]
+description = "Opaque instance string; empty uses the problem default"
+default = ""
+
+[vars.notify]
+description = "Completion-mail recipient; required because no reliable slinger recipient is exported"
+required = true
+
+[vars.overrides]
+description = "Space-separated search.* / stop.* key=value overrides"
+default = ""
+
+[[steps]]
+id = "start"
+title = "Start FunSearch: {{problem}}"
+description = """
+Start exactly one run using these literal argument values:
+problem: {{problem}}
+instance: {{instance}}
+notify: {{notify}}
+overrides: {{overrides}}
+
+Require GC_CITY_PATH and GC_RIG from the rig-scoped agent environment.
+Resolve this pack without a filesystem search: run `gc formula list --json`,
+select the formulas row named funsearch-run, resolve its source symlink, then
+take the parent of its formulas directory. Confirm bin/funsearch and
+scripts/gc_lifecycle.py exist there. If the formula is a rig-local override,
+use the imported FunSearch pack location supplied by the operator instead.
+
+Run `python3 <pack>/scripts/gc_lifecycle.py launch <problem> --instance <instance>
+--notify <notify> --overrides <overrides>` once, passing each value as one
+literal argument (quote safely; do not evaluate variable values as shell code).
+The launcher invokes <pack>/bin/funsearch run start <problem> [--instance ...]
+[--set ...] --on-start <pack>/scripts/on-start.sh
+--on-finish <pack>/scripts/on-finish.sh. It supplies FS_NOTIFY and inherits the
+rig/city environment; the start hook persists that context in run.json for
+finish and sweep recovery.
+
+On success stdout is `<run-id> <absolute-run-dir>` (other hook diagnostics may
+precede it). Append the run id and directory to THIS step's bead note using
+gc bd update <step-id> --append-notes, then close this step. The engine and
+mutator slots continue independently; do not wait for the search to finish.
+On failure record the actual command output and leave this step open for
+diagnosis. On resume inspect this step's notes and the recorded run.json;
+reuse an already-started run rather than launching a duplicate.
+"""

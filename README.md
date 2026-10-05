@@ -52,8 +52,37 @@ Omit `instance` and `overrides` to use the problem defaults. The seed must score
 build it without inheriting your shell environment. Results appear in
 `<problem>/runs/<run-id>/`: `best.c` and
 `summary.json` at completion, with a summary on the run bead and completion
-mail to `notify`. The run formula and Gas City hooks are supplied by the remaining
-implementation beads of epic mc-h4zx.
+mail to `notify`. The formula records the run id and directory on its start
+step and returns while the engine and mutators continue. `notify` is required:
+Gas City does not export a reliable slinger recipient. Formula compiler v2
+must be enabled. Run the formula on a general coding pool; mutator slots are
+routed directly to `<rig>/funsearch.mutator` with `--no-formula`.
+
+The start hook creates a `funsearch-run` bead in the importing rig and K child
+`funsearch-slot` beads, carrying N and the configured mutator model. It stores
+bead ids and rig/notify context in `run.json`, and registers the engine PID at
+`<city>/.gc/funsearch/active/<run-id>.json`. Run ids must be unique across the
+city. At completion the finish hook records best versus seed, children scored,
+throughput, OK rate, reason and `best.c`, closes slots before the run bead,
+sends `gc mail` to `notify`, then removes the registry entry.
+
+The `funsearch-sweep` exec order is dormant when the registry is empty. With
+active runs it checks every controller tick but sweeps at most every 30
+minutes. A dead engine without a terminal summary is marked failed with
+reason `engine died`, using database/backup results where available. A dead
+engine with a terminal summary has its interrupted finish hook retried with
+that outcome preserved. Live engines are left alone. Sweep errors retain the
+entry for a later retry and appear in order output. The sweep always updates
+`last-sweep`; a city lock prevents overlapping sweeps from different rigs.
+
+Hooks serialize per run and checkpoint completed actions for repeat calls.
+Sequential retries do not resend completion mail. A process death between a
+successful external write/mail and its local checkpoint can repeat that action;
+Gas City and the local JSON registry do not share a transaction.
+For a manual retry, use `<pack>/scripts/on-finish.sh <run-dir>`; saved context
+selects the correct rig even from another cwd. Direct hook launches require
+`GC_CITY_PATH`, `GC_RIG` (or `FS_CITY_PATH`, `FS_RIG`) and `FS_NOTIFY`.
+`FS_GC=/absolute/path/to/gc` can select a test shim or an alternate CLI binary.
 
 
 ## Using the engine directly

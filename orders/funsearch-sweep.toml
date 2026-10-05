@@ -1,0 +1,10 @@
+# Dormant checks create no tracking beads. All importing rigs share a city-wide
+# registry, timestamp and sweep lock; each entry restores its own rig scope.
+[order]
+description = "Retire dead FunSearch engines and deliver their completion summaries"
+trigger = "condition"
+check = '"$PACK_DIR/scripts/sweep-check.sh"'
+exec = '"$PACK_DIR/scripts/sweep.sh"'
+check_timeout = "10s"
+timeout = "5m"
+idempotent = true
