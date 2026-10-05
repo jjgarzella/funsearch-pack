@@ -1,20 +1,20 @@
 .POSIX:
 
 CC = cc
-CFLAGS = -O2 -Wall -Wextra
+CFLAGS = -O2 -std=c11 -Wall -Wextra -Werror
 CPPFLAGS = -Iinclude
 LDFLAGS =
 LDLIBS = -ldl
 
 all: worker
 
-worker:
-	@if test -f worker/funsearch-worker.c; then \
-		mkdir -p build && \
-		$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o build/funsearch-worker worker/funsearch-worker.c $(LDLIBS); \
-	fi
+worker: build/funsearch-worker
 
-test:
+build/funsearch-worker: worker/funsearch-worker.c include/funsearch.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ worker/funsearch-worker.c $(LDLIBS)
+
+test: worker
 	@if test -n "$$(find tests -type f -name 'test_*.py' -print)"; then \
 		python3 -m unittest discover -s tests -t . -p 'test_*.py'; \
 	fi
