@@ -1,0 +1,19 @@
+# funsearch — evolutionary program search for Gas City.
+#
+# A small coding agent, the mutator, writes new candidate programs.
+# A user-supplied evaluator scores them through a C interface.
+# Evaluators may be implemented in any language behind that interface.
+# The worker hosts evaluator libraries and loads one candidate at a time.
+# The Python engine manages programs, islands, tasks, and worker processes.
+# Candidates evolve through scored parent sampling and island resets.
+# Each problem supplies its own specification, seed, and evaluator.
+# The pack is project-agnostic and can be imported into any rig.
+# Gas City formulas and hooks connect runs to mutator slot beads.
+# Run state belongs to the problem directory and is never committed.
+# The bundled cap-set example will demonstrate a Julia-backed evaluator.
+# This scaffold contains no agents or formulas yet.
+# Implementation is tracked by epic mc-h4zx; see README.md for the layout.
+
+[pack]
+name = "funsearch"
+schema = 2
