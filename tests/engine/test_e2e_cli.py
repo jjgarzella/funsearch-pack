@@ -95,7 +95,8 @@ class EndToEndTests(PipelineTestCase):
         root = self.start("stop.max_children=10", hooks=True)
         self.assertTrue((root / "started.marker").exists())
         self.assertEqual((root.parent / ".gitignore").read_text(), "*\n")
-        with Database(root / "db.sqlite") as db:
+        with Database(root / "db.sqlite", readonly=True) as db:
+            self.assertEqual(db.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(db.get_program(0).source, (self.problem / "seed.c").read_text())
         engine_pid = int((root / "engine.pid").read_text())
         # Linux process groups let us verify both pools have been shut down.
@@ -117,6 +118,8 @@ class EndToEndTests(PipelineTestCase):
             child = self.child(directory, candidate_value)
             self.assertTrue(self.cli("try", root, task_id, child).startswith("RESULT OK"))
             self.assertTrue(self.cli("submit", root, task_id, child).startswith("ACCEPTED"))
+            self.assertFalse((root / "db.sqlite-shm").exists())
+            self.assertFalse((root / "db.sqlite-wal").exists())
         self.cli("next-task", root, code=3)
         summary = self.finished(root)
         for key in ("run_id", "instance", "status", "reason", "started_at", "ended_at",

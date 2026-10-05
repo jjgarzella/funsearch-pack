@@ -234,7 +234,8 @@ def dispatch(args):
     if args.command == "run" and args.run_command == "start":
         return start_run(args)
     root, metadata, cfg = read_run(args.run_dir)
-    with Database(root / "db.sqlite") as db:
+    readonly = args.command in ("run", "best", "rescore")
+    with Database(root / "db.sqlite", readonly=readonly) as db:
         if args.command == "next-task":
             with db.transaction():
                 require_running(db)

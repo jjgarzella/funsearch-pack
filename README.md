@@ -128,6 +128,13 @@ ten distinct OK candidates in `top/`. The final and periodic SQLite backups
 live in `snapshots/`, with the latest five retained. Worker errors and daemon
 tracebacks appear in `engine.log`.
 
+Run databases and snapshots use SQLite DELETE rollback journaling and a
+5000 ms busy timeout. WAL is avoided because its shared-memory mmap can
+SIGBUS on host-mounted run directories (observed on a Docker Desktop host
+mount). Writable opens convert existing WAL databases to DELETE; stop old
+engines/clients before migrating a legacy run. Status, best, rescore, and
+mutator inspection open read-only connections without schema writes.
+
 The engine flushes timestamped startup, shutdown, and SIGTERM/SIGHUP/SIGINT
 events to `engine.log`; those signals request normal shutdown. Python's
 faulthandler writes fatal-signal stack traces there. A small detached parent

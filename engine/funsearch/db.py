@@ -101,17 +101,22 @@ CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 
 class Database:
-    def __init__(self, path, *, busy_timeout_ms=5000):
+    def __init__(self, path, *, busy_timeout_ms=5000, readonly=False):
         self.path = Path(path)
-        self.connection = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000,
-                                          isolation_level=None)
+        target = self.path.resolve().as_uri() + "?mode=ro" if readonly else str(path)
+        self.connection = sqlite3.connect(target, uri=readonly,
+                                          timeout=busy_timeout_ms / 1000, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.executescript(_SCHEMA)
-        if "trial_n" not in {row[1] for row in self.connection.execute("PRAGMA table_info(evalq)")}:
-            self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
+        if not readonly:
+            # Host-mounted run directories may not support WAL's shared -shm
+            # mmap reliably (live acceptance saw SIGBUS). Rollback journaling
+            # avoids that mapping and also migrates existing WAL databases.
+            self.connection.execute("PRAGMA journal_mode=DELETE")
+            self.connection.executescript(_SCHEMA)
+            if "trial_n" not in {row[1] for row in self.connection.execute("PRAGMA table_info(evalq)")}:
+                self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
         self._depth = 0
 
     def __enter__(self):
@@ -326,4 +331,6 @@ class Database:
 
     def backup(self, path) -> None:
         with sqlite3.connect(str(path)) as destination:
+            destination.execute("PRAGMA journal_mode=DELETE")
             self.connection.backup(destination)
+            destination.execute("PRAGMA journal_mode=DELETE")

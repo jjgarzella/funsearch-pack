@@ -70,8 +70,8 @@ class DatabaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.finish_evaluation(first.id, result)
 
-    def test_wal_state_backup_and_rollback(self):
-        self.assertEqual(self.db.connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+    def test_delete_state_backup_and_rollback(self):
+        self.assertEqual(self.db.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         self.assertEqual(self.db.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.db.set_state("status", "running")
         self.db.set_state("stats", {"children": 1})
@@ -85,10 +85,36 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.list_tasks(), [])
         backup = Path(self.temp.name) / "backup.sqlite"
         self.db.backup(backup)
-        with Database(backup) as saved:
+        with Database(backup, readonly=True) as saved:
+            self.assertEqual(saved.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(saved.get_state("children"), 3)
             self.assertEqual(saved.get_state("stats"), {"children": 1})
         self.assertEqual(self.db.get_state("absent", "fallback"), "fallback")
+
+    def test_readonly_client_and_missing_file(self):
+        self.db.set_state("status", "running")
+        with Database(self.path, readonly=True) as client:
+            self.assertEqual(client.get_state("status"), "running")
+            self.assertEqual(client.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                client.set_state("status", "changed")
+        missing = self.path.with_name("missing.sqlite")
+        with self.assertRaises(sqlite3.OperationalError):
+            Database(missing, readonly=True)
+        self.assertFalse(missing.exists())
+
+    def test_existing_wal_database_migrates_without_losing_committed_data(self):
+        legacy = self.path.with_name("legacy.sqlite")
+        with sqlite3.connect(legacy) as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            connection.execute("CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO state VALUES ('legacy', '42')")
+        connection.close()
+        with Database(legacy) as migrated:
+            self.assertEqual(migrated.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            self.assertEqual(migrated.get_state("legacy"), 42)
+            migrated.set_state("new", "value")
+        self.assertFalse(Path(str(legacy) + "-shm").exists())
 
     def test_invalid_data(self):
         for values in ({"score": float("nan")}, {"sig": [float("inf")]}, {"sig": [0] * 9}):

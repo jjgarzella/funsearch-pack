@@ -26,7 +26,9 @@ required input files. Instance strings remain opaque. Evaluator build output
 need not exist yet. Every schema field has a dataclass default; `exports` must be
 supplied. Problem name and instance default to empty strings when omitted.
 
-`Database` opens SQLite with WAL, foreign keys, and a 5000 ms busy timeout.
+`Database` opens SQLite with DELETE rollback journaling, foreign keys, and a
+5000 ms busy timeout. Writable opens migrate existing WAL databases. Read-only
+clients use `readonly=True` and a `mode=ro` URI without schema changes.
 Program, Task, Trial, and Evaluation accessors return immutable dataclass records;
 JSON fields are decoded to Python values. Each process should open its own
 connection. `transaction()` supports composing accessor writes atomically through
