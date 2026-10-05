@@ -1,0 +1,36 @@
+# Export FS_PACK=/absolute/path/to/funsearch-pack before building or running.
+[problem]
+name = "my-problem"              # A descriptive label for results.
+instance = "n=6"                 # Opaque to FunSearch; your evaluator parses it.
+
+[candidate]
+language = "c"
+compile = "cc -O2 -shared -fPIC -o {out} {src}"
+compile_try = "cc -O1 -g -fsanitize=address,undefined -shared -fPIC -o {out} {src}"
+exports = ["priority"]           # Match candidate.h and seed.c exactly.
+
+[evaluator]
+# For an agent-launched run that does not inherit FS_PACK, use:
+# build = 'make -C evaluator FS_PACK="/absolute/path/to/funsearch-pack"'
+build = "make -C evaluator"      # Runs in the problem directory; uses FS_PACK.
+library = "evaluator/libevaluator.so" # Relative to the problem directory.
+timeout_s = 30                   # Per scoring call, including verification.
+memory_mb = 2048                 # Allow for any runtime embedded by the evaluator.
+
+[search]
+# Keep these tuning defaults for the first validated baseline.
+islands = 4
+mutators = 3                     # Concurrent candidate authors; affects cost.
+tasks_per_session = 1            # Tasks before the author gets fresh context.
+trial_budget = 3                 # Maximum trial evaluations per task.
+parents_per_task = 2
+workers = 2
+reset_period_s = 1800
+
+[stop]
+duration_s = 3600                # Positive duration limit, seconds.
+max_children = 100               # Positive limit on scored submitted children.
+plateau_children = 0             # 0 disables stopping on lack of improvement.
+
+[mutator]
+model = "claude-haiku-4-5-20251001" # Choose a model available in your city.
