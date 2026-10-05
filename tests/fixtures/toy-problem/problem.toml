@@ -4,4 +4,5 @@ instance = "n=1"
 [candidate]
 exports = ["f"]
 [evaluator]
-build = ""
+build = "mkdir -p evaluator && cc -shared -fPIC -I../../../include -o evaluator/libevaluator.so ../../worker/toy_eval.c"
+library = "evaluator/libevaluator.so"

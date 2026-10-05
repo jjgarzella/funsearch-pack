@@ -20,7 +20,7 @@ class ConfigTests(unittest.TestCase):
         expected = Config().to_dict()
         expected["problem"] = {"name": "toy", "instance": "n=1"}
         expected["candidate"]["exports"] = ["f"]
-        expected["evaluator"]["build"] = ""
+        expected["evaluator"]["build"] = "mkdir -p evaluator && cc -shared -fPIC -I../../../include -o evaluator/libevaluator.so ../../worker/toy_eval.c"
         self.assertEqual(cfg.to_dict(), expected)
         self.assertEqual(cfg.search.islands, 4)
         self.assertEqual(cfg.stop.plateau_children, 0)

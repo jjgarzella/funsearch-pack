@@ -1,0 +1,88 @@
+# Compile and evaluator pipeline
+
+The pipeline requires Python's standard library, a C compiler, `make`, and a
+POSIX host with process groups and `select`. Import from `engine.funsearch` at
+the pack root, or add `engine/` to the module path and import `funsearch`.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from engine.funsearch.config import load_config
+from engine.funsearch.compile import compile_candidate, try_worker_env
+from engine.funsearch.evaluator import build_evaluator
+from engine.funsearch.workers import WorkerPool
+
+cfg = load_config(problem_dir)
+evaluator = build_evaluator(cfg, problem_dir)
+with WorkerPool(cfg, evaluator, cfg.problem.instance, cfg.search.workers) as final_pool:
+    with WorkerPool(cfg, evaluator, cfg.problem.instance, cfg.search.workers,
+                    extra_env=try_worker_env()) as try_pool:
+        ok, library, log = compile_candidate(cfg, candidate_c, trial_dir, "try")
+        if ok:
+            result = try_pool.score(library, cfg.evaluator.timeout_s)
+        # Several caller threads can share a pool. Each call blocks until an
+        # idle worker is available, then returns its result dictionary.
+        with ThreadPoolExecutor(max_workers=cfg.search.workers) as executor:
+            pending = executor.submit(try_pool.score, library, cfg.evaluator.timeout_s)
+```
+
+`compile_candidate(cfg, source, out_dir, mode)` accepts `try` and `final`, uses
+the corresponding configured shell command, and replaces `{src}` and `{out}`
+with shell-quoted absolute paths. It returns `(ok, library_path, log)`. Each
+concurrent compilation must use its own output directory. The output is
+`candidate.so`; an existing output is removed before compilation, and failed
+outputs are removed too. Commands run in the output directory for at most 60
+seconds, and stderr logs are truncated to 4 KiB. Timeout kills the compiler's
+whole process group.
+
+Every required export must be defined in `nm -D --defined-only` output. Undefined
+references do not satisfy this check. When `nm` is unavailable, an isolated
+Python process loads the library with `ctypes.CDLL` and checks `hasattr`; a
+constructor crash cannot take down the engine. For try builds that fallback
+uses the ASan environment too. An installed but failing `nm` reports an error.
+
+`build_evaluator` runs the configured nonempty build command in the problem
+directory with a 15 minute timeout, verifies the library exists and defines
+`fs_score`, and returns its absolute path. Failures raise `EvaluatorBuildError`.
+An empty build command supports prebuilt evaluators. The toy fixture's build
+command references the evaluator and header shipped elsewhere in this repo.
+
+`worker_binary()` locates the pack relative to this module, and invokes
+`make -C <pack> worker` if `build/funsearch-worker` is missing. `Worker` and
+`WorkerPool` both support context managers and idempotent `close()`.
+
+A worker starts in a new process group with `FS_MEMORY_MB` from configuration.
+The engine sends a blank request and reads its `bad request` response to ensure
+`fs_init` has finished; the C protocol has no spontaneous ready response.
+A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup
+failures retry at most three times, with a 60 second limit per attempt. A failed
+replacement remains failed and raises on later calls instead of retrying forever.
+Worker stderr is written to a temporary file so noisy evaluator output cannot
+block the protocol.
+
+`score(library, timeout_s)` returns `status`, `score`, `sig`, and `msg`. Scoring
+timeouts return ERROR with `timeout after Ns`; crashes return ERROR with
+`worker crashed: signal N` or `worker crashed: exit code N`. Both kill the old
+process group and start a replacement before returning. A failure to start that
+replacement raises `WorkerError` or `EvaluatorInitError`. The timeout starts
+once a worker becomes available; time waiting for an idle worker and restarting
+a process is additional. `close()` rejects new/waiting pool requests, waits for
+active requests, sends QUIT, and allows one second for shutdown before killing
+and reaping each process and cleaning up its pipes and stderr file.
+
+Try workers need the ASan runtime before loading sanitized candidate libraries.
+`try_worker_env()` asks `${CC:-cc} -print-file-name=libasan.so` for that runtime,
+prepends it to `LD_PRELOAD`, and sets
+`ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`. It also removes `FS_MEMORY_MB`:
+ASan reserves a large virtual shadow address range, so the normal `RLIMIT_AS`
+limit makes sanitizer workers abort with `Failed to mmap` before evaluation.
+The normal pool retains the configured address-space limit. Sanitizer trials
+still have scoring timeouts but do not enforce that address-space limit. The
+environment overlay accepts `None` to remove a variable explicitly.
+
+Run the pipeline acceptance checks from the pack root:
+
+```sh
+make worker
+python3 -m unittest discover -s tests -t . -p 'test_pipeline_*.py' -v
+make test
+```
