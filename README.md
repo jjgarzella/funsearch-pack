@@ -107,3 +107,60 @@ file is removed after shutdown and the finish hook completes.
 CLI exit codes: 0 success; 1 runtime or seed failure; 2 usage/configuration
 error; 3 RUN_OVER for next-task/try/submit; 4 rejection or exhausted trial
 budget. `run status`, `best`, and `rescore` remain available after completion.
+
+## Mutator role
+
+`funsearch.mutator` is a demand-driven Claude pool using
+`claude-haiku-4-5-20251001`. Each fresh session claims a routed slot bead,
+reads its metadata through `bin/funsearch slot show <bead>`, and performs
+`next-task` → read TASK.md → write child.c → `try` → `submit`.
+Trials obey the task budget; duplicate rejection leaves the same task open.
+After N accepted submissions it releases the slot and drains. RUN_OVER
+(exit 3 from any task command) closes the slot and drains.
+`slot show` also reports an unfinished task and its used trials so a fresh
+session can resume after a crash or error without allocating a second task.
+
+N is `[search] tasks_per_session`, copied to `fs.tasks_per_session` on each
+slot bead. K is `[search] mutators`, the number of slot beads per run.
+The agent's `max_active_sessions = 3` supports the default K=3; increase the
+rig's agent patch cap for larger K, allowing for other concurrent runs and
+rig/workspace limits. `[mutator] model` is passed by the run lifecycle hooks
+as slot `opt_model` metadata to override the agent default. Slot metadata must
+also include `fs.run_dir` (absolute) and `fs.slot` (string or integer).
+
+The agent's working directory is private per concrete session, under
+`<city>/.gc/funsearch/mutators/`. `pre_start` installs a Claude `PreToolUse`
+guard. Claude runs in `dontAsk` mode with only Bash/Read/Write/Edit, project
+settings, no MCP servers, and slash commands disabled. The guard permits
+only literal calls to this pack's next-task/try/submit and slot helpers,
+`gc hook --claim --json` (optionally `--drain-ack`), and
+`gc runtime drain-ack`. It rejects shell composition/substitution, other
+commands, wrong runs/slots/tasks, and file access outside the current task's
+TASK.md and child.c. Only child.c is writable. Paths with shell metacharacters
+are unsupported; spaces may be quoted. The guard grants explicit permission
+for allowed calls; all others are denied.
+
+`slot release` uses an ownership/status-guarded `gc bd update` to reopen and
+unassign the bead, clear stale session/claim/work-directory metadata, and preserve
+`gc.routed_to`. `slot close` uses the same guards with `--status=closed` so
+ownership and the terminal update happen atomically. An already closed slot
+(for example, by the finish hook) is a read-only success. Neither helper drains;
+the agent calls `gc runtime drain-ack` only after a successful transition.
+These adapters are the only engine CLI subcommands that call Gas City.
+
+## Security notes
+
+The mutator guard enforces a Claude tool policy, not process isolation.
+Gas City's agent schema has no OS filesystem or network sandbox setting.
+Candidate compilation and scoring execute native code with the host user's
+access: C includes, compiler options, and candidate code can access files
+or the network independently of the agent's file tools. Symlink swaps by
+another process remain a race. Do not use this setup as an adversarial
+evaluator-hiding boundary; OS/container isolation is separate work.
+
+The pack and generated settings must remain trusted, and a launch override
+must not disable project settings/hooks, enable permission bypass, or add
+tools/MCP servers. Gas City also supplies its city-managed Claude hooks;
+their trusted lifecycle commands are outside the model's tool allowlist.
+The later live acceptance bead verifies the actual Claude launch and hook
+loading. Policy/helper tests here exercise both allowed and denied calls.

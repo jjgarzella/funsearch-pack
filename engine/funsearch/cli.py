@@ -56,6 +56,10 @@ def parser():
     rescore.add_argument("run_dir")
     rescore.add_argument("program", metavar="id|best")
     rescore.add_argument("--instance", required=True)
+    slot = commands.add_parser("slot", help="Gas City mutator slot lifecycle")
+    slots = slot.add_subparsers(dest="slot_command", required=True)
+    for name in ("show", "release", "close"):
+        slots.add_parser(name).add_argument("bead")
     return cli
 
 
@@ -218,6 +222,9 @@ def evaluate(args, root, cfg, db):
 
 
 def dispatch(args):
+    if args.command == "slot":
+        from .slots import slot_command
+        return slot_command(args.slot_command, args.bead)
     if args.command == "check":
         problem = Path(args.problem).resolve()
         cfg = load_config(problem, instance=args.instance)

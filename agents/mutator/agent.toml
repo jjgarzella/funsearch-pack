@@ -1,0 +1,21 @@
+# Claude Haiku is the small coding role; model defaults remain overridable by
+# slot opt_model metadata. full-auto means dontAsk, NOT permission bypass.
+# A demand-driven pool has no always-on sessions; cap 3 matches default K.
+# Fresh context and a private control/settings directory per concrete session
+# avoid sharing state. pre_start installs the mandatory task/tool guard.
+# ConfigDir is the authored pack root; GC_RIG selects the rig's bead store.
+scope = "rig"
+provider = "claude"
+wake_mode = "fresh"
+work_dir = ".gc/funsearch/mutators/{{.Rig}}/{{.Agent}}"
+min_active_sessions = 0
+max_active_sessions = 3
+idle_timeout = "30m"
+pre_start = ["python3 '{{.ConfigDir}}/scripts/mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
+nudge = "Run gc hook --claim --drain-ack --json now and follow the mutator slot loop."
+args = ["--tools", "Bash,Read,Write,Edit", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--setting-sources", "project", "--disable-slash-commands"]
+
+[option_defaults]
+model = "claude-haiku-4-5-20251001"
+permission_mode = "full-auto"
+effort = "low"
