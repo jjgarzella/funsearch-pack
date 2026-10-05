@@ -124,12 +124,18 @@ class Worker:
     def _start(self):
         last_error = None
         for _ in range(START_ATTEMPTS):
+            if self._closed:
+                self._dispose()
+                raise WorkerError("worker is closed")
             try:
                 self._stderr = tempfile.TemporaryFile()
                 self.process = subprocess.Popen(
                     [str(self.binary), str(self.evaluator_so), self.instance],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
                     env=self.env, start_new_session=True, bufsize=0)
+                if self._closed:
+                    self._dispose()
+                    raise WorkerError("worker is closed")
                 self._send("")
                 reply = json.loads(self._line(time.monotonic() + START_TIMEOUT_S))
                 if not isinstance(reply, dict):
@@ -196,12 +202,23 @@ class Worker:
             except (OSError, ValueError, WorkerError) as exc:
                 result = _error(f"worker protocol error: {exc}")
             self._dispose()
+            if self._closed:
+                return _error("evaluation interrupted at shutdown")
             try:
                 self._start()
             except WorkerError as exc:
+                if self._closed:
+                    return _error("evaluation interrupted at shutdown")
                 self._failure = exc
                 raise
             return result
+
+    def abort(self):
+        """Interrupt an active score without waiting for its scoring lock."""
+        self._closed = True
+        process = self.process
+        if process is not None:
+            kill_group(process)
 
     def close(self):
         with self._lock:
@@ -251,6 +268,14 @@ class WorkerPool:
             with self._condition:
                 self._idle.append(worker)
                 self._condition.notify_all()
+
+    def abort(self):
+        """Reject new calls and interrupt workers after the stop grace period."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        for worker in self.workers:
+            worker.abort()
 
     def close(self):
         with self._condition:

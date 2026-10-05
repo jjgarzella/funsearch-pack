@@ -42,7 +42,7 @@ def seed_islands(db: Database, cfg: Config, source: str, *, score: float,
     with db.transaction():
         if db.list_programs(active_only=False):
             raise ValueError("program database is already seeded")
-        seeds = [db.add_program(i, source, score=score, sig=sig, msg=msg)
+        seeds = [db.add_program(i, source, score=score, sig=sig, msg=msg, program_id=0 if i == 0 else None)
                  for i in range(cfg.search.islands)]
         db.set_state("islands", cfg.search.islands)
         db.set_state("next_island", 0)

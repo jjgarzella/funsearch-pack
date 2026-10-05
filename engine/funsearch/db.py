@@ -63,6 +63,7 @@ class Evaluation:
     created_at: float
     started_at: float | None
     finished_at: float | None
+    trial_n: int | None = None
 
 
 _SCHEMA = """
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS trials (
 CREATE TABLE IF NOT EXISTS evalq (
  id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('try','submit','seed')),
  task_id INTEGER REFERENCES tasks(id), src_path TEXT NOT NULL, so_path TEXT NOT NULL,
+ trial_n INTEGER,
  state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','running','done')),
  result TEXT, created_at REAL NOT NULL, started_at REAL, finished_at REAL
 );
@@ -108,6 +110,8 @@ class Database:
         self.connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.executescript(_SCHEMA)
+        if "trial_n" not in {row[1] for row in self.connection.execute("PRAGMA table_info(evalq)")}:
+            self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
         self._depth = 0
 
     def __enter__(self):
@@ -166,7 +170,7 @@ class Database:
         return Evaluation(**data)
 
     def add_program(self, island: int, source: str, *, parent_ids=(), status="OK",
-                    score=None, sig=(), msg="", idea=None, norm_hash=None) -> Program:
+                    score=None, sig=(), msg="", idea=None, norm_hash=None, program_id=None) -> Program:
         signature = list(sig)
         if len(signature) > 8:
             raise ValueError("signature must contain at most eight values")
@@ -176,9 +180,9 @@ class Database:
             json.dumps(score, allow_nan=False)
         with self.transaction():
             cursor = self.connection.execute(
-                "INSERT INTO programs(island,parent_ids,source,norm_hash,status,score,sig,msg,idea,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (island, json.dumps(list(parent_ids)), source, norm_hash or normalized_hash(source),
+                "INSERT INTO programs(id,island,parent_ids,source,norm_hash,status,score,sig,msg,idea,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (program_id, island, json.dumps(list(parent_ids)), source, norm_hash or normalized_hash(source),
                  status, score, encoded_sig, msg, extract_idea(source) if idea is None else idea, time.time()))
             return self.get_program(cursor.lastrowid)
 
@@ -272,19 +276,24 @@ class Database:
         return [Trial(**dict(row)) for row in self.connection.execute(
             "SELECT * FROM trials WHERE task_id=? ORDER BY n", (task_id,))]
 
-    def enqueue(self, kind: str, src_path, so_path, *, task_id=None) -> Evaluation:
+    def enqueue(self, kind: str, src_path, so_path, *, task_id=None, trial_n=None) -> Evaluation:
         with self.transaction():
             cursor = self.connection.execute(
-                "INSERT INTO evalq(kind,task_id,src_path,so_path,created_at) VALUES (?,?,?,?,?)",
-                (kind, task_id, str(src_path), str(so_path), time.time()))
+                "INSERT INTO evalq(kind,task_id,src_path,so_path,created_at,trial_n) VALUES (?,?,?,?,?,?)",
+                (kind, task_id, str(src_path), str(so_path), time.time(), trial_n))
             return self.get_evaluation(cursor.lastrowid)
 
     def get_evaluation(self, evaluation_id: int) -> Evaluation | None:
         return self._evaluation(self.connection.execute("SELECT * FROM evalq WHERE id=?", (evaluation_id,)).fetchone())
 
-    def claim_evaluation(self) -> Evaluation | None:
+    def claim_evaluation(self, kind=None) -> Evaluation | None:
         with self.transaction():
-            row = self.connection.execute("SELECT id FROM evalq WHERE state='queued' ORDER BY id LIMIT 1").fetchone()
+            query = "SELECT id FROM evalq WHERE state='queued'"
+            args = ()
+            if kind is not None:
+                query += " AND kind=?"
+                args = (kind,)
+            row = self.connection.execute(query + " ORDER BY id LIMIT 1", args).fetchone()
             if row is None:
                 return None
             self.connection.execute("UPDATE evalq SET state='running',started_at=? WHERE id=?", (time.time(), row["id"]))

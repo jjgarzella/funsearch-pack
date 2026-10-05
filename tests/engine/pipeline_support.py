@@ -21,7 +21,8 @@ class PipelineTestCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.problem = self.root / "problem"
-        shutil.copytree(FIXTURE, self.problem)
+        # CLI check builds the fixture in place; tests must start from source.
+        shutil.copytree(FIXTURE, self.problem, ignore=shutil.ignore_patterns("*.so", "*.o", "__pycache__"))
         self.cfg = load_config(self.problem)
         # The fixture's relative command is usable in situ. For a temporary
         # copy, point at exactly the same toy evaluator and public header.

@@ -1,0 +1,328 @@
+"""Run owner: asynchronous scoring, stop conditions, and durable outputs."""
+
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import random
+import signal
+import time
+import traceback
+
+from .compile import try_worker_env
+from .db import Database
+from .evolve import reset_weakest
+from .runtime import read_run, run_hook, top_programs
+from .workers import WorkerPool
+
+
+SNAPSHOT_PERIOD_S = 600
+STOP_GRACE_S = 120
+
+
+def snapshot(db, root):
+    directory = root / "snapshots"
+    directory.mkdir(exist_ok=True)
+    n = db.increment_state("snapshots")
+    db.backup(directory / f"db-{n}.sqlite")
+    files = sorted(directory.glob("db-*.sqlite"), key=lambda p: int(p.stem[3:]))
+    for path in files[:-5]:
+        path.unlink()
+
+
+def stop_reason(db, cfg):
+    if db.get_state("stop_requested", False):
+        return "stop requested"
+    if time.time() - db.get_state("started_at") >= cfg.stop.duration_s:
+        return "duration_s"
+    if db.get_state("children_scored", 0) >= cfg.stop.max_children:
+        return "max_children"
+    if cfg.stop.plateau_children and db.get_state("plateau_count", 0) >= cfg.stop.plateau_children:
+        return "plateau_children"
+    return None
+
+
+def store_result(db, evaluation, result):
+    """Commit the result, task completion, and counters as one transaction."""
+    result = dict(result)
+    with db.transaction():
+        if evaluation.kind == "try":
+            db.add_trial(evaluation.task_id, evaluation.trial_n,
+                         status=result["status"], score=result["score"], msg=result["msg"])
+        else:
+            task = db.get_task(evaluation.task_id)
+            source = Path(evaluation.src_path).read_text()
+            db.increment_state("children_scored")
+            if result["status"] == "OK":
+                db.increment_state("children_ok")
+            before = db.get_state("best_score")
+            if result["status"] == "OK" and result["score"] > before:
+                db.set_state("best_score", result["score"])
+                db.set_state("plateau_count", 0)
+            else:
+                db.increment_state("plateau_count")
+            from .normalize import normalized_hash
+            duplicate = db.has_normalized_hash(normalized_hash(source))
+            if result["status"] == "OK":
+                duplicate = duplicate or any(p.score == result["score"] and p.sig == result["sig"]
+                                             for p in db.list_programs(status="OK"))
+            if task.status != "open":
+                result["rejected"] = "task is no longer open"
+            elif duplicate:
+                result["rejected"] = "duplicate candidate"
+            else:
+                program = db.add_program(task.island, source, parent_ids=task.parent_ids,
+                                         status=result["status"], score=result["score"],
+                                         sig=result["sig"], msg=result["msg"])
+                db.close_task(task.id)
+                result["program_id"] = program.id
+        db.finish_evaluation(evaluation.id, result)
+
+
+def cancel_queued(db):
+    while (evaluation := db.claim_evaluation()) is not None:
+        result = {"status": "ERROR", "score": 0, "sig": [], "msg": "RUN_OVER", "run_over": True}
+        with db.transaction():
+            if evaluation.kind == "try":
+                db.add_trial(evaluation.task_id, evaluation.trial_n,
+                             status="ERROR", msg="RUN_OVER")
+            db.finish_evaluation(evaluation.id, result)
+
+
+def write_outputs(db, root, metadata, cfg, status, reason):
+    ended = time.time()
+    started = db.get_state("started_at")
+    scored = db.get_state("children_scored", 0)
+    ok = db.get_state("children_ok", 0)
+    best = top_programs(db)
+    summary = {"run_id": metadata["run_id"], "instance": cfg.problem.instance,
+               "status": status, "reason": reason, "started_at": started, "ended_at": ended,
+               "children_scored": scored, "children_ok": ok,
+               "ok_rate": ok / scored if scored else 0,
+               "best_score": best[0].score if best else None,
+               "seed_score": db.get_state("seed_score"),
+               "best_program_id": best[0].id if best else None,
+               "throughput_per_hour": scored * 3600 / max(ended - started, 0.001),
+               "islands": [{"island": i, "best_program_id": p.id if p else None,
+                            "best_score": p.score if p else None}
+                           for i in range(cfg.search.islands)
+                           for p in [db.best_program(i)]]}
+    with db.transaction():
+        db.set_state("status", status)
+        db.set_state("reason", reason)
+        db.set_state("ended_at", ended)
+    temporary = root / "summary.json.tmp"
+    temporary.write_text(json.dumps(summary, indent=2) + "\n")
+    temporary.replace(root / "summary.json")
+    if best:
+        (root / "best.c").write_text(best[0].source)
+    (root / "top").mkdir(exist_ok=True)
+    for rank, program in enumerate(best, 1):
+        (root / "top" / f"{rank}-{program.score:g}.c").write_text(program.source)
+
+
+def serve(run_dir, ready_fd):
+    root, metadata, cfg = read_run(run_dir)
+    pools, executors, pending = {}, {}, {}
+    db = Database(root / "db.sqlite")
+    status, reason = "failed", "daemon startup failed"
+    notified = False
+    stop_deadline = None
+    signal_stop = False
+
+    def request_stop(*_):
+        nonlocal signal_stop
+        signal_stop = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        evaluator = metadata["evaluator_library"]
+        for kind, env in (("submit", None), ("try", try_worker_env())):
+            pools[kind] = WorkerPool(cfg, evaluator, cfg.problem.instance,
+                                     cfg.search.workers, env)
+            executors[kind] = ThreadPoolExecutor(max_workers=cfg.search.workers)
+        with db.transaction():
+            db.set_state("status", "running")
+            db.set_state("pid", os.getpid())
+        (root / "engine.pid").write_text(str(os.getpid()) + "\n")
+        os.write(ready_fd, b"READY\n")
+        os.close(ready_fd)
+        notified = True
+        last_reset = last_snapshot = time.monotonic()
+        rng = random.Random()
+        while True:
+            if db.get_state("start_error"):
+                raise RuntimeError(db.get_state("start_error"))
+            if signal_stop:
+                db.set_state("stop_requested", True)
+            for future, evaluation in list(pending.items()):
+                if future.done():
+                    try:
+                        result = future.result()
+                    except Exception:
+                        if stop_deadline is None:
+                            raise
+                        result = {"status": "ERROR", "score": 0, "sig": [],
+                                  "msg": "evaluation interrupted at shutdown"}
+                    store_result(db, evaluation, result)
+                    del pending[future]
+                    found = stop_reason(db, cfg)
+                    if found and stop_deadline is None:
+                        reason = found
+                        status = "stopped" if found == "stop requested" else "completed"
+                        db.set_state("status", "stopping")
+                        stop_deadline = time.monotonic() + STOP_GRACE_S
+            if stop_deadline is None:
+                found = stop_reason(db, cfg)
+                if found:
+                    reason = found
+                    status = "stopped" if found == "stop requested" else "completed"
+                    db.set_state("status", "stopping")
+                    stop_deadline = time.monotonic() + STOP_GRACE_S
+            if stop_deadline is not None:
+                cancel_queued(db)
+                if not pending:
+                    break
+                if time.monotonic() >= stop_deadline:
+                    for pool in pools.values():
+                        pool.abort()
+            elif db.get_state("start_hook_done", False):
+                for kind in ("submit", "try"):
+                    occupied = sum(e.kind == kind for e in pending.values())
+                    capacity = cfg.search.workers - occupied
+                    if kind == "submit":
+                        capacity = min(capacity, cfg.stop.max_children -
+                                       db.get_state("children_scored", 0) - occupied)
+                    for _ in range(capacity):
+                        evaluation = db.claim_evaluation(kind)
+                        if evaluation is None:
+                            break
+                        future = executors[kind].submit(pools[kind].score, evaluation.so_path,
+                                                         cfg.evaluator.timeout_s)
+                        pending[future] = evaluation
+            now = time.monotonic()
+            if stop_deadline is None and now - last_reset >= cfg.search.reset_period_s:
+                reset_weakest(db, rng)
+                last_reset = now
+            if now - last_snapshot >= SNAPSHOT_PERIOD_S:
+                snapshot(db, root)
+                last_snapshot = now
+            age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
+            with db.transaction():
+                db.connection.execute(
+                    "UPDATE tasks SET status='abandoned',closed_at=? WHERE status='open' "
+                    "AND created_at<? AND id NOT IN "
+                    "(SELECT task_id FROM evalq WHERE state!='done' AND task_id IS NOT NULL)", (time.time(), time.time() - age))
+            time.sleep(0.02)
+    except BaseException as exc:
+        traceback.print_exc()
+        status, reason = "failed", str(exc)
+        # Interrupt workers even if persisting the failed state encounters an
+        # error. Pool cleanup must not prevent outputs or the finish hook.
+        for pool in pools.values():
+            try:
+                pool.abort()
+            except BaseException:
+                traceback.print_exc()
+        try:
+            db.set_state("status", "stopping")
+        except BaseException:
+            traceback.print_exc()
+    finally:
+        # Abort makes active calls return before waiting for executor shutdown.
+        cleanups = [lambda executor=executor: executor.shutdown(wait=True, cancel_futures=True)
+                    for executor in executors.values()]
+        cleanups += [pool.close for pool in pools.values()]
+        for cleanup in cleanups:
+            try:
+                cleanup()
+            except BaseException as exc:
+                traceback.print_exc()
+                status, reason = "failed", f"worker cleanup: {exc}"
+        try:
+            cancel_queued(db)
+            for row in db.connection.execute("SELECT * FROM evalq WHERE state='running'").fetchall():
+                evaluation = db.get_evaluation(row["id"])
+                result = {"status": "ERROR", "score": 0, "sig": [], "msg": reason, "run_over": True}
+                with db.transaction():
+                    if evaluation.kind == "try":
+                        db.add_trial(evaluation.task_id, evaluation.trial_n, status="ERROR", msg=reason)
+                    db.finish_evaluation(evaluation.id, result)
+        except BaseException as exc:
+            traceback.print_exc()
+            status, reason = "failed", f"queue cleanup: {exc}"
+        try:
+            write_outputs(db, root, metadata, cfg, status, reason)
+            snapshot(db, root)
+        except BaseException as exc:
+            traceback.print_exc()
+            status, reason = "failed", f"final outputs: {exc}"
+            try:
+                write_outputs(db, root, metadata, cfg, status, reason)
+            except BaseException:
+                traceback.print_exc()
+        try:
+            run_hook(metadata.get("on_finish"), root)
+        except BaseException as exc:
+            traceback.print_exc()
+            try:
+                write_outputs(db, root, metadata, cfg, "failed", f"on-finish hook: {exc}")
+                snapshot(db, root)
+            except BaseException:
+                traceback.print_exc()
+        finally:
+            try:
+                (root / "engine.pid").unlink(missing_ok=True)
+            finally:
+                db.close()
+                if not notified:
+                    try:
+                        os.write(ready_fd, ("FAILED " + reason.replace("\n", " ") + "\n").encode())
+                    finally:
+                        os.close(ready_fd)
+
+
+def daemonize(run_dir):
+    """Double fork; return only when the daemon's pools are ready."""
+    import select
+    reader, writer = os.pipe()
+    first = os.fork()
+    if first == 0:
+        os.close(reader)
+        try:
+            os.setsid()
+            if os.fork() != 0:
+                os._exit(0)
+            os.chdir(run_dir)
+            with open("/dev/null", "rb") as null, open("engine.log", "ab", buffering=0) as log:
+                os.dup2(null.fileno(), 0)
+                os.dup2(log.fileno(), 1)
+                os.dup2(log.fileno(), 2)
+            serve(run_dir, writer)
+        except BaseException:
+            traceback.print_exc()
+            try:
+                os.write(writer, b"FAILED daemon startup\n")
+            except OSError:
+                pass
+        finally:
+            os._exit(0)
+    os.close(writer)
+    os.waitpid(first, 0)
+    try:
+        _, _, cfg = read_run(run_dir)
+        deadline = time.monotonic() + 60 + cfg.search.workers * 2 * 180
+        message = b""
+        while b"\n" not in message:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([reader], [], [], remaining)[0]:
+                raise RuntimeError("daemon startup timed out")
+            chunk = os.read(reader, 4096)
+            if not chunk:
+                raise RuntimeError("daemon exited during startup")
+            message += chunk
+        if message != b"READY\n":
+            raise RuntimeError(message.decode().strip())
+    finally:
+        os.close(reader)

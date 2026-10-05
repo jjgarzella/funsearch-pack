@@ -52,5 +52,58 @@ Omit `instance` and `overrides` to use the problem defaults. The seed must score
 build it without inheriting your shell environment. Results appear in
 `<problem>/runs/<run-id>/`: `best.c` and
 `summary.json` at completion, with a summary on the run bead and completion
-mail to `notify`. The CLI and run formula are supplied by the remaining
+mail to `notify`. The run formula and Gas City hooks are supplied by the remaining
 implementation beads of epic mc-h4zx.
+
+
+## Using the engine directly
+
+The engine needs Python 3.11 or later, a C compiler, and `make`; its Python
+modules use only the standard library. It also works without Gas City:
+
+```sh
+bin/funsearch check /path/to/problem --instance n=6
+bin/funsearch run start /path/to/problem --run-id experiment \
+  --set search.workers=2 --set stop.max_children=100
+# start prints: <run-id> <absolute-run-dir>
+bin/funsearch next-task /path/to/problem/runs/experiment --slot 1
+# next-task prints: TASK <task-id> <absolute-task-dir>
+bin/funsearch try /path/to/problem/runs/experiment 1 /path/to/task/child.c
+bin/funsearch submit /path/to/problem/runs/experiment 1 /path/to/task/child.c
+bin/funsearch run status /path/to/problem/runs/experiment
+bin/funsearch best /path/to/problem/runs/experiment -k 5
+bin/funsearch rescore /path/to/problem/runs/experiment best --instance n=7
+bin/funsearch stop /path/to/problem/runs/experiment
+```
+
+`run start` checks the seed and returns after the daemon's worker pools are
+ready. Configuration, the seed, the problem statement, and the candidate
+header are saved in the run directory. Each try or submission compiles a
+private source copy; includes of `candidate.h` work there and during rescore.
+Try results print `RESULT <status> <score> <message>`; accepted submissions
+print `ACCEPTED <program-id> <status> <score>`. A rejected submission leaves
+its task open. A compile failure during try consumes a trial and records an
+ERROR result. Invalid and crashing submissions are stored so future mutators
+can see what was tried. Exact and normalized duplicates are rejected before
+scoring; candidates with the same OK score and signature as an active
+program are rejected after scoring.
+
+The daemon stops for a requested stop, the duration limit, the submitted-child
+limit, or the configured plateau. `children_scored` counts authoritative
+submitted evaluations, including behaviour duplicates rejected after scoring;
+tries and compile failures do not count. The maximum-child limit includes
+in-flight submissions so multiple workers cannot overshoot it. Evaluations
+already running can finish for up to two minutes after stopping; queued
+requests receive RUN_OVER. Runs export `summary.json`, `best.c`, and the top
+ten distinct OK candidates in `top/`. The final and periodic SQLite backups
+live in `snapshots/`, with the latest five retained. Worker errors and daemon
+tracebacks appear in `engine.log`.
+
+Optional `--on-start 'command'` and `--on-finish 'command'` hooks receive the
+absolute run directory as an argument and in `FS_RUN_DIR`. The finish hook
+runs after outputs are written, including when the daemon fails. The PID
+file is removed after shutdown and the finish hook completes.
+
+CLI exit codes: 0 success; 1 runtime or seed failure; 2 usage/configuration
+error; 3 RUN_OVER for next-task/try/submit; 4 rejection or exhausted trial
+budget. `run status`, `best`, and `rescore` remain available after completion.
