@@ -1,0 +1,32 @@
+[problem]
+name = "cap-set"
+instance = "n=6"
+
+[candidate]
+language = "c"
+compile = "cc -O2 -shared -fPIC -o {out} {src}"
+compile_try = "cc -O1 -g -fsanitize=address,undefined -shared -fPIC -o {out} {src}"
+exports = ["priority"]
+
+[evaluator]
+build = "make -C evaluator"
+library = "evaluator/libcapset.so"
+timeout_s = 30
+memory_mb = 4096
+
+[search]
+islands = 4
+mutators = 3
+tasks_per_session = 1
+trial_budget = 3
+parents_per_task = 2
+workers = 2
+reset_period_s = 1800
+
+[stop]
+duration_s = 3600
+max_children = 100
+plateau_children = 0
+
+[mutator]
+model = "claude-haiku-4-5-20251001"
