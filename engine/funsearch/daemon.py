@@ -1,11 +1,13 @@
 """Run owner: asynchronous scoring, stop conditions, and durable outputs."""
 
 from concurrent.futures import ThreadPoolExecutor
+import faulthandler
 import json
 import os
 from pathlib import Path
 import random
 import signal
+import sys
 import time
 import traceback
 
@@ -18,6 +20,11 @@ from .workers import WorkerPool
 
 SNAPSHOT_PERIOD_S = 600
 STOP_GRACE_S = 120
+
+
+def log_event(message):
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+          f"pid={os.getpid()} {message}", file=sys.stderr, flush=True)
 
 
 def snapshot(db, root):
@@ -130,12 +137,15 @@ def serve(run_dir, ready_fd):
     stop_deadline = None
     signal_stop = False
 
-    def request_stop(*_):
+    def request_stop(signum, _frame):
         nonlocal signal_stop
+        log_event(f"received {signal.Signals(signum).name}; requesting shutdown")
         signal_stop = True
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGHUP, request_stop)
+    log_event(f"starting run={metadata['run_id']} workers_per_pool={cfg.search.workers}")
     try:
         evaluator = metadata["evaluator_library"]
         for kind, env in (("submit", None), ("try", try_worker_env())):
@@ -149,6 +159,7 @@ def serve(run_dir, ready_fd):
         os.write(ready_fd, b"READY\n")
         os.close(ready_fd)
         notified = True
+        log_event("worker pools ready")
         last_reset = last_snapshot = time.monotonic()
         rng = random.Random()
         while True:
@@ -217,6 +228,7 @@ def serve(run_dir, ready_fd):
             time.sleep(0.02)
     except BaseException as exc:
         traceback.print_exc()
+        sys.stderr.flush()
         status, reason = "failed", str(exc)
         # Interrupt workers even if persisting the failed state encounters an
         # error. Pool cleanup must not prevent outputs or the finish hook.
@@ -272,6 +284,7 @@ def serve(run_dir, ready_fd):
             except BaseException:
                 traceback.print_exc()
         finally:
+            log_event(f"shutdown status={status} reason={reason}")
             try:
                 (root / "engine.pid").unlink(missing_ok=True)
             finally:
@@ -284,7 +297,7 @@ def serve(run_dir, ready_fd):
 
 
 def daemonize(run_dir):
-    """Double fork; return only when the daemon's pools are ready."""
+    """Detach an engine and a small exit observer; wait only for readiness."""
     import select
     reader, writer = os.pipe()
     first = os.fork()
@@ -299,6 +312,22 @@ def daemonize(run_dir):
                 os.dup2(null.fileno(), 0)
                 os.dup2(log.fileno(), 1)
                 os.dup2(log.fileno(), 2)
+            sys.stdout.reconfigure(line_buffering=True, write_through=True)
+            sys.stderr.reconfigure(line_buffering=True, write_through=True)
+            engine = os.fork()
+            if engine != 0:
+                # A detached parent can record even SIGKILL, which the engine
+                # cannot catch. It holds no DB connection or evaluator workers.
+                os.close(writer)
+                _, wait_status = os.waitpid(engine, 0)
+                exitcode = os.waitstatus_to_exitcode(wait_status)
+                evidence = {"pid": engine, "ended_at": time.time(),
+                            "exitcode": exitcode,
+                            "signal": -exitcode if exitcode < 0 else None}
+                Path("engine-exit.json").write_text(json.dumps(evidence, indent=2) + "\n")
+                log_event(f"engine pid={engine} exited exitcode={exitcode} signal={evidence['signal']}")
+                os._exit(0)
+            faulthandler.enable(file=sys.stderr, all_threads=True)
             serve(run_dir, writer)
         except BaseException:
             traceback.print_exc()

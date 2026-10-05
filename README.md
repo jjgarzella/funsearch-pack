@@ -128,6 +128,13 @@ ten distinct OK candidates in `top/`. The final and periodic SQLite backups
 live in `snapshots/`, with the latest five retained. Worker errors and daemon
 tracebacks appear in `engine.log`.
 
+The engine flushes timestamped startup, shutdown, and SIGTERM/SIGHUP/SIGINT
+events to `engine.log`; those signals request normal shutdown. Python's
+faulthandler writes fatal-signal stack traces there. A small detached parent
+waits for the engine and writes `engine-exit.json` with its PID, end time,
+exit code, and signal (including SIGKILL). This evidence requires that the
+parent survives; a SIGKILL record alone does not establish an OOM cause.
+
 Optional `--on-start 'command'` and `--on-finish 'command'` hooks receive the
 absolute run directory as an argument and in `FS_RUN_DIR`. The finish hook
 runs after outputs are written, including when the daemon fails. The PID

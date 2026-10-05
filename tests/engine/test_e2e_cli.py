@@ -347,3 +347,51 @@ class EndToEndTests(PipelineTestCase):
         summary = self.finished(root, "failed")
         self.assertIn("on-finish hook", summary["reason"])
         self.assertIn("Traceback", (root / "engine.log").read_text())
+
+    def exit_evidence(self, root):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if (root / "engine-exit.json").exists():
+                return json.loads((root / "engine-exit.json").read_text())
+            time.sleep(0.03)
+        self.fail("exit observer did not record engine status")
+
+    def test_shutdown_signals_are_logged_and_finalize(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=signum):
+                root = self.start(hooks=True)
+                pid = int((root / "engine.pid").read_text())
+                os.kill(pid, signum)
+                self.assertEqual(self.finished(root, "stopped")["reason"], "stop requested")
+                self.assertTrue((root / "finished.marker").exists())
+                evidence = self.exit_evidence(root)
+                self.assertEqual(evidence["pid"], pid)
+                self.assertEqual(evidence["exitcode"], 0)
+                self.assertIsNone(evidence["signal"])
+                self.assertIn(f"received {signal.Signals(signum).name}",
+                              (root / "engine.log").read_text())
+
+    def test_uncatchable_death_and_fatal_trace_are_recorded(self):
+        for signum in (signal.SIGKILL, signal.SIGABRT):
+            with self.subTest(signal=signum):
+                root = self.start()
+                pid = int((root / "engine.pid").read_text())
+                process_text = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
+                workers = [int(line.split()[0]) for line in process_text.splitlines()[1:]
+                           if int(line.split()[1]) == pid and "funsearch-worker" in line]
+                try:
+                    os.kill(pid, signum)
+                    evidence = self.exit_evidence(root)
+                    self.assertEqual(evidence["exitcode"], -signum)
+                    self.assertEqual(evidence["signal"], signum)
+                    self.assertFalse((root / "summary.json").exists())
+                    log = (root / "engine.log").read_text()
+                    self.assertIn(f"signal={signum}", log)
+                    if signum == signal.SIGABRT:
+                        self.assertIn("Fatal Python error: Aborted", log)
+                        self.assertIn("daemon.py", log)
+                finally:
+                    for worker in workers:
+                        if pid_alive(worker):
+                            os.kill(worker, signal.SIGKILL)
+                    (root / "engine.pid").unlink(missing_ok=True)
