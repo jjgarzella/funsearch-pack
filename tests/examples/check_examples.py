@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import select
 import shlex
 import shutil
 import subprocess
@@ -19,6 +20,35 @@ CHECKER = ROOT / "tools/check_cap.py"
 
 
 class CapSetTests(unittest.TestCase):
+    def test_interactive_worker_waits_between_requests(self):
+        process = subprocess.Popen(
+            [str(WORKER), str(EVALUATOR), "n=6"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "FS_MEMORY_MB": "4096"},
+        )
+        try:
+            process.stdin.write("\n")
+            process.stdin.flush()
+            self.assertTrue(select.select([process.stdout], [], [], 30)[0])
+            self.assertEqual(json.loads(process.stdout.readline())["msg"], "bad request")
+            # No queued input: Julia's nonblocking stdin must not cause EAGAIN.
+            self.assertFalse(select.select([process.stdout], [], [], 0.2)[0])
+            self.assertIsNone(process.poll())
+            process.stdin.write(f"SCORE {BUILD / 'seed.so'}\n")
+            process.stdin.flush()
+            self.assertTrue(select.select([process.stdout], [], [], 30)[0])
+            result = json.loads(process.stdout.readline())
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(result["score"], 64)
+            process.stdin.write("QUIT\n")
+            process.stdin.flush()
+            _, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
+
     def run_worker(self, candidates=(), *, instance="n=6", env=None, cwd=None):
         requests = "".join(f"SCORE {BUILD / (name + '.so')}\n" for name in candidates) + "QUIT\n"
         return subprocess.run(

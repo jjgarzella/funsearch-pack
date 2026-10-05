@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,6 +190,19 @@ int main(int argc, char **argv)
             fclose(proto);
             return 3;
         }
+    }
+
+    /* Embedded runtimes such as Julia may make stdin nonblocking during
+     * initialization. The host protocol waits for each engine request. */
+    int input_flags = fcntl(STDIN_FILENO, F_GETFL);
+    if (input_flags < 0 ||
+        fcntl(STDIN_FILENO, F_SETFL, input_flags & ~O_NONBLOCK) < 0) {
+        fatal("cannot restore blocking stdin");
+        if (fini)
+            fini();
+        dlclose(evaluator);
+        fclose(proto);
+        return 3;
     }
 
     while ((length = getline(&line, &capacity, stdin)) >= 0) {
