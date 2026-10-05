@@ -1,0 +1,7 @@
+[problem]
+name = "toy"
+instance = "n=1"
+[candidate]
+exports = ["f"]
+[evaluator]
+build = ""

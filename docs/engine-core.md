@@ -1,0 +1,80 @@
+# Python engine core
+
+The core requires Python 3.12 and uses only the standard library. From the
+repository root, imports use `engine.funsearch`; the eventual entry point can
+add `engine/` to its module path and import `funsearch` directly.
+
+```python
+import random
+from engine.funsearch.config import load_config
+from engine.funsearch.db import Database
+from engine.funsearch.evolve import seed_islands, reset_weakest
+from engine.funsearch.tasks import create_task
+
+cfg = load_config(problem_dir, ["search.islands=6", "stop.max_children=50"])
+with Database(run_dir / "db.sqlite") as db:
+    # The compile/evaluation layer must verify the seed before this call.
+    seed_islands(db, cfg, source, score=result["score"],
+                 sig=result["sig"], msg=result["msg"])
+    rng = random.Random(42)
+    task_id = create_task(db, cfg, problem_dir, run_dir, "slot-1", rng=rng)
+```
+
+`load_config` validates TOML, typed overrides, positive limits (with
+`stop.plateau_children=0` disabling the plateau limit), nonempty exports, and
+required input files. Instance strings remain opaque. Evaluator build output
+need not exist yet. Every schema field has a dataclass default; `exports` must be
+supplied. Problem name and instance default to empty strings when omitted.
+
+`Database` opens SQLite with WAL, foreign keys, and a 5000 ms busy timeout.
+Program, Task, Trial, and Evaluation accessors return immutable dataclass records;
+JSON fields are decoded to Python values. Each process should open its own
+connection. `transaction()` supports composing accessor writes atomically through
+nested savepoints. `backup(path)` uses the SQLite backup API.
+
+The primary operations are:
+
+- Programs: `add_program`, `get_program`, `list_programs`, `best_program`,
+  `has_normalized_hash`, `recent_children`, `archive_island`.
+- Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`.
+- Trials: `reserve_trial(task_id, budget)` atomically consumes a budget slot;
+  `add_trial` stores its eventual result; `list_trials` reads results in order.
+- Queue: `enqueue`, `claim_evaluation` (oldest queued item, atomically),
+  `finish_evaluation`, `get_evaluation`. Queue items transition queued → running
+  → done. The daemon owns recovery if it crashes with running entries.
+- State: `set_state`, `get_state`, `increment_state`; values are JSON.
+
+The core owns state keys `islands`, `next_island`, and `island_resets`. Later
+layers can add run status, started_at, best score, and counters with these state
+accessors. Task ids and program ids are integers. Task directories are
+`<run-dir>/tasks/<task-id>/`; `create_task` returns the id after writing TASK.md.
+It rolls back database changes and removes newly created task files on an error.
+Existing directories are preserved and cause an error rather than being reused.
+
+Normalization hashes canonical C tokens with SHA-256. It ignores comments
+(including IDEA lines), preserves string and character literals, and preserves
+preprocessor line boundaries and object/function macro distinctions. IDEA
+extraction skips literal contents and returns the first actual `// IDEA:` comment.
+It does not attempt general C semantic equivalence.
+
+Evolution groups OK programs by exact score and signatures rounded to eight
+decimal places. Cluster selection uses range-normalized scores and Boltzmann
+weights with `T0=0.1`, `period=30000`, and
+`T=T0*(1-(n_island % period)/period)`. Member selection uses range-normalized
+negative source length at temperature 1. Parents are sampled without replacement;
+invalid programs never become parents. All stochastic evolution accepts an
+explicit `random.Random` for reproducible decisions.
+
+`reset_weakest` archives the weaker floor(N/2) islands, with random tie breaking,
+and copies each new seed from the best program of a randomly selected survivor.
+Archived programs retain their ids so open tasks can still read their parents.
+`list_programs` and hash checks default to active programs; `recent_children`
+includes archived history for the mutator's last-ten summary. New reset seeds
+have no parents and therefore are excluded from that summary.
+
+Run the core acceptance tests with:
+
+```sh
+python3 -m unittest discover -s tests -t . -p 'test_core_*.py' -v
+make test
+```
