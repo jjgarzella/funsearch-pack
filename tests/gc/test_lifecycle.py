@@ -99,6 +99,11 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.hook("on-start", root)
         self.assertEqual(len(self.calls()), count)
         self.summary(root)
+        # Live slots are owned by mutator sessions, not by the finish hook.
+        for row in beads.values():
+            if row["parent"] == "test-1":
+                row.update(status="in_progress", assignee="other-mutator-session")
+        (self.shim_state / "beads.json").write_text(json.dumps(beads))
         # Saved context wins over the invoking sweep's unrelated rig/recipient.
         self.env.update(GC_RIG="other", FS_NOTIFY="wrong")
         self.hook("on-finish", root)

@@ -183,7 +183,9 @@ def finish_locked(root, metadata):
                          "--label", "funsearch-slot", "--all", "--limit", "0", "--json"))
     for row in rows:
         if row["status"] != "closed":
-            gc(city, rig, "bd", "close", row["id"], "--reason", summary["status"])
+            # The engine/sweep owns run shutdown while an active mutator owns
+            # each claimed slot. Terminal cleanup must override that claim.
+            gc(city, rig, "bd", "close", row["id"], "--force", "--reason", summary["status"])
     if fs.get("run_closed") != summary["status"]:
         gc(city, rig, "bd", "close", fs["run_bead"], "--reason", summary["status"])
         fs["run_closed"] = summary["status"]

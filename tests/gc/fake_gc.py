@@ -43,6 +43,8 @@ elif args[:2] == ["bd", "list"]:
 elif args[:2] == ["bd", "close"]:
     bead = args[2]
     assert state[bead]["rig"] == flag("--rig")
+    if state[bead].get("assignee") and "--force" not in args:
+        sys.exit("cannot close a slot claimed by another actor without --force")
     assert not any(row["parent"] == bead and row["status"] != "closed" for row in state.values())
     state[bead]["status"] = "closed"
     state[bead]["close_reason"] = flag("--reason")
