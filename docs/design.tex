@@ -459,24 +459,32 @@ and wrong runs/slots/tasks are denied. File tools can read only the current
 \code{TASK.md} and \code{child.c}; only \code{child.c} is writable.
 Paths with shell metacharacters are unsupported; quoted spaces are allowed.
 
+\subsection{Trust model (v1)}
+Candidate C programs written by LLM mutators are compiled and run natively as
+the invoking user, with that user's filesystem and network access. The mutator
+tool guard and compile source policy keep honest mutators on task and catch
+accidents. They are \textbf{not a security boundary} and do not contain
+adversarial code. Use v1 only for trusted local experiments. OS-level isolation
+is future work, tracked in backlog bead \code{mc-v8f3.5}.
+
 This enforces a Claude tool policy, and it is not a boundary against the
 mutator itself. Gas City's agent schema supplies no OS filesystem/network
 sandbox. The guard must allow \code{try} and \code{submit}, which compile and run
 the mutator's C with the host user's access; that code can rewrite the
 session's generated settings, slot context and run state, and use the city.
 \code{TASK.md} embeds other candidates' source, a prompt-injection channel.
-The engine narrows the easy paths: candidate source may not read files through
-the preprocessor or assembler (absolute, parent or computed includes,
-\code{\#embed}, inline assembly, token pasting), because compiler diagnostics
-reach the mutator; candidate code gets an allowlisted environment (locale,
+The compile source policy is a best-effort lint for common mutator accidents:
+it rejects suspicious includes, \code{\#embed}, inline assembly and token
+pasting. It may reject inert text or miss compiler-specific forms. It does not
+isolate compilation or prevent arbitrary filesystem reads or diagnostic
+disclosure. Candidate code gets an allowlisted environment (locale,
 \code{PATH}, \code{HOME}, \code{TMPDIR} and the problem's \code{evaluator.env}
-patterns); and replies must echo a per-request token. None of this contains
-native code, so the pack provides no adversarial evaluator-hiding boundary;
-unattended runs belong under a dedicated user or container. Symlink swaps by other
+patterns); replies must echo a per-request token. These hygiene measures do
+not contain native code. V1 supports trusted local experiments only; OS-level
+isolation remains backlog work (\code{mc-v8f3.5}). Symlink swaps by other
 processes remain a race. Pack code/settings must be trusted, and launch overrides
 must preserve hooks, project settings, permission mode, tool and MCP restrictions.
 City-managed trusted lifecycle hooks operate outside the model's tool allowlist.
-OS/container isolation remains backlog work.
 
 \subsection{Slot ownership, release and fresh retirement}
 A session claims with \code{gc hook --claim --drain-ack --json}.

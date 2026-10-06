@@ -29,7 +29,7 @@ class CompileTests(PipelineTestCase):
         self.assertIn("error", log)
         self.assertLessEqual(len(log), 4096)
 
-    def test_source_policy_blocks_file_reads_into_compiler_log(self):
+    def test_source_policy_lints_common_file_read_accidents(self):
         secret = self.root / "secret.txt"
         secret.write_text("TOP-SECRET-CONTENT\n")
         (self.root / "sub").mkdir()
@@ -73,7 +73,7 @@ class CompileTests(PipelineTestCase):
                 for mode in ("try", "final"):
                     ok, library, log = compile_candidate(self.cfg, source, self.root / "policy", mode)
                     self.assertFalse(ok)
-                    self.assertTrue(log.startswith("source policy: "), log)
+                    self.assertTrue(log.startswith("source policy lint: "), log)
                     self.assertIn(reason, log)
                     self.assertNotIn("TOP-SECRET", log)
                     self.assertFalse(library.exists())

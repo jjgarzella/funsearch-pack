@@ -88,9 +88,9 @@ def _directives(text):
 
     Every physical line start, and the end of every block comment, may begin
     a directive. Deciding which ones lie inside a comment or a (raw) string
-    literal needs a lexer that agrees with the compiler's, so the policy
-    checks them all: it can over-reject inert text, but cannot miss a
-    directive. Comments may sit before and after "#" and before the operand.
+    literal needs a lexer that agrees with the compiler's, so the lint
+    checks them all. It can reject inert text and may miss compiler-specific
+    forms; it is not a complete C preprocessor. Comments may sit before and after "#" and before the operand.
     """
     gaps, seen = _Gaps(text, newlines=False), set()
     starts = [0, *(match.end() for match in re.finditer(r"\n|\*/", text))]
@@ -131,32 +131,29 @@ def _join_adjacent_literals(text):
 def source_policy_error(source):
     """Return why candidate source may not be compiled, or "".
 
-    Compiler and assembler diagnostics are shown to the mutator, so reading an
-    arbitrary file (an absolute or ../ include, #embed, .incbin, .include)
-    would leak it into the model's context. Ordinary system and sibling headers
-    such as <math.h> and "candidate.h" remain allowed. Inline assembly and
-    token pasting (which could assemble an asm keyword) are rejected outright;
-    the asm checks deliberately match anywhere, comments included.
-
-    This is a textual filter, not a sandbox: it closes the compiler's file
-    reads, while native candidate code still runs as the host user.
+    Best-effort lint for trusted local experiments: ordinary system and
+    sibling headers such as <math.h> and "candidate.h" remain allowed, while
+    suspicious includes and assembler text catch common mutator accidents.
+    This may reject inert text or miss compiler-specific forms. It is not a
+    security boundary and does not isolate compiler filesystem/network access
+    or prevent arbitrary file disclosure. Native code runs as the invoking user.
     """
     for text in _readings(source):
         if _ASM.search(text):
-            return "source policy: inline assembly (asm, __asm, __asm__) is not allowed"
+            return "source policy lint: inline assembly (asm, __asm, __asm__) is not allowed"
         if "##" in text or "%:%:" in text:
-            return "source policy: token pasting (##) is not allowed"
+            return "source policy lint: token pasting (##) is not allowed"
         if _ASSEMBLER_READ.search(text) or _ASSEMBLER_READ.search(_join_adjacent_literals(text)):
-            return "source policy: .incbin and .include are not allowed"
+            return "source policy lint: .incbin and .include are not allowed"
         for directive, operand in _directives(text):
             if directive == "embed":
-                return "source policy: #embed is not allowed"
+                return "source policy lint: #embed is not allowed"
             header = _HEADER.match(operand)
             if not header:
-                return f"source policy: #{directive} must name a literal header"
+                return f"source policy lint: #{directive} must name a literal header"
             name = header.group(1) if header.group(1) is not None else header.group(2)
             if name.startswith("/") or ".." in Path(name).parts:
-                return f"source policy: #{directive} may not use an absolute or parent path"
+                return f"source policy lint: #{directive} may not use an absolute or parent path"
     return ""
 
 

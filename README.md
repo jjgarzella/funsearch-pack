@@ -214,6 +214,16 @@ a new pool session can claim normally.
 
 ## Security notes
 
+### Trust model (v1)
+
+Candidate C programs written by LLM mutators are compiled and run natively as
+the invoking user, with that user's filesystem and network access. The
+mutator tool guard and compile source policy keep honest mutators on task and
+catch accidents. They are **not a security boundary** and do not contain
+adversarial code. Use v1 only for trusted local experiments. OS-level isolation
+is future work, tracked in backlog bead `mc-v8f3.5`.
+
+
 The mutator guard enforces a Claude tool policy, not process isolation, and
 it is **not a boundary against the mutator itself**. Gas City's agent schema has
 no OS filesystem or network sandbox setting. The guard must allow `try` and
@@ -225,15 +235,13 @@ embeds other candidates' source, so a prompt injected there can steer a mutator
 into writing such code. Symlink swaps by another process remain a race. Do not
 use this setup as an adversarial evaluator-hiding boundary.
 
-Mitigations that do not depend on an OS sandbox:
+Best-effort hygiene for trusted local experiments:
 
-- Compiler diagnostics are shown to the mutator, so candidate source may not
-  read files through the preprocessor or assembler. Absolute or `..` includes,
-  computed includes, `#embed`, inline assembly (`asm`, `__asm__`), `##` token
-  pasting, and `incbin`/`.include` text are rejected before compiling. The check
-  treats every line as a possible directive, so an include hidden from a naive
-  lexer (inside a comment, a raw string or a trigraph) is still rejected; it
-  may also reject such text when it is inert.
+- The compile source policy is a best-effort lint. It rejects absolute or `..`
+  includes, computed includes, `#embed`, inline assembly (`asm`, `__asm__`),
+  `##` token pasting, and `incbin`/`.include` text before compiling. It may
+  reject inert text and may miss compiler-specific forms; it does not isolate
+  compilation or prevent arbitrary filesystem reads or diagnostic disclosure.
 - Candidate code (evaluator workers and the export check's library load)
   gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
   `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
@@ -243,10 +251,8 @@ Mitigations that do not depend on an OS sandbox:
   candidate cannot trivially forge its own score on the worker's protocol fd.
   Candidates share the worker's address space, so this only raises the bar.
 
-These shrink the easy paths; they do not contain native code. For unattended or
-untrusted runs, run the city or at least the mutator pool and engine as a
-dedicated user, or in a container, with no access to credentials or other
-projects. OS/container isolation of the worker is separate work.
+These are hygiene measures within the trusted-local model. V1 does not support
+untrusted runs; OS-level isolation remains future work (`mc-v8f3.5`).
 
 The pack and generated settings must remain trusted, and a launch override
 must not disable project settings/hooks, enable permission bypass, or add
