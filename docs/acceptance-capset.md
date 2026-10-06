@@ -1,14 +1,222 @@
-# Live cap-set acceptance — FAIL
+# Live cap-set acceptance — PASS
 
-Date: 2026-10-05 UTC. Acceptance bead: `mc-h4zx.11`; rig:
-`math-experiments`. This is a real formula launch with real Haiku mutators,
-beads, and completion mail. It does **not** satisfy the epic's acceptance gate.
-The acceptance bead remains open; successors must not be dispatched.
+Final acceptance: 2026-10-06 UTC, bead `mc-h4zx.11`, rig
+`math-experiments`. **Best 82 > seed 64; unattended duration completion;
+independent verification passed.** This final result supersedes the failed
+historical runs archived below. All changes land on local pack main only;
+city.toml's authorized import remains for the close-out bead to commit.
 
-Latest diagnosis: the instrumented rerun below exited with **SIGBUS (7)**
-inside SQLite `get_state`; the OOM-kill counter remained **3 → 3**.
-This rerun does not support the OOM hypothesis. The underlying SIGBUS cause
-and the original uninstrumented death remain unresolved.
+## Final run, parameters, and acceptance evidence
+
+Formula `mx-npjn` launched run `20261006-001523-cdca` from pack
+`9cf05f0` through the README command shown in the archive, with exactly
+`stop.duration_s=3600 stop.max_children=100 search.mutators=3`, instance n=6,
+notify kurt. N=1, four islands, two workers per pool, evaluator memory 4096.
+Run bead `mx-etl6`; slot beads `mx-etl6.1`, `.2`, `.3`.
+Engine 85308; detached observer 85283. Artifacts:
+`examples/cap-set/runs/20261006-001523-cdca/`.
+
+| Acceptance criterion | Final evidence |
+| --- | --- |
+| Unattended configured-stop completion | `summary.json`: completed / duration_s; no manual stop or sweep |
+| Run bead closed with summary | `mx-etl6` closed, notes contain best, seed, throughput, OK rate and best.c |
+| Slot beads closed | All three closed by the finish hook |
+| Completion mail | `run.json` checkpoints mail_sent=true, finished=true; city mail event recorded |
+| Registry cleanup | Active entry for this run removed |
+| Improvement | **82 >64**, gain 18 (28.125%) |
+| Best plus top-ten request reproduce scores | Best and all **six available distinct top candidates** match; fewer than ten existed |
+| Every recorded scored result is genuine | All **82** completed evaluation records reproduce status/score/signature with their original compilation mode |
+| Independent exact cap re-check | All **534** verification dumps pass `tools/check_cap.py` |
+| Fresh startup measurement and N recommendation | Five replacements, distinct Gas City session IDs and Claude session keys; recommendation N=5 below |
+| Explicit kill and crash sweep | Earlier real SIGKILL gate passed; retained because these fixes did not change sweep logic |
+
+The observer recorded `exitcode=0`, signal null at
+2026-10-06T01:43:39.519693+00:00.
+Both engine and observer had GC_SESSION_ID/GC_SESSION_NAME/GC_AGENT absent
+in their actual /proc environment, with city/rig/FS_NOTIFY retained;
+`acceptance-process-identity.json` preserves that proof. The engine survived
+retirement of its launcher and reached its own configured stop condition.
+SQLite remained DELETE; no db.sqlite-shm file was observed.
+
+Three slots were created and routed; cumulative inventory records **15 real
+Haiku sessions** with the prescribed restricted launch. Tasks in this run
+were allocated to slots 1 and 2; slot3 stayed routed but idle until finish.
+Thus configuration and slot lifecycle for K=3 were exercised, while full
+three-seat utilization was not established. The report does not claim three
+simultaneously productive mutators or measured ideal K=3 throughput.
+
+## Final metrics and timing limits
+
+| Metric | Value |
+| --- | ---: |
+| Seed / best |64 /82 |
+| Scored submitted evaluations / OK |63 /63 |
+| OK rate |1.0 (100%) |
+| Actual elapsed to summary |5271.617s (87.860min) |
+| Throughput/hour, actual wall-time denominator |43.023 |
+| Distinct stored evolved programs |5 |
+| Allocated / completed / abandoned tasks |7 /5 /2 |
+| Reserved / recorded tries |19 /19 |
+| Mean tries per allocated task |2.714 |
+| Mean tries per completed task |3.000 |
+| Mean completed-task duration |304.600s |
+| Initial session-to-first-task costs |53.714 /56.975s; mean55.344s |
+| Fresh release-to-first-next-task mean / median |313.994 /130.587s |
+
+Scored submissions include authoritative evaluations rejected afterward as
+behavior duplicates. They do not imply 63 distinct stored children; there
+were five. Trials are separate from children_scored.
+
+The configured 3600-second stop completed after **5271.617 seconds** of
+recorded wall time. The sampler observed shared execution gaps, notably
+00:41:02→00:55:55 (893s), 00:56:10→01:12:21 (971s), and
+01:12:36→01:43:30 (1854s). The latter crosses the nominal duration deadline.
+This is evidence of interrupted/delayed execution of the monitor as well as
+the engine, not proof of a specific host/kernel cause. It prevents interpreting
+the stop duration as a strict wall-clock deadline on this host.
+
+The required single 120-second shell monitor eventually reported MONITOR_TIMEOUT
+when it resumed beyond its 100-minute deadline, despite the persisted engine
+completion at01:43:21.149Z. The final checks use the terminal artifacts and
+bead state, not that monitor's exit as a success claim. The engine still
+finished itself with the configured duration reason and clean observer exit.
+
+Memory sampling records global oom_kill **3→5** (delta2):
+
+| Sample UTC | oom_kill | Available RAM MiB | Engine alive |
+| --- | ---: | ---: | --- |
+|00:15:45 |3 |313 |yes |
+|00:16:01 |4 |5499 |yes |
+|00:34:21 |4 |357 |yes |
+|00:34:37 |5 |4758 |yes |
+
+The engine/observer survived both global events. The sampler does not identify
+the killed processes, so they are not attributed to evaluator or mutator
+processes. No reduced-worker run was triggered: the coordinator's retry was
+conditional on engine death with an OOM increase. `mem.log` retains 101 samples,
+counters, free -m, top-RSS processes, and engine liveness.
+
+## Fresh context cost and recommended N
+
+| Slot | Retiring session | Fresh session | Release UTC | First next-task UTC | Seconds |
+| --- | --- | --- | --- | --- | ---: |
+| 1 | `mc-wisp-8ikcu0` | `mc-wisp-9o79wa` | 2026-10-06T00:30:10Z | 2026-10-06T00:32:20.586743+00:00 | 130.587 |
+| 2 | `mc-wisp-f22r5y` | `mc-wisp-u3peio` | 2026-10-06T00:19:21Z | 2026-10-06T00:20:19.433511+00:00 | 58.434 |
+| 2 | `mc-wisp-ntr44o` | `mc-wisp-f0bbgz` | 2026-10-06T00:30:15Z | 2026-10-06T00:33:27.564314+00:00 | 192.564 |
+| 2 | `mc-wisp-f0bbgz` | `mc-wisp-4tk776` | 2026-10-06T00:35:29Z | 2026-10-06T00:37:25.397130+00:00 | 116.397 |
+| 2 | `mc-wisp-4tk776` | `mc-wisp-e0jkzf` | 2026-10-06T00:38:03Z | 2026-10-06T00:55:54.987089+00:00 | 1071.987 |
+
+Every row pairs the closest preceding release/claim with the newly created
+task in that claim interval. Resuming an existing open task is excluded from
+first-next-task measurements. Cumulative session inventory preserves the old
+and new provider keys; both IDs and keys differ in every row. Slot audit
+history contains **zero same-session post-release claims**. These are actual
+fresh-context boundaries, not the reused-context proxy from the failed run.
+
+The four ordinary samples average **124.495s**.
+The 1071.987-second sample spans the large execution gap and raises the full
+mean to 313.994s; it remains in the reported statistics. Median is 130.587s.
+This is end-to-end controller/provider/claim/startup cost, not inference alone.
+
+Recommend **N=5** as the next operating value. The ordinary mean amortizes to
+about24.9s/task and median to26.1s/task, compared with roughly125–131s atN=1;
+the full observed mean amortizes to62.8s/task. N=5 balances that measured cost
+against fresh-context diversity. Keep the acceptance run's N=1 unchanged;
+validate N=5 on a stable host before treating these projections as tuned
+throughput. N cannot eliminate host execution gaps or idle-seat scheduling.
+
+## Final independent verification and best priority function
+
+The formula offers no documented environment passthrough/run-directory choice,
+so the original run did not set FS_CAPSET_DUMP. The permitted rescore route
+was used, with dumps enabled during independent verification.
+
+`funsearch best <run_dir> -k10` returned six distinct candidates. Rescoring
+best and those IDs with `--instance n=6` reproduced all recorded scores:
+
+| Program | Score | Signature |
+| --- | ---: | --- |
+| best | 82 | `[17, 40, 82]` |
+| 8 | 82 | `[17, 40, 82]` |
+| 4 | 79 | `[20, 40, 79]` |
+| 5 | 72 | `[17, 37, 72]` |
+| 6 | 67 | `[20, 36, 67]` |
+| 7 | 67 | `[17, 34, 67]` |
+| 0 | 64 | `[16, 32, 64]` |
+
+All 63 submit evaluations were recompiled with final flags; all 19 try
+evaluations with their original O1 ASan/UBSan flags and matching sanitizer
+worker environment. Every status, score and signature matched. All nine
+stored programs (including island seeds/history) independently matched under
+final compilation. This verifies the actual immutable request/program sources,
+not agent-reported scores. The exact checker passed all 534 dump, including
+partial first-verification dumps and the completed mode-matched replay.
+Artifacts: `acceptance-rescore.json`, `acceptance-cap-check.log`,
+`acceptance-metrics.json`, `acceptance-sessions.json`, and slot histories.
+
+One cross-mode comparison exposed a legitimate reproducibility limitation:
+trial 73 returned `[17,32,67]` under configured O1 sanitizers but `[17,34,67]`
+when recompiled with final O2. Replaying O1 sanitizers reproduced the original
+exactly; the n=6 score stayed 67. Its floating-point priority expression can
+produce compiler-mode-dependent ordering. We do not assume try signatures
+equal final signatures; authoritative submissions use final compilation and
+all final programs/top scores reproduced. No original cap failed exact checking.
+
+Best priority function (program 8, score 82, signature `[17,40,82]`):
+
+```c
+#include "candidate.h"
+
+// IDEA: weighted variance — emphasize balance in count0 which may be more structurally important for avoiding lines
+double priority(const int8_t *v, int32_t n)
+{
+    int count0 = 0, count1 = 0, count2 = 0;
+    for (int32_t i = 0; i < n; i++) {
+        if (v[i] == 0) count0++;
+        else if (v[i] == 1) count1++;
+        else if (v[i] == 2) count2++;
+    }
+
+    double avg = n / 3.0;
+    double dev0 = (count0 - avg) * (count0 - avg);
+    double dev1 = (count1 - avg) * (count1 - avg);
+    double dev2 = (count2 - avg) * (count2 - avg);
+
+    // Weight count0 more heavily, count1 and count2 equally
+    double weighted_var = 1.5 * dev0 + 0.75 * dev1 + 0.75 * dev2;
+
+    return -weighted_var;
+}
+```
+
+## Final changes, validation, and disposition
+
+The acceptance work locally landed the blocking-stdin fix `db3bfe1`, claimed
+slot cleanup `8c99686`, death diagnostics `dc8778c`, rollback journaling
+`d3794d0`, and detached-identity/fresh-retirement fixes `9cf05f0`.
+Historical reports retain the discovery evidence below.
+
+For the final implementation, the prescribed gate
+`make worker && make -C examples/cap-set/evaluator && make test` passed:
+**106 Python tests, 21 Julia assertions, nine cap-set checks, skill-template
+check, 13 worker checks**. Focused 14 retirement/identity tests, gc lint, and
+git diff --check passed. Re-exec preserves the short snapshot/shutdown test
+seams; test cleanup waits for the exit observer to prevent artifact races.
+Log: `/tmp/fs-mc-h4zx.11-detach-make-test.log`;
+focused log `/tmp/fs-mc-h4zx.11-retirement-tests.log`.
+
+Direct embedded Julia remains the justified fallback because Kaimon's
+managed-project allow-list excludes this exact FunSearch project/worktree.
+No shared Julia session or service was modified. No code was pushed or
+committed in math-city/math-experiments. Keep the authorized city import.
+Final disposition: **PASS; close acceptance and dispatch the eligible
+successor under the bead's rules.** All retained timing/utilization limits
+are reported explicitly rather than hidden in successful status.
+
+## Historical failed runs and diagnosis archive
+
+The following sections preserve earlier FAIL outcomes and their then-current
+open/hold dispositions. They are superseded by the final PASS above.
 
 ## Run and outcome
 
