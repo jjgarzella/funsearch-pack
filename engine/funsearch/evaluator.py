@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from ._process import run_command
+from ._process import run_command, worker_environment
 from .compile import check_exports
 
 
@@ -23,7 +23,7 @@ def build_evaluator(cfg, problem_dir):
     library = (root / cfg.evaluator.library).resolve()
     if not library.is_file():
         raise EvaluatorBuildError(f"evaluator library does not exist: {library}")
-    ok, message = check_exports(library, ["fs_score"])
+    ok, message = check_exports(library, ["fs_score"], worker_environment(cfg))
     if not ok:
         raise EvaluatorBuildError(f"invalid evaluator library: {message}")
     return library

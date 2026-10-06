@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from ._process import candidate_environment, kill_group, run_command
+from ._process import kill_group, run_command, worker_environment
 
 
 START_TIMEOUT_S = 60
@@ -22,8 +22,10 @@ START_ATTEMPTS = 3
 STDERR_LIMIT_BYTES = 1 << 20
 # Replace a warm worker once candidates have consumed this fraction of its
 # memory budget and it is still growing, before leaks from earlier candidates
-# fail an innocent one.
+# fail an innocent one. Growth counts only in steps of at least
+# RECYCLE_STEP_FRACTION of the budget, so page-level jitter is not a leak.
 RECYCLE_FRACTION = 0.5
+RECYCLE_STEP_FRACTION = 1 / 16
 # Startup failures carry this much of the worker's stderr (evaluator output).
 STDERR_TAIL_BYTES = 2048
 _build_lock = threading.Lock()
@@ -117,8 +119,7 @@ class Worker:
         self.cfg = cfg
         self.evaluator_so = Path(evaluator_so).resolve()
         self.instance = instance
-        self.env = candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})},
-                                         cfg.evaluator.env)
+        self.env = worker_environment(cfg, extra_env)
         self.binary = worker_binary()
         self.process = None
         self._stderr = None
@@ -127,7 +128,7 @@ class Worker:
         self._closed = False
         self._failure = None
         self._baseline_kb = None
-        self._last_kb = None
+        self._mark_kb = None
         self._recycle_due = False
         self._start()
 
@@ -226,8 +227,7 @@ class Worker:
                     raise EvaluatorInitError(str(reply["fatal"]))
                 if reply != _error("bad request"):
                     raise WorkerError(f"unexpected worker startup response: {reply!r}")
-                self._baseline_kb = _memory_kb(self.process.pid, self._memory_field())
-                self._last_kb = None
+                self._baseline_kb = self._mark_kb = _memory_kb(self.process.pid, self._memory_field())
                 return
             except EvaluatorInitError as exc:
                 message = self._with_startup_stderr(str(exc))
@@ -259,20 +259,25 @@ class Worker:
 
         Allocators and GC runtimes (an embedded Julia) keep their peak mapped
         and reuse it, so a high but stable level is not a leak; recycling on it
-        would cold-start the worker after every score. Only growth since the
-        previous score, beyond the threshold, counts.
+        would cold-start the worker after every score. The mark is the
+        high-water level below the threshold (the baseline at start). Past the
+        threshold it stays fixed, and the worker recycles once memory exceeds
+        it by a step: a leak past the threshold in one score, or a slow leak
+        that keeps adding up. Smaller jitter around a retained peak does not.
         """
         if self._baseline_kb is None or self.process is None:
             return False
         current = _memory_kb(self.process.pid, self._memory_field())
         if current is None:
             return False
-        previous, self._last_kb = self._last_kb, current
         budget = self.cfg.evaluator.memory_mb * 1024
         if "FS_MEMORY_MB" in self.env:
             budget -= self._baseline_kb
-        return (previous is not None and current > previous
-                and current - self._baseline_kb > RECYCLE_FRACTION * max(budget, 0))
+        if current - self._baseline_kb <= RECYCLE_FRACTION * budget:
+            self._mark_kb = max(self._mark_kb, current)
+            return False
+        # Without budget left past the baseline, a fresh worker is no better.
+        return budget > 0 and current - self._mark_kb >= RECYCLE_STEP_FRACTION * budget
 
     def _trim_stderr(self):
         # The worker shares this file's offset, so rewinding it here bounds

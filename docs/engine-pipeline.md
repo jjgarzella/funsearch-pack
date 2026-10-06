@@ -65,9 +65,11 @@ block the protocol. Startup failures (including `EvaluatorInitError`) append
 its last 2 KiB, which only the worker and evaluator have written at that point.
 Stderr written while scoring may come from candidate code, so it never reaches
 results; the engine truncates the file after a score once it exceeds 1 MiB.
-Workers get the allowlisted `candidate_environment()` (see `CANDIDATE_ENV`),
-plus variables matching `evaluator.env`; the export check's ctypes fallback
-loads candidates under the same environment.
+Workers get `worker_environment(cfg)`: the `CANDIDATE_ENV` allowlist, plus
+variables matching `evaluator.env` and `FS_MEMORY_MB`. The export check's
+ctypes fallback loads both candidate and evaluator libraries under the same
+environment (with the sanitizer overlay for try-mode candidates), so library
+constructors see what the worker will.
 
 Each request is `SCORE #<token> <path>` with a fresh random token. A reply
 counts only if it echoes that token; anything else is a protocol error, scored
@@ -80,11 +82,16 @@ A warm worker accumulates whatever earlier candidates leaked. After each score,
 the engine compares the worker's memory with its post-startup baseline:
 virtual size against the `FS_MEMORY_MB` address-space limit for final workers,
 and resident size against `evaluator.memory_mb` for sanitizer workers. When it
-is past half of the remaining budget and has grown since the previous score,
-the worker is replaced at the start of the next request, before that request's
-timeout starts, so leaks do not fail a later, innocent candidate. A stable high
-level is a retained peak (allocator arenas, an embedded GC heap such as
-Julia's) that later candidates reuse, so it does not recycle the worker.
+is past half of the remaining budget and has grown by at least 1/16 of the
+budget beyond its mark (the highest level seen below the threshold, the
+baseline at start), the worker is replaced at the start of the next request,
+before that request's timeout starts, so leaks do not fail a later, innocent
+candidate. That catches a leak past the threshold in one score, including the
+first after a restart, and a slow leak that adds up. A stable high level, give
+or take page-level jitter, is a retained peak (allocator arenas, an embedded GC
+heap such as Julia's) that later candidates reuse, so it does not recycle the
+worker. A legitimate first score that retains more than half the budget does
+recycle every time; raise `evaluator.memory_mb` for such evaluators.
 
 `score(library, timeout_s)` returns `status`, `score`, `sig`, and `msg`. Scoring
 timeouts return ERROR with `timeout after Ns`; crashes return ERROR with

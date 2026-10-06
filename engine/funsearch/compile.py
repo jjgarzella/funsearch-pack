@@ -1,5 +1,6 @@
 """Candidate compilation and shared-library export checks (stdlib only)."""
 
+from bisect import bisect_left
 import json
 import os
 from pathlib import Path
@@ -9,21 +10,17 @@ import shutil
 import subprocess
 import sys
 
-from ._process import LOG_BYTES, candidate_environment, run_command
+from ._process import LOG_BYTES, run_command, worker_environment
 
 
 COMPILE_TIMEOUT_S = 60
-# A directive starts a line, after spaces and block comments. Comments may sit
-# between "#" and the name, and before the operand.
-_GAP = r"(?:[ \t\f\v]|/\*[\s\S]*?\*/)*"
-_DIRECTIVE = re.compile(_GAP + r"(?:#|%:)" + _GAP + r"(include_next|include|import|embed)\b"
-                        + _GAP + r"([^\n]*)")
+_DIRECTIVE_NAME = re.compile(r"(include_next|include|import|embed)\b")
 _HEADER = re.compile(r'"([^"\n]*)"|<([^>\n]*)>')
 _TRIGRAPH = re.compile(r"\?\?([=/'()!<>-])")
 _TRIGRAPHS = dict(zip("=/'()!<>-", "#\\^[]|{}~"))
 _SPLICES = (re.compile(r"\\\n"), re.compile(r"\\[ \t\f\v]*\n"))
 _ASM = re.compile(r"(?<![A-Za-z0-9_$])(?:__asm__|__asm|asm)(?![A-Za-z0-9_$])")
-_ADJACENT_LITERALS = re.compile(r'"(?:\s|/\*[\s\S]*?\*/|//[^\n]*\n)*(?:u8|u|U|L)?"')
+_LITERAL_PREFIX = re.compile(r'(?:u8|u|U|L)?"')
 _ASSEMBLER_READ = re.compile(r"incbin|\.include", re.I)
 
 
@@ -41,15 +38,94 @@ def _readings(source):
             yield splice.sub("", base)
 
 
-def _directive_starts(text):
-    # Every physical line start, and the end of every block comment, may begin
-    # a directive. Deciding which ones lie inside a comment or a (raw) string
-    # literal needs a lexer that agrees with the compiler's, so the policy
-    # checks them all: it can over-reject inert text, but cannot miss a
-    # directive.
-    yield 0
-    for match in re.finditer(r"\n|\*/", text):
-        yield match.end()
+class _Gaps:
+    """Where a run of blanks and comments starting at a position ends.
+
+    A block comment ends at the first "*/" after its "/*", as in C. Comment
+    ends are found by bisection and each comment's continuation is memoized,
+    so scanning from every possible start stays near-linear in the source
+    (regexes with a repeated comment body backtrack exponentially when
+    comments are stacked). An unterminated comment ends the gap; the
+    compiler rejects it anyway.
+    """
+
+    def __init__(self, text, newlines):
+        self.text = text
+        # newlines: literal concatenation (whitespace incl. newlines and //
+        # comments); otherwise a directive line (spaces and block comments).
+        self.blanks = " \t\f\v\n" if newlines else " \t\f\v"
+        self.newlines = newlines
+        self.closes = [match.start() for match in re.finditer(r"\*/", text)]
+        self.line_ends = [match.start() for match in re.finditer(r"\n", text)] if newlines else []
+        self.memo = {}
+
+    def end(self, pos):
+        text, visited = self.text, []
+        while pos not in self.memo:
+            visited.append(pos)
+            while pos < len(text) and text[pos] in self.blanks:
+                pos += 1
+            if text.startswith("/*", pos):
+                index = bisect_left(self.closes, pos + 2)
+                if index == len(self.closes):
+                    break
+                pos = self.closes[index] + 2
+            elif self.newlines and text.startswith("//", pos):
+                index = bisect_left(self.line_ends, pos)
+                if index == len(self.line_ends):
+                    break
+                pos = self.line_ends[index] + 1
+            else:
+                break
+        pos = self.memo.get(pos, pos)
+        for start in visited:
+            self.memo[start] = pos
+        return pos
+
+
+def _directives(text):
+    """Yield (directive, operand) for every possible directive start.
+
+    Every physical line start, and the end of every block comment, may begin
+    a directive. Deciding which ones lie inside a comment or a (raw) string
+    literal needs a lexer that agrees with the compiler's, so the policy
+    checks them all: it can over-reject inert text, but cannot miss a
+    directive. Comments may sit before and after "#" and before the operand.
+    """
+    gaps, seen = _Gaps(text, newlines=False), set()
+    starts = [0, *(match.end() for match in re.finditer(r"\n|\*/", text))]
+    for start in starts:
+        pos = gaps.end(start)
+        # Starts inside one comment all reach the same "#"; parse it once.
+        if pos in seen:
+            continue
+        seen.add(pos)
+        if text.startswith("#", pos):
+            pos += 1
+        elif text.startswith("%:", pos):
+            pos += 2
+        else:
+            continue
+        name = _DIRECTIVE_NAME.match(text, gaps.end(pos))
+        if name:
+            operand = gaps.end(name.end())
+            line_end = text.find("\n", operand)
+            yield name[1], text[operand:len(text) if line_end < 0 else line_end]
+
+
+def _join_adjacent_literals(text):
+    """Remove each closing quote, blanks/comments and opening quote between
+    adjacent string literals, so split assembler keywords become visible."""
+    gaps = _Gaps(text, newlines=True)
+    pieces, cursor, quote = [], 0, text.find('"')
+    while quote >= 0:
+        joined = _LITERAL_PREFIX.match(text, gaps.end(quote + 1))
+        if joined:
+            pieces.append(text[cursor:quote])
+            cursor = joined.end()
+        quote = text.find('"', joined.end() if joined else quote + 1)
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def source_policy_error(source):
@@ -70,13 +146,9 @@ def source_policy_error(source):
             return "source policy: inline assembly (asm, __asm, __asm__) is not allowed"
         if "##" in text or "%:%:" in text:
             return "source policy: token pasting (##) is not allowed"
-        if _ASSEMBLER_READ.search(text) or _ASSEMBLER_READ.search(_ADJACENT_LITERALS.sub("", text)):
+        if _ASSEMBLER_READ.search(text) or _ASSEMBLER_READ.search(_join_adjacent_literals(text)):
             return "source policy: .incbin and .include are not allowed"
-        for start in _directive_starts(text):
-            match = _DIRECTIVE.match(text, start)
-            if not match:
-                continue
-            directive, operand = match.groups()
+        for directive, operand in _directives(text):
             if directive == "embed":
                 return "source policy: #embed is not allowed"
             header = _HEADER.match(operand)
@@ -111,12 +183,13 @@ def try_worker_env():
             "FS_MEMORY_MB": None}
 
 
-def check_exports(so_path, exports, extra_env=None):
+def check_exports(so_path, exports, env):
     """Return (ok, message); only fall back to dlsym when nm is unavailable.
 
     The ctypes fallback runs in isolation so constructors (or an ASan library)
-    cannot crash the engine process. Those constructors are candidate code, so
-    the child gets the candidate environment, not the engine's.
+    cannot crash the engine process. Those constructors are evaluator or
+    candidate code, so the child gets env (from worker_environment()), not the
+    engine's environment.
     """
     path = str(Path(so_path).resolve())
     if shutil.which("nm"):
@@ -144,7 +217,7 @@ def check_exports(so_path, exports, extra_env=None):
         try:
             result = subprocess.run([sys.executable, "-c", script, path, json.dumps(exports)],
                                     capture_output=True, text=True, timeout=60,
-                                    env=candidate_environment(extra_env))
+                                    env=env)
             if result.returncode:
                 return False, f"cannot load library for export check: {result.stderr[:LOG_BYTES]}"
             missing = json.loads(result.stdout)
@@ -180,7 +253,7 @@ def compile_candidate(cfg, src_path, out_dir, mode):
         ok, message = False, f"compiler did not produce {library}"
     elif ok:
         extra_env = try_worker_env() if mode == "try" and not shutil.which("nm") else None
-        ok, message = check_exports(library, cfg.candidate.exports, extra_env)
+        ok, message = check_exports(library, cfg.candidate.exports, worker_environment(cfg, extra_env))
     else:
         message = ""
     if message:

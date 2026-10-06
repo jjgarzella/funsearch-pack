@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
-    STDERR_LIMIT_BYTES, EvaluatorInitError, Worker, WorkerError, WorkerPool, _checked_reply, worker_binary)
+    RECYCLE_FRACTION, RECYCLE_STEP_FRACTION, STDERR_LIMIT_BYTES, EvaluatorInitError, Worker,
+    WorkerError, WorkerPool, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
 
 
@@ -201,6 +202,11 @@ double f(void) {
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def recycle_levels(self, baseline):
+        """(threshold, step) in KiB above the baseline for a VmSize worker."""
+        budget = self.cfg.evaluator.memory_mb * 1024 - baseline
+        return RECYCLE_FRACTION * budget, RECYCLE_STEP_FRACTION * budget
+
     def test_leaking_worker_is_recycled_before_the_next_request(self):
         baseline = 100_000
         values = {"VmSize": baseline}
@@ -209,16 +215,17 @@ double f(void) {
         worker = pool.workers[0]
         process = worker.process
         good = self.candidate("good")
-        threshold = baseline + (self.cfg.evaluator.memory_mb * 1024 - baseline) // 2
-        # A stable high level is a retained peak (allocator or GC heap), not
-        # a leak: it never recycles, however high.
-        values["VmSize"] = threshold + 1000
-        for _ in range(3):
+        threshold, step = self.recycle_levels(baseline)
+        mark = int(baseline + threshold - 1000)
+        # A high but stable level is a retained peak (allocator or GC heap),
+        # not a leak: page-level jitter above the threshold never recycles.
+        for level in (mark, mark + 2000, mark + 6000, mark + 2000, mark + 6004, mark + 6008):
+            values["VmSize"] = level
             self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIs(worker.process, process)
-        # Growth past the threshold recycles, but only before the next
+        # Growth of a step past the mark recycles, but only before the next
         # request: the reply already in hand is returned first.
-        values["VmSize"] += 1
+        values["VmSize"] = int(mark + step)
         self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIs(worker.process, process)
         values["VmSize"] = baseline + 7
@@ -228,6 +235,42 @@ double f(void) {
         # The replacement measures its own baseline, not the old reading.
         self.assertEqual(worker._baseline_kb, baseline + 7)
 
+    def test_one_shot_leak_after_start_is_recycled(self):
+        # The first score after a (re)start counts: a candidate that leaks
+        # past the threshold at once, followed by flat ones, is still replaced.
+        baseline = 100_000
+        values = {"VmSize": baseline}
+        self.memory(values)
+        pool = self.pool()
+        worker = pool.workers[0]
+        process = worker.process
+        good = self.candidate("good")
+        threshold, _ = self.recycle_levels(baseline)
+        values["VmSize"] = int(baseline + threshold + 1)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIsNot(worker.process, process)
+
+    def test_slow_leak_past_the_threshold_adds_up(self):
+        baseline = 100_000
+        values = {"VmSize": baseline}
+        self.memory(values)
+        pool = self.pool()
+        worker = pool.workers[0]
+        process = worker.process
+        good = self.candidate("good")
+        threshold, step = self.recycle_levels(baseline)
+        mark = int(baseline + threshold)
+        for growth in (0, step / 4, step / 2, 3 * step / 4):
+            values["VmSize"] = int(mark + growth)
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+        values["VmSize"] = int(mark + step)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIsNot(worker.process, process)
+
     def test_growth_up_to_the_threshold_does_not_recycle(self):
         baseline = 100_000
         values = {"VmSize": baseline}
@@ -236,25 +279,38 @@ double f(void) {
         worker = pool.workers[0]
         process = worker.process
         good = self.candidate("good")
-        threshold = baseline + (self.cfg.evaluator.memory_mb * 1024 - baseline) / 2
-        for level in (threshold - 10, threshold, baseline):
+        threshold, _ = self.recycle_levels(baseline)
+        for level in (baseline + threshold - 10, baseline + threshold, baseline):
             values["VmSize"] = level
             self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIs(worker.process, process)
 
     def test_sanitizer_worker_recycles_on_resident_size(self):
         # Without FS_MEMORY_MB there is no RLIMIT_AS: only VmRSS is read
-        # (VmSize would raise KeyError) and the budget keeps the baseline.
-        values = {"VmRSS": 50_000}
+        # (VmSize would raise KeyError), and the baseline is not taken off
+        # the budget, which has no address-space limit to share with it.
+        baseline = 50_000
+        values = {"VmRSS": baseline}
         self.memory(values)
         pool = self.pool(extra_env={"FS_MEMORY_MB": None})
         worker = pool.workers[0]
         process = worker.process
         good = self.candidate("good")
-        half = self.cfg.evaluator.memory_mb * 1024 // 2
-        for level in (50_000 + half - 1, 50_000 + half + 1, 50_000):
-            values["VmRSS"] = level
+        budget = self.cfg.evaluator.memory_mb * 1024
+        unreduced = RECYCLE_FRACTION * budget
+        reduced = RECYCLE_FRACTION * (budget - baseline)
+        # Past the reduced threshold by more than a step, under the real one.
+        between = int(baseline + (reduced + unreduced) / 2)
+        self.assertGreater(between - baseline - reduced, 0)
+        self.assertGreater(between - baseline, RECYCLE_STEP_FRACTION * budget)
+        for _ in range(2):
+            values["VmRSS"] = between
             self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+        values["VmRSS"] = int(baseline + unreduced + RECYCLE_STEP_FRACTION * budget)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        values["VmRSS"] = baseline
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIsNot(worker.process, process)
 
     def test_failed_recycle_fails_later_requests(self):
@@ -264,8 +320,6 @@ double f(void) {
         worker = pool.workers[0]
         good = self.candidate("good")
         values["VmSize"] = self.cfg.evaluator.memory_mb * 1024 - 2
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        values["VmSize"] += 1
         self.assertEqual(pool.score(good, 5)["score"], 3.5)
         with patch.object(worker, "_start", side_effect=WorkerError("cannot restart")):
             with self.assertRaisesRegex(WorkerError, "cannot restart"):

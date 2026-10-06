@@ -10,10 +10,11 @@ import tempfile
 LOG_BYTES = 4096
 
 
-# Candidate code runs as the host user, in evaluator workers and in the export
-# check. It sees only this allowlist, plus the evaluator.env patterns a problem
-# declares, so identity, store scope and credentials added to the engine's
-# environment (by Gas City or anything else) never reach it by default.
+# Candidate and evaluator code runs as the host user, in evaluator workers and
+# in the export check. It sees only this allowlist, plus the evaluator.env
+# patterns a problem declares, so identity, store scope and credentials added
+# to the engine's environment (by Gas City or anything else) never reach it by
+# default. worker_environment() is the one place that applies the policy.
 CANDIDATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_*", "TZ",
                  "TMPDIR", "LD_LIBRARY_PATH")
 
@@ -29,6 +30,17 @@ def candidate_environment(extra_env=None, passthrough=()):
         else:
             result[key] = str(value)
     return result
+
+
+def worker_environment(cfg, extra_env=None):
+    """Environment for every process that loads evaluator or candidate code.
+
+    Worker spawn and the export checks (candidate and evaluator libraries)
+    all use it, so constructors see what the worker will. extra_env is a
+    mode overlay such as try_worker_env(); None values remove variables.
+    """
+    return candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})},
+                                 cfg.evaluator.env)
 
 
 def kill_group(process):
