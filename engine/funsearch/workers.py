@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from ._process import kill_group, run_command, worker_environment
+from ._process import candidate_environment, kill_group, run_command
 
 
 START_TIMEOUT_S = 60
@@ -21,8 +21,11 @@ START_ATTEMPTS = 3
 # Candidate output is diagnostics only; keep at most this much per worker.
 STDERR_LIMIT_BYTES = 1 << 20
 # Replace a warm worker once candidates have consumed this fraction of its
-# memory budget, before leaks from earlier candidates fail an innocent one.
+# memory budget and it is still growing, before leaks from earlier candidates
+# fail an innocent one.
 RECYCLE_FRACTION = 0.5
+# Startup failures carry this much of the worker's stderr (evaluator output).
+STDERR_TAIL_BYTES = 2048
 _build_lock = threading.Lock()
 
 
@@ -114,7 +117,8 @@ class Worker:
         self.cfg = cfg
         self.evaluator_so = Path(evaluator_so).resolve()
         self.instance = instance
-        self.env = worker_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})})
+        self.env = candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})},
+                                         cfg.evaluator.env)
         self.binary = worker_binary()
         self.process = None
         self._stderr = None
@@ -123,6 +127,8 @@ class Worker:
         self._closed = False
         self._failure = None
         self._baseline_kb = None
+        self._last_kb = None
+        self._recycle_due = False
         self._start()
 
     def _line(self, deadline):
@@ -180,6 +186,23 @@ class Worker:
         detail = f"signal {-code}" if code < 0 else f"exit code {code}"
         return "worker crashed: " + detail
 
+    def _with_startup_stderr(self, message):
+        """Append the tail of a starting worker's stderr to message.
+
+        Only the worker and evaluator have run at startup, so this is the
+        evaluator author's diagnostic. Stderr written while scoring may come
+        from candidate code and is never copied into results the mutator sees.
+        """
+        if self._stderr is None:
+            return message
+        try:
+            size = os.fstat(self._stderr.fileno()).st_size
+            self._stderr.seek(max(0, size - STDERR_TAIL_BYTES))
+            tail = self._stderr.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            return message
+        return f"{message}\nworker stderr:\n{tail}" if tail else message
+
     def _start(self):
         last_error = None
         for _ in range(START_ATTEMPTS):
@@ -204,21 +227,25 @@ class Worker:
                 if reply != _error("bad request"):
                     raise WorkerError(f"unexpected worker startup response: {reply!r}")
                 self._baseline_kb = _memory_kb(self.process.pid, self._memory_field())
+                self._last_kb = None
                 return
-            except EvaluatorInitError:
+            except EvaluatorInitError as exc:
+                message = self._with_startup_stderr(str(exc))
                 self._dispose()
-                raise
+                raise EvaluatorInitError(message) from None
             except (EOFError, OSError, TimeoutError, ValueError, WorkerError) as exc:
                 if isinstance(exc, (EOFError, BrokenPipeError)) and self.process is not None:
                     try:
                         last_error = self._crash_message()
-                    except EvaluatorInitError:
+                    except EvaluatorInitError as init_error:
+                        message = self._with_startup_stderr(str(init_error))
                         self._dispose()
-                        raise
+                        raise EvaluatorInitError(message) from None
                 elif isinstance(exc, TimeoutError):
                     last_error = f"worker startup timeout after {START_TIMEOUT_S:g}s"
                 else:
                     last_error = str(exc)
+                last_error = self._with_startup_stderr(last_error)
                 self._dispose()
         raise WorkerError(f"worker failed to start after {START_ATTEMPTS} attempts: {last_error}")
 
@@ -228,15 +255,24 @@ class Worker:
         return "VmSize" if "FS_MEMORY_MB" in self.env else "VmRSS"
 
     def _should_recycle(self):
+        """Whether candidates leaked: memory is past the threshold and grew.
+
+        Allocators and GC runtimes (an embedded Julia) keep their peak mapped
+        and reuse it, so a high but stable level is not a leak; recycling on it
+        would cold-start the worker after every score. Only growth since the
+        previous score, beyond the threshold, counts.
+        """
         if self._baseline_kb is None or self.process is None:
             return False
         current = _memory_kb(self.process.pid, self._memory_field())
         if current is None:
             return False
+        previous, self._last_kb = self._last_kb, current
         budget = self.cfg.evaluator.memory_mb * 1024
         if "FS_MEMORY_MB" in self.env:
             budget -= self._baseline_kb
-        return current - self._baseline_kb > RECYCLE_FRACTION * max(budget, 0)
+        return (previous is not None and current > previous
+                and current - self._baseline_kb > RECYCLE_FRACTION * max(budget, 0))
 
     def _trim_stderr(self):
         # The worker shares this file's offset, so rewinding it here bounds
@@ -259,6 +295,14 @@ class Worker:
                 raise WorkerError("worker is closed")
             if self._failure is not None:
                 raise self._failure
+            if self._recycle_due:
+                # Outside the deadline: the replacement's fs_init is not
+                # charged to this candidate's timeout.
+                self._recycle()
+                if self._failure is not None:
+                    raise self._failure
+                if self.process is None:
+                    raise WorkerError("worker is closed")
             deadline = time.monotonic() + timeout_s
             nonce = secrets.token_hex(16)
             try:
@@ -277,8 +321,9 @@ class Worker:
                 result = _error(f"worker protocol error: {exc}")
             else:
                 self._trim_stderr()
-                if self._should_recycle():
-                    self._recycle()
+                # Replace a leaking worker before the next request, not while
+                # this caller waits for the reply already in hand.
+                self._recycle_due = self._should_recycle()
                 return reply
             self._dispose()
             if self._closed:
@@ -294,11 +339,11 @@ class Worker:
 
     def _recycle(self):
         """Replace a healthy worker whose candidates leaked too much memory."""
+        self._recycle_due = False
         self._dispose(graceful=True)
         try:
             self._start()
         except WorkerError as exc:
-            # The reply already in hand is valid; later calls report this.
             if not self._closed:
                 self._failure = exc
 

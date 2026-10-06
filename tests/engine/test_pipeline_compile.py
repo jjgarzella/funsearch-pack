@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import shlex
+import shutil
 import sys
 from unittest.mock import patch
 
@@ -39,7 +41,19 @@ class CompileTests(PipelineTestCase):
                    f'#include_next "{secret}"\n',
                    f'#define P "{secret}"\n#include P\n',
                    f'#embed "{secret}"\n',
-                   f'__asm__(".incbin \\"{secret}\\"");\n')
+                   f'__asm__(".incbin \\"{secret}\\"");\n',
+                   # A C lexer ends a stray quote at the line end; the
+                   # include is live although a multi-line literal hides it.
+                   f"#if 0\n'\n#endif\n//' /*\n#include \"{secret}\"\n// */\n",
+                   f'const char *r = R"x(" /* )x";\n#include "{secret}"\n// */\n',
+                   f"int n = 1'/*';\n#include \"{secret}\"\n// */\n",
+                   f'??=include "{secret}"\n',
+                   f'#inc\\  \nlude "{secret}"\n',
+                   f'__asm__(".inc\\\nbin \\"{secret}\\"");\n',
+                   f'__asm__(".inc" "bin \\"{secret}\\"");\n',
+                   f'__asm__(".include \\"{secret}\\"");\n',
+                   f'#define P(a, b) a##b\nP(__as, m__)(".text");\n',
+                   f'__attribute__((section(".text\\n.inc" "bin \\"{secret}\\""))) int y;\n')
         for text in blocked:
             with self.subTest(text=text):
                 source = self.root / "sub" / "candidate.c"
@@ -57,6 +71,21 @@ class CompileTests(PipelineTestCase):
         (allowed.parent / "candidate.h").write_text("double f(void);\n")
         ok, _, log = compile_candidate(self.cfg, allowed, self.root / "allowed", "final")
         self.assertTrue(ok, log)
+
+    def test_export_check_fallback_runs_constructors_in_candidate_environment(self):
+        source = self.source('#include <stdio.h>\n#include <stdlib.h>\n'
+                             '__attribute__((constructor)) static void leak(void) {\n'
+                             '    const char *v = getenv("ANTHROPIC_API_KEY");\n'
+                             '    fprintf(stderr, "seen=%s\\n", v ? v : "none"); exit(1);\n}\n'
+                             'double f(void) { return 1; }\n')
+        real_which = shutil.which
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-leak"}), \
+                patch("engine.funsearch.compile.shutil.which",
+                      side_effect=lambda name: None if name == "nm" else real_which(name)):
+            ok, _, log = compile_candidate(self.cfg, source, self.root / "ctor", "final")
+        self.assertFalse(ok)
+        self.assertIn("seen=none", log)
+        self.assertNotIn("sk-leak", log)
 
     def test_missing_export_and_undefined_export(self):
         for source in ("double other(void) { return 1; }",

@@ -39,13 +39,26 @@ The primary operations are:
 
 - Programs: `add_program`, `get_program`, `list_programs`, `best_program`,
   `has_normalized_hash`, `recent_children`, `archive_island`.
-- Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`.
+- Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`;
+  `open_tasks_for_slot(slot)` lists a slot's unfinished tasks (more than one
+  means the slot is corrupt); `abandon_stale_tasks(cutoff)` abandons open tasks
+  created before `cutoff` that have no queued or running evaluation, and returns
+  how many it closed.
 - Trials: `reserve_trial(task_id, budget)` atomically consumes a budget slot;
   `add_trial` stores its eventual result; `list_trials` reads results in order.
 - Queue: `enqueue`, `claim_evaluation` (oldest queued item, atomically),
-  `finish_evaluation`, `get_evaluation`. Queue items transition queued → running
-  → done. The daemon owns recovery if it crashes with running entries.
-- State: `set_state`, `get_state`, `increment_state`; values are JSON.
+  `finish_evaluation`, `get_evaluation`; `has_pending_submission(task_id)` is
+  true while a submission for the task is queued or running, and
+  `running_evaluations()` lists running items. Queue items transition queued →
+  running → done. If the engine dies, `funsearch run recover <run-dir>`
+  (`daemon.recover_outputs`, which the Gas City sweep calls) writes failed
+  outputs from the live database, or from the newest readable snapshot when
+  the live one is unreadable.
+- State: `set_state`, `get_state`, `increment_state`, `all_state` (every key);
+  values are JSON.
+
+Code outside the engine (the Gas City lifecycle script, the mutator guard)
+uses these methods rather than SQL, so the schema stays private to `db.py`.
 
 The core owns state keys `islands`, `next_island`, and `island_resets`. Later
 layers can add run status, started_at, best score, and counters with these state

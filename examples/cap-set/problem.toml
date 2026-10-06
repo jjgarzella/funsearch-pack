@@ -13,6 +13,8 @@ build = "make -C evaluator"
 library = "evaluator/libcapset.so"
 timeout_s = 30
 memory_mb = 4096
+# Workers get an allowlisted environment; keep Julia's and this evaluator's.
+env = ["JULIA_*", "FS_CAPSET_*"]
 
 [search]
 islands = 4

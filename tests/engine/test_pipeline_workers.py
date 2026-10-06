@@ -194,29 +194,110 @@ double f(void) {
                 self.assertEqual(_checked_reply(dict(good, nonce="n", **change), "n"), {
                     "status": "ERROR", "score": 0, "sig": [], "msg": "non-finite score or signature"})
 
-    def test_leaky_worker_is_recycled_between_scores(self):
+    def memory(self, values):
+        """Report worker memory from values (field -> KiB), which tests mutate."""
+        patcher = patch("engine.funsearch.workers._memory_kb",
+                        side_effect=lambda pid, field: values[field])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_leaking_worker_is_recycled_before_the_next_request(self):
+        baseline = 100_000
+        values = {"VmSize": baseline}
+        self.memory(values)
         pool = self.pool()
         worker = pool.workers[0]
         process = worker.process
         good = self.candidate("good")
+        threshold = baseline + (self.cfg.evaluator.memory_mb * 1024 - baseline) // 2
+        # A stable high level is a retained peak (allocator or GC heap), not
+        # a leak: it never recycles, however high.
+        values["VmSize"] = threshold + 1000
+        for _ in range(3):
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+        # Growth past the threshold recycles, but only before the next
+        # request: the reply already in hand is returned first.
+        values["VmSize"] += 1
         self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIs(worker.process, process)
-        limit_kb = self.cfg.evaluator.memory_mb * 1024
-        with patch("engine.funsearch.workers._memory_kb", return_value=limit_kb):
-            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        values["VmSize"] = baseline + 7
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
         self.assertIsNot(worker.process, process)
         self.assertEqual(process.returncode, 0)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        # The replacement measures its own baseline, not the old reading.
+        self.assertEqual(worker._baseline_kb, baseline + 7)
 
-    def test_worker_environment_drops_city_identity_and_secrets(self):
+    def test_growth_up_to_the_threshold_does_not_recycle(self):
+        baseline = 100_000
+        values = {"VmSize": baseline}
+        self.memory(values)
+        pool = self.pool()
+        worker = pool.workers[0]
+        process = worker.process
+        good = self.candidate("good")
+        threshold = baseline + (self.cfg.evaluator.memory_mb * 1024 - baseline) / 2
+        for level in (threshold - 10, threshold, baseline):
+            values["VmSize"] = level
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+
+    def test_sanitizer_worker_recycles_on_resident_size(self):
+        # Without FS_MEMORY_MB there is no RLIMIT_AS: only VmRSS is read
+        # (VmSize would raise KeyError) and the budget keeps the baseline.
+        values = {"VmRSS": 50_000}
+        self.memory(values)
+        pool = self.pool(extra_env={"FS_MEMORY_MB": None})
+        worker = pool.workers[0]
+        process = worker.process
+        good = self.candidate("good")
+        half = self.cfg.evaluator.memory_mb * 1024 // 2
+        for level in (50_000 + half - 1, 50_000 + half + 1, 50_000):
+            values["VmRSS"] = level
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIsNot(worker.process, process)
+
+    def test_failed_recycle_fails_later_requests(self):
+        values = {"VmSize": 100_000}
+        self.memory(values)
+        pool = self.pool()
+        worker = pool.workers[0]
+        good = self.candidate("good")
+        values["VmSize"] = self.cfg.evaluator.memory_mb * 1024 - 2
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        values["VmSize"] += 1
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        with patch.object(worker, "_start", side_effect=WorkerError("cannot restart")):
+            with self.assertRaisesRegex(WorkerError, "cannot restart"):
+                pool.score(good, 5)
+        with self.assertRaisesRegex(WorkerError, "cannot restart"):
+            pool.score(good, 5)
+
+    def test_candidate_environment_is_an_allowlist(self):
         private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
-                   "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent"}
-        with patch.dict(os.environ, private):
+                   "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent", "FS_STORE": "/x",
+                   "SOLVER_LICENSE": "l"}
+        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "SOLVER_LICENSE_FILE": "/opt/l"}
+        self.cfg.evaluator.env = ["SOLVER_*_FILE"]
+        with patch.dict(os.environ, {**private, **public}):
             pool = self.pool(extra_env={"KEEP_ME": "1"})
         env = pool.workers[0].env
         self.assertFalse(set(private) & set(env))
+        self.assertLessEqual(public.items(), env.items())
         self.assertEqual(env["KEEP_ME"], "1")
         self.assertIn("PATH", env)
+
+    def test_startup_failures_include_evaluator_stderr(self):
+        init = self.source("#!/bin/sh\necho 'julia: no depot' >&2\nexit 3\n", "init-fail")
+        crash = self.source("#!/bin/sh\necho 'cannot dup' >&2\nexit 1\n", "crash")
+        for binary, error, text in ((init, EvaluatorInitError, "code 3\nworker stderr:\njulia: no depot"),
+                                    (crash, WorkerError, "exit code 1\nworker stderr:\ncannot dup")):
+            binary.chmod(0o755)
+            with self.subTest(binary=binary.name), \
+                    patch("engine.funsearch.workers.worker_binary", return_value=binary):
+                with self.assertRaises(error) as caught:
+                    self.pool()
+                self.assertIn(text, str(caught.exception))
 
     def test_respawning_is_bounded_to_three_attempts(self):
         pool = self.pool()

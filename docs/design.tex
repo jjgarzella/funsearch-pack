@@ -467,9 +467,10 @@ session's generated settings, slot context and run state, and use the city.
 \code{TASK.md} embeds other candidates' source, a prompt-injection channel.
 The engine narrows the easy paths: candidate source may not read files through
 the preprocessor or assembler (absolute, parent or computed includes,
-\code{\#embed}, \code{.incbin}), because compiler diagnostics reach the mutator;
-workers start without Gas City, store and credential-like environment
-variables; and replies must echo a per-request token. None of this contains
+\code{\#embed}, inline assembly, token pasting), because compiler diagnostics
+reach the mutator; candidate code gets an allowlisted environment (locale,
+\code{PATH}, \code{HOME}, \code{TMPDIR} and the problem's \code{evaluator.env}
+patterns); and replies must echo a per-request token. None of this contains
 native code, so the pack provides no adversarial evaluator-hiding boundary;
 unattended runs belong under a dedicated user or container. Symlink swaps by other
 processes remain a race. Pack code/settings must be trusted, and launch overrides
@@ -507,12 +508,14 @@ gc sling <rig>/<pool> funsearch-run --formula \
   --var instance=n=6 --var notify=<recipient> \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 \end{lstlisting}
-The start agent resolves the pack through \code{gc formula list --json},
-then calls \path{scripts/gc_lifecycle.py} launch with literal quoted values.
+The start agent takes the pack root from the \code{pack} variable or, when
+that is empty, from the \code{gc.formula\_source} metadata gc records on the
+workflow root, and stops for the operator if neither yields the pack. It then
+calls \path{scripts/gc_lifecycle.py} launch with literal quoted values.
 That helper parses overrides as data, invokes run start with on-start/on-finish
 hooks, and supplies \code{FS\_NOTIFY}. The start step records run ID/directory
 and closes while the search continues. A rig-local formula override needs the
-operator-supplied pack location; there is no generic formula-agent
+operator-supplied \code{pack} variable; there is no generic formula-agent
 \code{PACK\_DIR} assumption. Resume uses the recorded run rather than relaunching.
 
 The start hook creates a \code{funsearch-run} bead in the starting rig and K

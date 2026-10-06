@@ -9,39 +9,82 @@ import shutil
 import subprocess
 import sys
 
-from ._process import LOG_BYTES, environment, run_command
-from .normalize import _TOKEN
+from ._process import LOG_BYTES, candidate_environment, run_command
 
 
 COMPILE_TIMEOUT_S = 60
-_DIRECTIVE = re.compile(r"^[ \t]*(?:#|%:)[ \t]*(include_next|include|import|embed)\b[ \t]*(.*)$", re.M)
+# A directive starts a line, after spaces and block comments. Comments may sit
+# between "#" and the name, and before the operand.
+_GAP = r"(?:[ \t\f\v]|/\*[\s\S]*?\*/)*"
+_DIRECTIVE = re.compile(_GAP + r"(?:#|%:)" + _GAP + r"(include_next|include|import|embed)\b"
+                        + _GAP + r"([^\n]*)")
 _HEADER = re.compile(r'"([^"\n]*)"|<([^>\n]*)>')
+_TRIGRAPH = re.compile(r"\?\?([=/'()!<>-])")
+_TRIGRAPHS = dict(zip("=/'()!<>-", "#\\^[]|{}~"))
+_SPLICES = (re.compile(r"\\\n"), re.compile(r"\\[ \t\f\v]*\n"))
+_ASM = re.compile(r"(?<![A-Za-z0-9_$])(?:__asm__|__asm|asm)(?![A-Za-z0-9_$])")
+_ADJACENT_LITERALS = re.compile(r'"(?:\s|/\*[\s\S]*?\*/|//[^\n]*\n)*(?:u8|u|U|L)?"')
+_ASSEMBLER_READ = re.compile(r"incbin|\.include", re.I)
+
+
+def _readings(source):
+    """Yield each plausible translation-phase 1-2 text of source.
+
+    Compilers differ on trigraphs (ISO modes replace them) and on spaces
+    between a backslash and a newline (GCC and Clang still splice). A directive
+    that one reading hides is live in another, so the policy checks them all.
+    """
+    text = source.replace("\r\n", "\n").replace("\r", "\n")
+    for trigraphs in (False, True):
+        base = _TRIGRAPH.sub(lambda match: _TRIGRAPHS[match[1]], text) if trigraphs else text
+        for splice in _SPLICES:
+            yield splice.sub("", base)
+
+
+def _directive_starts(text):
+    # Every physical line start, and the end of every block comment, may begin
+    # a directive. Deciding which ones lie inside a comment or a (raw) string
+    # literal needs a lexer that agrees with the compiler's, so the policy
+    # checks them all: it can over-reject inert text, but cannot miss a
+    # directive.
+    yield 0
+    for match in re.finditer(r"\n|\*/", text):
+        yield match.end()
 
 
 def source_policy_error(source):
     """Return why candidate source may not be compiled, or "".
 
-    Compiler diagnostics are shown to the mutator, so a preprocessor read of
-    an arbitrary file (an absolute or ../ include, #embed, .incbin) would leak
-    that file into the model's context. Ordinary system and sibling headers
-    such as <math.h> and "candidate.h" remain allowed.
+    Compiler and assembler diagnostics are shown to the mutator, so reading an
+    arbitrary file (an absolute or ../ include, #embed, .incbin, .include)
+    would leak it into the model's context. Ordinary system and sibling headers
+    such as <math.h> and "candidate.h" remain allowed. Inline assembly and
+    token pasting (which could assemble an asm keyword) are rejected outright;
+    the asm checks deliberately match anywhere, comments included.
+
+    This is a textual filter, not a sandbox: it closes the compiler's file
+    reads, while native candidate code still runs as the host user.
     """
-    if re.search(r"\bincbin\b", source):
-        return "source policy: .incbin is not allowed"
-    text = source.replace("\\\r\n", "").replace("\\\n", "")
-    # Comments act as spaces; string literals stay intact.
-    text = "".join(" " if match.lastgroup == "comment" else match.group()
-                   for match in _TOKEN.finditer(text))
-    for match in _DIRECTIVE.finditer(text):
-        directive, operand = match.groups()
-        if directive == "embed":
-            return "source policy: #embed is not allowed"
-        header = _HEADER.match(operand)
-        if not header:
-            return f"source policy: #{directive} must name a literal header"
-        name = header.group(1) if header.group(1) is not None else header.group(2)
-        if name.startswith("/") or ".." in Path(name).parts:
-            return f"source policy: #{directive} may not use an absolute or parent path"
+    for text in _readings(source):
+        if _ASM.search(text):
+            return "source policy: inline assembly (asm, __asm, __asm__) is not allowed"
+        if "##" in text or "%:%:" in text:
+            return "source policy: token pasting (##) is not allowed"
+        if _ASSEMBLER_READ.search(text) or _ASSEMBLER_READ.search(_ADJACENT_LITERALS.sub("", text)):
+            return "source policy: .incbin and .include are not allowed"
+        for start in _directive_starts(text):
+            match = _DIRECTIVE.match(text, start)
+            if not match:
+                continue
+            directive, operand = match.groups()
+            if directive == "embed":
+                return "source policy: #embed is not allowed"
+            header = _HEADER.match(operand)
+            if not header:
+                return f"source policy: #{directive} must name a literal header"
+            name = header.group(1) if header.group(1) is not None else header.group(2)
+            if name.startswith("/") or ".." in Path(name).parts:
+                return f"source policy: #{directive} may not use an absolute or parent path"
     return ""
 
 
@@ -72,7 +115,8 @@ def check_exports(so_path, exports, extra_env=None):
     """Return (ok, message); only fall back to dlsym when nm is unavailable.
 
     The ctypes fallback runs in isolation so constructors (or an ASan library)
-    cannot crash the engine process.
+    cannot crash the engine process. Those constructors are candidate code, so
+    the child gets the candidate environment, not the engine's.
     """
     path = str(Path(so_path).resolve())
     if shutil.which("nm"):
@@ -100,7 +144,7 @@ def check_exports(so_path, exports, extra_env=None):
         try:
             result = subprocess.run([sys.executable, "-c", script, path, json.dumps(exports)],
                                     capture_output=True, text=True, timeout=60,
-                                    env=environment(extra_env))
+                                    env=candidate_environment(extra_env))
             if result.returncode:
                 return False, f"cannot load library for export check: {result.stderr[:LOG_BYTES]}"
             missing = json.loads(result.stdout)

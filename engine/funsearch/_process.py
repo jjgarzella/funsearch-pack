@@ -1,5 +1,6 @@
 """Bounded shell commands shared by the compilation pipeline."""
 
+from fnmatch import fnmatchcase
 import os
 import signal
 import subprocess
@@ -9,33 +10,19 @@ import tempfile
 LOG_BYTES = 4096
 
 
-def environment(extra_env=None):
-    """Overlay process environment; None explicitly removes a variable."""
-    result = os.environ.copy()
-    for key, value in (extra_env or {}).items():
-        if value is None:
-            result.pop(key, None)
-        else:
-            result[key] = str(value)
-    return result
+# Candidate code runs as the host user, in evaluator workers and in the export
+# check. It sees only this allowlist, plus the evaluator.env patterns a problem
+# declares, so identity, store scope and credentials added to the engine's
+# environment (by Gas City or anything else) never reach it by default.
+CANDIDATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_*", "TZ",
+                 "TMPDIR", "LD_LIBRARY_PATH")
 
 
-# Candidate code runs inside evaluator workers as the host user. Do not hand it
-# Gas City identity, store scope or credentials it never needs to score.
-_PRIVATE_PREFIXES = ("GC_", "BEADS_", "ANTHROPIC_", "CLAUDE_", "FS_GC", "FS_CITY_PATH",
-                     "FS_RIG", "FS_NOTIFY")
-_PRIVATE_NAMES = ("SSH_AUTH_SOCK", "GPG_AGENT_INFO")
-_PRIVATE_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "CREDENTIAL")
-
-
-def worker_environment(extra_env=None):
-    """Like environment(), minus city identity and credential-like variables."""
-    result = environment()
-    for key in list(result):
-        upper = key.upper()
-        if (upper.startswith(_PRIVATE_PREFIXES) or upper in _PRIVATE_NAMES
-                or any(word in upper for word in _PRIVATE_WORDS)):
-            del result[key]
+def candidate_environment(extra_env=None, passthrough=()):
+    """Allowlisted environment for candidate code; None in extra_env removes."""
+    patterns = (*CANDIDATE_ENV, *passthrough)
+    result = {key: value for key, value in os.environ.items()
+              if any(fnmatchcase(key, pattern) for pattern in patterns)}
     for key, value in (extra_env or {}).items():
         if value is None:
             result.pop(key, None)

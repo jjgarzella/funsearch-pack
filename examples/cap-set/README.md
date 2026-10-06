@@ -40,7 +40,9 @@ for sanitizer trials because ASan reserves a large shadow mapping; final
 scoring retains the configured 4096 MB limit.
 
 To save and independently check every verified cap during a run, set the
-dump directory before starting it (the engine and workers must inherit it):
+dump directory before starting it (the engine and workers must inherit it;
+`evaluator.env` in problem.toml passes `FS_CAPSET_*` and `JULIA_*` through the
+workers' allowlisted environment):
 
 ```sh
 export FS_CAPSET_DUMP="$PWD/build/cap-dumps"

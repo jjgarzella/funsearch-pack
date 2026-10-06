@@ -47,7 +47,10 @@ gc sling <rig>/<pool> funsearch-run --formula \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 ```
 
-Omit `instance` and `overrides` to use the problem defaults. Overrides may set
+Omit `instance` and `overrides` to use the problem defaults. The start step
+finds the pack from the formula source gc records on the workflow; if you
+override `funsearch-run` locally in a rig, add `--var pack=/absolute/path/to/funsearch-pack`.
+Overrides may set
 only `search.*`, `stop.*`, `mutator.model` and `instance`; keys that hold shell
 commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
 `problem.toml`. The seed must score
@@ -118,7 +121,7 @@ ready. Configuration, the seed, the problem statement, and the candidate
 header are saved in the run directory. Each try or submission compiles a
 private source copy; includes of `candidate.h` work there and during rescore.
 Candidate source may not include absolute or `..` paths, use computed
-includes, `#embed` or `.incbin` (see Security notes).
+includes, `#embed`, inline assembly or `##` token pasting (see Security notes).
 Try results print `RESULT <status> <score> <message>`; accepted submissions
 print `ACCEPTED <program-id> <status> <score>`. A rejected submission leaves
 its task open. A compile failure during try consumes a trial and records an
@@ -226,10 +229,16 @@ Mitigations that do not depend on an OS sandbox:
 
 - Compiler diagnostics are shown to the mutator, so candidate source may not
   read files through the preprocessor or assembler. Absolute or `..` includes,
-  computed includes, `#embed` and `.incbin` are rejected before compiling.
-- Evaluator workers start without Gas City identity and store variables
-  (`GC_*`, `BEADS_*`), Anthropic/Claude variables, the SSH/GPG agent sockets, or
-  variables whose names look like tokens, secrets, passwords or API keys.
+  computed includes, `#embed`, inline assembly (`asm`, `__asm__`), `##` token
+  pasting, and `incbin`/`.include` text are rejected before compiling. The check
+  treats every line as a possible directive, so an include hidden from a naive
+  lexer (inside a comment, a raw string or a trigraph) is still rejected; it
+  may also reject such text when it is inert.
+- Candidate code (evaluator workers and the export check's library load)
+  gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
+  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
+  the problem's `evaluator.env`. Gas City identity, store scope, agent sockets
+  and credentials are not passed on unless a pattern names them.
 - Each scoring request carries a random token that a reply must echo, so a
   candidate cannot trivially forge its own score on the worker's protocol fd.
   Candidates share the worker's address space, so this only raises the bar.

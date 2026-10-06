@@ -271,6 +271,10 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.assertEqual(len(formula["steps"]), 1)
         self.assertTrue(formula["vars"]["problem"]["required"])
         self.assertTrue(formula["vars"]["notify"]["required"])
+        # The pack root comes from the runtime or the operator, never a search.
+        self.assertEqual(formula["vars"]["pack"]["default"], "")
+        self.assertIn("gc.formula_source", formula["steps"][0]["description"])
+        self.assertNotIn("formula list", formula["steps"][0]["description"])
         order = tomllib.loads((ROOT / "orders" / "funsearch-sweep.toml").read_text())["order"]
         self.assertEqual(order["trigger"], "condition")
         self.assertNotIn("pool", order)

@@ -16,6 +16,9 @@ build = "make -C evaluator"      # Runs in the problem directory; uses FS_PACK.
 library = "evaluator/libevaluator.so" # Relative to the problem directory.
 timeout_s = 30                   # Per scoring call, including verification.
 memory_mb = 2048                 # Allow for any runtime embedded by the evaluator.
+# Workers see only PATH, HOME, USER, LOGNAME, LANG*, LC_*, TZ, TMPDIR and
+# LD_LIBRARY_PATH. List other variables fs_init/fs_score read (fnmatch patterns).
+env = []                         # e.g. ["JULIA_*", "MYEVAL_*"]
 
 [search]
 # Keep these tuning defaults for the first validated baseline.

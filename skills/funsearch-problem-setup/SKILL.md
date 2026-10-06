@@ -124,6 +124,21 @@ language works if the shared library exports these C symbols with this ABI;
 for example, a C wrapper can embed Julia. See
 [`examples/cap-set`](../../examples/cap-set) for the worked example.
 
+The evaluator shares its worker process with candidate code, so workers start
+with an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
+`LANGUAGE`, `LC_*`, `TZ`, `TMPDIR` and `LD_LIBRARY_PATH`, plus `FS_MEMORY_MB`.
+An evaluator that reads any other variable (an embedded runtime's `JULIA_*`,
+your own `MYEVAL_DEBUG`) must list it in `evaluator.env` as an fnmatch pattern,
+or `getenv` returns NULL under the engine although it works in your shell.
+Candidates can read every variable a worker has, so never pass a token, API
+key or licence secret this way: read it from a file only the evaluator needs,
+or hard-code non-secret settings. If `fs_init` fails, its stderr (last 2 KiB)
+is appended to the startup error, so print the reason before returning nonzero.
+
+Candidate source, including `seed.c`, may not use absolute or `..` includes,
+computed includes, `#embed`, inline assembly or `##` token pasting; these
+words are rejected even in comments.
+
 ## 5. Harden the evaluator before searching
 
 Program search can exploit verifier loopholes. Apply these checks to the
@@ -174,6 +189,7 @@ Choose these settings deliberately:
 | `problem.instance` | Default instance string, parsed by your evaluator; override with `--instance`. |
 | `evaluator.timeout_s` | Time allowed per scoring call, including all required verification. |
 | `evaluator.memory_mb` | Memory limit; allow enough for any embedded runtime. |
+| `evaluator.env` | Variable patterns the evaluator reads beyond the worker allowlist; never secrets. |
 | `search.trial_budget` | Number of local trial evaluations a candidate author can use per task. |
 | `search.mutators` | Number of concurrent candidate authors; start small to control cost. |
 | `search.tasks_per_session` | Tasks before a candidate author starts with fresh context. |

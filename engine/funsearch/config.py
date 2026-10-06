@@ -30,6 +30,8 @@ class Evaluator:
     library: str = "evaluator/libevaluator.so"
     timeout_s: float = 30
     memory_mb: int = 2048
+    # Extra variable names (fnmatch patterns) evaluator workers inherit.
+    env: list[str] = field(default_factory=list)
 
 
 @dataclass

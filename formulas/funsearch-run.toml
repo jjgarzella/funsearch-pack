@@ -20,6 +20,10 @@ default = ""
 description = "Completion-mail recipient; required because no reliable slinger recipient is exported"
 required = true
 
+[vars.pack]
+description = "Absolute FunSearch pack root; empty uses this workflow's recorded gc.formula_source"
+default = ""
+
 [vars.overrides]
 description = "Space-separated key=value overrides of search.*, stop.*, mutator.model or instance; other keys are rejected"
 default = ""
@@ -33,13 +37,20 @@ problem: {{problem}}
 instance: {{instance}}
 notify: {{notify}}
 overrides: {{overrides}}
+pack: {{pack}}
 
 Require GC_CITY_PATH and GC_RIG from the rig-scoped agent environment.
-Resolve this pack without a filesystem search: run `gc formula list --json`,
-select the formulas row named funsearch-run, resolve its source symlink, then
-take the parent of its formulas directory. Confirm bin/funsearch and
-scripts/gc_lifecycle.py exist there. If the formula is a rig-local override,
-use the imported FunSearch pack location supplied by the operator instead.
+The pack root <pack> comes from the runtime, never from a search or a guess:
+- If pack above is non-empty, use it.
+- Otherwise read this step's gc.root_bead_id metadata (the step itself when
+  absent), run `gc bd show <root> --json`, and take its gc.formula_source
+  metadata, which gc records when it instantiates the formula. Resolve it with
+  `realpath`; <pack> is the parent of the directory containing it.
+Then require <pack>/formulas/funsearch-run.toml, <pack>/bin/funsearch and
+<pack>/scripts/gc_lifecycle.py to exist. If gc.formula_source is missing, or
+those files are absent (for example a rig-local override of this formula),
+stop: record the reason in this step's notes, leave the step open, and ask the
+operator to re-sling with --var pack=<absolute pack root>.
 
 Run `python3 <pack>/scripts/gc_lifecycle.py launch <problem> --instance <instance>
 --notify <notify> --overrides <overrides>` once, passing each value as one
