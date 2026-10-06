@@ -4,7 +4,7 @@ import math
 import random
 
 from .config import Config
-from .db import Database, Program
+from .db import Database, Program, ProgramSummary
 
 
 DEFAULT_TEMPERATURE = 0.1
@@ -12,7 +12,8 @@ DEFAULT_PERIOD = 30000
 SIGNATURE_DIGITS = 8
 
 
-def cluster_programs(programs: list[Program], *, digits=SIGNATURE_DIGITS) -> dict[tuple, list[Program]]:
+def cluster_programs(programs: list[Program | ProgramSummary], *,
+                     digits=SIGNATURE_DIGITS) -> dict[tuple, list]:
     clusters = {}
     for program in programs:
         if program.status != "OK" or program.score is None:
@@ -51,23 +52,26 @@ def seed_islands(db: Database, cfg: Config, source: str, *, score: float,
 
 def sample_parents(db: Database, island: int, count: int, rng: random.Random,
                    *, temperature=DEFAULT_TEMPERATURE, period=DEFAULT_PERIOD) -> list[Program]:
-    """Sample without replacement, clusters first and then shorter members."""
+    """Sample without replacement, clusters first and then shorter members.
+
+    Runs inside next-task's writer transaction, so it reads only the sampling
+    fields and loads full source for the chosen parents alone.
+    """
     if count < 1 or temperature <= 0 or period < 1:
         raise ValueError("count, temperature and period must be positive")
-    programs = db.list_programs(island)
-    clusters = cluster_programs(programs)
-    current_temperature = temperature * (1 - (len(programs) % period) / period)
+    clusters = cluster_programs(db.scored_summaries(island))
+    current_temperature = temperature * (1 - (db.count_programs(island) % period) / period)
     parents = []
     for _ in range(min(count, sum(map(len, clusters.values())))):
         keys = list(clusters)
         key = _softmax_pick(keys, [key[0] for key in keys], current_temperature, rng)
         members = clusters[key]
-        parent = _softmax_pick(members, [-len(p.source) for p in members], 1.0, rng)
+        parent = _softmax_pick(members, [-p.length for p in members], 1.0, rng)
         parents.append(parent)
         members.remove(parent)
         if not members:
             del clusters[key]
-    return parents
+    return [db.get_program(parent.id) for parent in parents]
 
 
 def reset_weakest(db: Database, rng: random.Random, *, islands=None) -> list[int]:

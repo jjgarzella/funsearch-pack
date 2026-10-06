@@ -157,11 +157,13 @@ def source_policy_error(source):
     return ""
 
 
-def try_worker_env():
+def try_worker_env(cfg):
     """Environment needed to load ASan candidates in a separate worker.
 
     None removes FS_MEMORY_MB: ASan's large virtual shadow mapping cannot
-    coexist with an RLIMIT_AS limit. Normal workers retain the configured limit.
+    coexist with an RLIMIT_AS limit. ASan's own limits keep evaluator.memory_mb
+    instead: the worker aborts once its RSS exceeds it, and a larger single
+    allocation returns NULL. Normal workers retain the RLIMIT_AS limit.
     """
     compiler = shlex.split(os.environ.get("CC", "cc"))
     try:
@@ -175,8 +177,10 @@ def try_worker_env():
     preload = str(runtime.resolve())
     if os.environ.get("LD_PRELOAD"):
         preload += " " + os.environ["LD_PRELOAD"]
+    memory_mb = int(cfg.evaluator.memory_mb)
     return {"LD_PRELOAD": preload,
-            "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1",
+            "ASAN_OPTIONS": (f"detect_leaks=0:abort_on_error=1:hard_rss_limit_mb={memory_mb}"
+                             f":max_allocation_size_mb={memory_mb}:allocator_may_return_null=1"),
             "FS_MEMORY_MB": None}
 
 
@@ -249,7 +253,7 @@ def compile_candidate(cfg, src_path, out_dir, mode):
     if ok and not library.is_file():
         ok, message = False, f"compiler did not produce {library}"
     elif ok:
-        extra_env = try_worker_env() if mode == "try" and not shutil.which("nm") else None
+        extra_env = try_worker_env(cfg) if mode == "try" and not shutil.which("nm") else None
         ok, message = check_exports(library, cfg.candidate.exports, worker_environment(cfg, extra_env))
     else:
         message = ""

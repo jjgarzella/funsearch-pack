@@ -182,9 +182,13 @@ class CompileTests(PipelineTestCase):
         import subprocess
         output = subprocess.run(["nm", "-D", str(library)], capture_output=True, text=True, check=True).stdout
         self.assertIn("__asan", output)
-        env = try_worker_env()
+        env = try_worker_env(self.cfg)
         self.assertTrue(Path(env["LD_PRELOAD"].split()[0]).is_file())
-        self.assertEqual(env["ASAN_OPTIONS"], "detect_leaks=0:abort_on_error=1")
+        limit = self.cfg.evaluator.memory_mb
+        self.assertEqual(env["ASAN_OPTIONS"],
+                         f"detect_leaks=0:abort_on_error=1:hard_rss_limit_mb={limit}"
+                         f":max_allocation_size_mb={limit}:allocator_may_return_null=1")
+        self.assertIsNone(env["FS_MEMORY_MB"])
 
     def test_sanitized_ctypes_fallback(self):
         with patch("engine.funsearch.compile.shutil.which", return_value=None):

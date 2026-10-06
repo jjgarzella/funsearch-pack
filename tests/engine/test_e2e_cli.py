@@ -1,6 +1,7 @@
 """Real CLI/daemon/worker integration, with a scripted C mutator."""
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -219,6 +220,19 @@ class EndToEndTests(PipelineTestCase):
         self.cli("run", "start", self.problem, "--run-id", root.name, code=2)
         self.assertEqual((root / "run.json").read_text(), before)
 
+    def test_run_scores_with_its_own_evaluator_snapshot(self):
+        root = self.start()
+        metadata = json.loads((root / "run.json").read_text())
+        library = Path(metadata["evaluator_library"])
+        self.assertEqual(library.parent, root / "evaluator")
+        self.assertEqual(metadata["evaluator_sha256"], hashlib.sha256(library.read_bytes()).hexdigest())
+        # Rebuilding or breaking the problem's evaluator cannot reach the run:
+        # a fresh rescore worker still loads the run-owned copy.
+        Path(metadata["evaluator_source"]).write_bytes(b"not a shared library")
+        task_id, directory = self.task(root)
+        self.assertIn("ACCEPTED", self.cli("submit", root, task_id, self.child(directory, 2)))
+        self.assertEqual(json.loads(self.cli("rescore", root, "best", "--instance", "n=1"))["status"], "OK")
+
     def test_same_task_concurrent_submissions_score_once(self):
         root = self.start()
         task_id, directory = self.task(root)
@@ -268,6 +282,31 @@ class EndToEndTests(PipelineTestCase):
             for future in futures:
                 future.result()
         self.assertEqual(self.finished(root)["children_scored"], 2)
+
+    def test_run_opens_even_if_launcher_dies_during_start_hook(self):
+        root = self.problem / "runs" / "orphaned"
+        self.runs.append(root)
+        hook = self.root / "slow_hook.py"
+        hook.write_text("import sys, time\nfrom pathlib import Path\n"
+                        "Path(sys.argv[1], 'hook.started').touch()\ntime.sleep(2)\n"
+                        "Path(sys.argv[1], 'started.marker').touch()\n")
+        launcher = subprocess.Popen(
+            [str(CLI), "run", "start", str(self.problem), "--run-id", root.name,
+             "--set", "search.islands=2", "--set", "search.workers=1", "--set", "stop.duration_s=60",
+             "--on-start", f"{sys.executable} {shlex.quote(str(hook))}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 15
+        while not (root / "hook.started").exists() and time.monotonic() < deadline:
+            time.sleep(0.03)
+        self.assertTrue((root / "hook.started").exists())
+        launcher.kill()
+        launcher.wait(timeout=5)
+        # The daemon owns the start hook, so the run still opens for business:
+        # requests queue while the hook runs and are scored after it finishes.
+        task_id, directory = self.task(root)
+        self.assertIn("ACCEPTED", self.cli("submit", root, task_id, self.child(directory, 2)))
+        self.assertTrue((root / "started.marker").exists())
+        self.assertIn("launcher exited before readiness", (root / "engine.log").read_text())
 
     def test_on_start_failure_still_finalizes_and_invokes_finish(self):
         root = self.problem / "runs" / "hook-fails"
@@ -437,6 +476,41 @@ class EndToEndTests(PipelineTestCase):
         self.cli("submit", root, task, self.child(directory))
         self.finished(root)
         self.assertEqual(self.exit_evidence(root)["exitcode"], 0)
+
+    def test_waiting_client_fails_promptly_when_engine_dies(self):
+        root = self.start()
+        pid = int((root / "engine.pid").read_text())
+        process_text = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
+        workers = [int(line.split()[0]) for line in process_text.splitlines()[1:]
+                   if int(line.split()[1]) == pid and "funsearch-worker" in line]
+        task_id, directory = self.task(root)
+        slow = self.child(directory, source="#include <unistd.h>\ndouble f(void) { sleep(30); return 1; }\n")
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                waiting = executor.submit(subprocess.run, [str(CLI), "submit", str(root), str(task_id), str(slow)],
+                                          capture_output=True, text=True, timeout=20)
+                self.wait_queue(root, 1)
+                started = time.monotonic()
+                os.kill(pid, signal.SIGKILL)
+                result = waiting.result()
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("engine process is not alive", result.stderr)
+            self.assertNotIn("ACCEPTED", result.stdout)
+            self.assertEqual(self.exit_evidence(root)["signal"], signal.SIGKILL)
+        finally:
+            for worker in workers:
+                if pid_alive(worker):
+                    os.kill(worker, signal.SIGKILL)
+            (root / "engine.pid").unlink(missing_ok=True)
+        self.cli("run", "recover", root)
+        with Database(root / "db.sqlite") as db:
+            states = db.connection.execute("SELECT state, result FROM evalq").fetchall()
+            self.assertEqual(db.get_task(task_id).status, "open")
+            self.assertEqual(db.get_state("children_scored"), 0)
+        self.assertEqual([state for state, _ in states], ["done"])
+        self.assertEqual(json.loads(states[0][1])["msg"], "engine died")
+        self.assertEqual(json.loads((root / "summary.json").read_text())["status"], "failed")
 
     def test_uncatchable_death_and_fatal_trace_are_recorded(self):
         for signum in (signal.SIGKILL, signal.SIGABRT):

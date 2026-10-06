@@ -15,7 +15,9 @@ check-pack:
 	@test -n "$(FS_PACK)" || { echo "Set FS_PACK to the absolute FunSearch pack path" >&2; exit 1; }
 	@test -f "$(FS_PACK)/include/funsearch.h" || { echo "FS_PACK must contain include/funsearch.h" >&2; exit 1; }
 
-libevaluator.so: evaluator.c ../candidate.h check-pack
+# check-pack is order-only (GNU make): it still runs first, but as a phony
+# target it must not make an up-to-date library look stale.
+libevaluator.so: evaluator.c ../candidate.h | check-pack
 	$(CC) $(CPPFLAGS) -I"$(FS_PACK)/include" $(CFLAGS) -shared -fPIC $(LDFLAGS) -o $@ evaluator.c
 
 clean:

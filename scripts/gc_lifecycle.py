@@ -21,8 +21,11 @@ import time
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK / "engine"))
 from funsearch.db import Database  # noqa: E402
-from funsearch.runtime import pid_alive  # noqa: E402
+from funsearch.runtime import FAILED, RUNNING, is_terminal, pid_alive  # noqa: E402
 
+# run.json is the engine's write-once manifest. This layer keeps its own
+# bead/slot/delivery bookkeeping beside it, under the run's lifecycle lock.
+LIFECYCLE_FILE = "gc-lifecycle.json"
 SLOT_CONTEXT_FILE = ".funsearch-slot.json"
 SLOT_RETIRED_FILE = ".funsearch-retired.json"
 # Formula/launch overrides tune the search only. Command-bearing keys
@@ -67,8 +70,17 @@ def city_path():
     return Path(value).resolve()
 
 
-def context(metadata):
-    saved = metadata.get("fs", {})
+def read_lifecycle(root, metadata):
+    path = root / LIFECYCLE_FILE
+    # Runs started before the split kept this state in run.json under "fs".
+    return read_json(path) if path.exists() else dict(metadata.get("fs", {}))
+
+
+def write_lifecycle(root, fs):
+    write_json(root / LIFECYCLE_FILE, fs)
+
+
+def context(saved):
     city = Path(saved["city"]) if saved.get("city") else city_path()
     rig = saved.get("rig") or os.environ.get("FS_RIG") or os.environ.get("GC_RIG")
     notify = saved.get("notify") or os.environ.get("FS_NOTIFY")
@@ -113,14 +125,14 @@ def registry_path(city, run_id):
     return city / ".gc" / "funsearch" / "active" / (run_id + ".json")
 
 
-def remove_registry(city, root, metadata):
+def remove_registry(city, root, run_id, run_bead):
     # An explicit id can be reused by a later run after completion. Retrying
     # an old finish hook must never delete that later run's registry entry.
     with lock(city / ".gc" / "funsearch" / "registry.lock"):
-        registry = registry_path(city, metadata["run_id"])
+        registry = registry_path(city, run_id)
         if registry.exists():
             entry = read_json(registry)
-            if entry["run_dir"] == str(root) and entry["run_bead"] == metadata["fs"]["run_bead"]:
+            if entry["run_dir"] == str(root) and entry["run_bead"] == run_bead:
                 registry.unlink()
 
 
@@ -135,8 +147,8 @@ def on_start(root):
 
 def start_locked(root):
     metadata = read_json(root / "run.json")
-    city, rig, notify = context(metadata)
-    fs = metadata.setdefault("fs", {})
+    fs = read_lifecycle(root, metadata)
+    city, rig, notify = context(fs)
     if fs.get("finished"):
         return
     fs.update(city=str(city), rig=rig, notify=notify)
@@ -148,13 +160,12 @@ def start_locked(root):
     if not fs.get("run_bead"):
         fields = {"fs.problem": metadata["problem_dir"], "fs.run_dir": str(root),
                   "fs.instance": metadata["instance"], "fs.pid": str(pid),
-                  "fs.status": "running", "fs.notify": notify}
+                  "fs.status": RUNNING, "fs.notify": notify}
         fs["run_bead"] = scoped_gc(city, rig, "bd", "create",
             f"funsearch run {metadata['run_id']}: {cfg['problem']['name']} {metadata['instance']}",
             "--labels", "funsearch-run", "--metadata", json.dumps(fields),
             "--description", f"FunSearch results: {root}", "--silent")
-    metadata["run_bead"] = fs["run_bead"]
-    write_json(root / "run.json", metadata)
+    write_lifecycle(root, fs)
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
              "run_bead": fs["run_bead"], "rig": rig, "pid": pid, "notify": notify}
     write_json(registry, entry)
@@ -170,11 +181,11 @@ def start_locked(root):
                 f"funsearch slot {metadata['run_id']}/{slot}", "--labels", "funsearch-slot",
                 "--parent", fs["run_bead"], "--metadata", json.dumps(fields),
                 "--description", "Follow the FunSearch mutator slot loop.", "--silent")
-            write_json(root / "run.json", metadata)
+            write_lifecycle(root, fs)
         if slot not in routed:
             scoped_gc(city, rig, "sling", f"{rig}/funsearch.mutator", slots[slot], "--no-formula")
             routed.append(slot)
-            write_json(root / "run.json", metadata)
+            write_lifecycle(root, fs)
 
 
 def summary_note(root, summary):
@@ -188,16 +199,16 @@ def summary_note(root, summary):
 
 
 def finish_locked(root, metadata):
-    fs = metadata.get("fs", {})
+    fs = read_lifecycle(root, metadata)
     if not fs.get("run_bead"):
         # An on-start failure before bead creation has no city state to retire.
         return
-    city, rig, notify = context(metadata)
+    city, rig, notify = context(fs)
     if fs.get("finished"):
-        remove_registry(city, root, metadata)
+        remove_registry(city, root, metadata["run_id"], fs["run_bead"])
         return
     summary = read_json(root / "summary.json")
-    if summary["status"] not in ("completed", "stopped", "failed"):
+    if not is_terminal(summary["status"]):
         raise ValueError("finish hook needs a terminal summary status")
     note = summary_note(root, summary)
     if fs.get("summary_recorded") != summary:
@@ -206,7 +217,7 @@ def finish_locked(root, metadata):
             args += ["--set-metadata", f"fs.{key}={summary.get(key)}"]
         scoped_gc(city, rig, *args)
         fs["summary_recorded"] = summary
-        write_json(root / "run.json", metadata)
+        write_lifecycle(root, fs)
     # Include blocked/deferred/in-progress slots, and avoid the default 50-row
     # limit. Slot children must close before the parent (bd enforces this).
     rows = json.loads(scoped_gc(city, rig, "bd", "list", "--parent", fs["run_bead"],
@@ -219,15 +230,15 @@ def finish_locked(root, metadata):
     if fs.get("run_closed") != summary["status"]:
         scoped_gc(city, rig, "bd", "close", fs["run_bead"], "--reason", summary["status"])
         fs["run_closed"] = summary["status"]
-        write_json(root / "run.json", metadata)
+        write_lifecycle(root, fs)
     if not fs.get("mail_sent"):
         scoped_gc(city, rig, "mail", "send", notify, "-s",
            f"funsearch run {metadata['run_id']} {summary['status']}: best {summary.get('best_score')}",
            "-m", note)
         fs["mail_sent"] = True
     fs["finished"] = True
-    write_json(root / "run.json", metadata)
-    remove_registry(city, root, metadata)
+    write_lifecycle(root, fs)
+    remove_registry(city, root, metadata["run_id"], fs["run_bead"])
 
 
 def on_finish(root):
@@ -256,7 +267,7 @@ def failed_summary(root, metadata):
     print(f"cannot recover {root}: {result.stderr.strip()}", file=sys.stderr)
     previous = read_json(root / "summary.json") if (root / "summary.json").exists() else {}
     previous.update(run_id=metadata["run_id"], instance=metadata["instance"],
-                    status="failed", reason="engine died", ended_at=time.time())
+                    status=FAILED, reason="engine died", ended_at=time.time())
     previous.setdefault("children_scored", 0)
     previous.setdefault("ok_rate", 0)
     previous.setdefault("best_score", None)
@@ -279,7 +290,7 @@ def sweep():
                     with lock(root / ".gc-lifecycle.lock"):
                         metadata = read_json(root / "run.json")
                         summary = read_json(root / "summary.json") if (root / "summary.json").exists() else {}
-                        if summary.get("status") not in ("completed", "stopped", "failed"):
+                        if not is_terminal(summary.get("status")):
                             failed_summary(root, metadata)
                         # A terminal summary with a failed finish hook needs
                         # delivery retried, preserving its actual outcome.

@@ -82,11 +82,25 @@ C symbols are:
 ```c
 /* REQUIRED: resolve(name) gives the candidate symbol address, or NULL. */
 fs_result fs_score(fs_resolve_fn resolve, const char *instance);
-/* OPTIONAL: initialization once before scoring; nonzero means fatal failure. */
+/* OPTIONAL: initialization once per worker before scoring; nonzero means fatal failure. */
 int fs_init(const char *instance);
-/* OPTIONAL: cleanup at shutdown. */
+/* OPTIONAL: cleanup at worker shutdown. */
 void fs_fini(void);
 ```
+
+One long-lived worker process calls `fs_score` repeatedly for different,
+unrelated candidates. Reset all per-candidate state on every call (static
+buffers, caches, counters), and do not keep candidate pointers (functions or
+data obtained through `resolve`) after `fs_score` returns: the candidate
+library is unloaded. A run starts several workers in parallel processes and
+replaces each one after a crash, a timeout or a fixed number of scores, so
+`fs_init` may run many times over a run.
+
+When a run starts, the directory containing the evaluator library is copied
+into the run (`<run>/evaluator/`) and the run's workers load that copy, so
+rebuilding or editing the evaluator never changes a live run's scoring. Keep
+files the evaluator loads at runtime (such as an embedded script it finds
+next to its own library) in that directory, and keep the directory small.
 
 `fs_result` contains `status`, `double score`, `int32_t nsig`, `double sig[8]`,
 and `char msg[256]`. Initialize every field. Use a NUL-terminated message:
@@ -245,12 +259,14 @@ and the recipient for completion mail. The README documents this invocation:
 
 ```sh
 gc sling <rig>/<pool> funsearch-run --formula \
+  --var pack=/absolute/path/to/funsearch-pack \
   --var problem=/absolute/path/to/my-problem \
   --var instance=n=6 --var notify=<recipient> \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 ```
 
-Replace the angle-bracket arguments with your rig, pool, and mail recipient.
+Replace the angle-bracket arguments with your rig, pool, and mail recipient,
+and `pack` with the absolute path of the FunSearch pack.
 Omit `instance` and `overrides` to use the problem defaults. Starting a run
 requires the seed to score `FS_OK`.
 

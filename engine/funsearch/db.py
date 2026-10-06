@@ -6,7 +6,7 @@ owns the schema: the Gas City adapters and the mutator tool guard use these
 methods rather than their own SQL.
 """
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -30,6 +30,20 @@ class Program:
     idea: str
     created_at: float
     active: bool
+
+    @property
+    def length(self) -> int:
+        return len(self.source)
+
+
+@dataclass(frozen=True)
+class ProgramSummary:
+    """An active scored program's sampling fields, without its source text."""
+    id: int
+    status: str
+    score: float
+    sig: list[float]
+    length: int
 
 
 @dataclass(frozen=True)
@@ -78,6 +92,7 @@ CREATE TABLE IF NOT EXISTS programs (
 );
 CREATE INDEX IF NOT EXISTS programs_island ON programs(island,active,status);
 CREATE INDEX IF NOT EXISTS programs_hash ON programs(norm_hash);
+CREATE INDEX IF NOT EXISTS programs_score ON programs(status,active,score);
 CREATE TABLE IF NOT EXISTS tasks (
  id INTEGER PRIMARY KEY, island INTEGER NOT NULL, parent_ids TEXT NOT NULL,
  slot TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open'
@@ -210,9 +225,53 @@ class Database:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return [self._program(row) for row in self.connection.execute("SELECT * FROM programs" + where + " ORDER BY id", args)]
 
+    def count_programs(self, island=None) -> int:
+        """Active programs of every status."""
+        query, args = "SELECT count(*) FROM programs WHERE active=1", []
+        if island is not None:
+            query += " AND island=?"
+            args.append(island)
+        return self.connection.execute(query, args).fetchone()[0]
+
+    def scored_summaries(self, island: int) -> list[ProgramSummary]:
+        """Active OK programs with a score, oldest first, without source text."""
+        rows = self.connection.execute(
+            "SELECT id,status,score,sig,length(source) AS length FROM programs "
+            "WHERE island=? AND active=1 AND status='OK' AND score IS NOT NULL ORDER BY id",
+            (island,))
+        return [ProgramSummary(row["id"], row["status"], row["score"], json.loads(row["sig"]), row["length"])
+                for row in rows]
+
+    # Best first: higher score, then shorter source, then older program.
+    _RANKED = ("SELECT * FROM programs WHERE status='OK' AND score IS NOT NULL{} "
+               "ORDER BY score DESC, length(source), id")
+
+    def ranked_programs(self, island=None, *, active_only=True):
+        """Yield scored OK programs best first, reading rows lazily."""
+        clauses, args = "", []
+        if island is not None:
+            clauses += " AND island=?"
+            args.append(island)
+        if active_only:
+            clauses += " AND active=1"
+        with closing(self.connection.execute(self._RANKED.format(clauses), args)) as cursor:
+            while rows := cursor.fetchmany(64):
+                yield from map(self._program, rows)
+
     def best_program(self, island=None) -> Program | None:
-        programs = [p for p in self.list_programs(island, status="OK") if p.score is not None]
-        return max(programs, key=lambda p: (p.score, -len(p.source), -p.id), default=None)
+        clauses, args = " AND active=1", []
+        if island is not None:
+            clauses += " AND island=?"
+            args.append(island)
+        return self._program(self.connection.execute(
+            self._RANKED.format(clauses) + " LIMIT 1", args).fetchone())
+
+    def has_scored_duplicate(self, score: float, sig) -> bool:
+        """Whether an active OK program has exactly this score and signature."""
+        rows = self.connection.execute(
+            "SELECT sig FROM programs WHERE status='OK' AND active=1 AND score=?", (score,))
+        signature = list(sig)
+        return any(json.loads(row["sig"]) == signature for row in rows)
 
     def has_normalized_hash(self, norm_hash: str, *, island=None) -> bool:
         query = "SELECT 1 FROM programs WHERE norm_hash=? AND active=1"

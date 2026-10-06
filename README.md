@@ -42,15 +42,15 @@ with your rig, pool, and completion-mail recipient:
 
 ```sh
 gc sling <rig>/<pool> funsearch-run --formula \
+  --var pack=/absolute/path/to/funsearch-pack \
   --var problem=/absolute/path/to/my-problem \
   --var instance=n=6 --var notify=<recipient> \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 ```
 
-Omit `instance` and `overrides` to use the problem defaults. The start step
-finds the pack from the formula source gc records on the workflow; if you
-override `funsearch-run` locally in a rig, add `--var pack=/absolute/path/to/funsearch-pack`.
-Overrides may set
+Omit `instance` and `overrides` to use the problem defaults. `pack` is the
+absolute path of this pack (the directory containing `pack.toml`); the start
+step runs its CLI from there. Overrides may set
 only `search.*` and `stop.*`; use the separate `instance` variable for the
 instance and `problem.toml` for the mutator model. Keys that hold shell
 commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
@@ -68,7 +68,8 @@ routed directly to `<rig>/funsearch.mutator` with `--no-formula`.
 
 The start hook creates a `funsearch-run` bead in the importing rig and K child
 `funsearch-slot` beads, carrying N and the configured mutator model. It stores
-bead ids and rig/notify context in `run.json`, and registers the engine PID at
+bead ids and rig/notify context in the run's `gc-lifecycle.json` (the engine's
+`run.json` manifest stays write-once), and registers the engine PID at
 `<city>/.gc/funsearch/active/<run-id>.json`. Run ids must be unique across the
 city. At completion the finish hook records best versus seed, children scored,
 throughput, OK rate, reason and `best.c`, closes slots before the run bead,
@@ -164,8 +165,11 @@ so Gas City orphan cleanup cannot mistake the search for a retired agent.
 City, rig, and notification context remain available to lifecycle hooks.
 
 Optional `--on-start 'command'` and `--on-finish 'command'` hooks receive the
-absolute run directory as an argument and in `FS_RUN_DIR`. The finish hook
-runs after outputs are written, including when the daemon fails. The PID
+absolute run directory as an argument and in `FS_RUN_DIR`. The engine daemon
+runs both, logging their output to `engine.log`: the start hook after its
+workers are ready and before any evaluation is dispatched (`run start` returns
+once it finishes, and fails the run if it fails), the finish hook after outputs
+are written, including when the daemon fails. The PID
 file is removed after shutdown and the finish hook completes.
 
 CLI exit codes: 0 success; 1 runtime or seed failure; 2 usage/configuration

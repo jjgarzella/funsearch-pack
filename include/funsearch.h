@@ -29,9 +29,20 @@ typedef struct {
 /* resolve(sym) returns the address of symbol `sym` in the candidate, or NULL. */
 typedef void *(*fs_resolve_fn)(const char *sym);
 
-/* REQUIRED */
+/*
+ * REQUIRED. One long-lived worker process calls fs_score many times, for
+ * different, unrelated candidates in sequence. Reset all per-candidate state on
+ * every call: static buffers, caches and counters otherwise carry one
+ * candidate's data into the next. Do not keep pointers into the candidate
+ * (functions or data from resolve) after returning; its library is unloaded.
+ * Several workers run in parallel processes.
+ */
 fs_result fs_score(fs_resolve_fn resolve, const char *instance);
-/* OPTIONAL: called once per worker process before any fs_score / at shutdown. */
+/*
+ * OPTIONAL: called once per worker process before any fs_score / at shutdown.
+ * A run starts several workers and replaces them after a crash, a timeout or a
+ * fixed number of scores, so fs_init may run many times over one run.
+ */
 int  fs_init(const char *instance);   /* nonzero = fatal: the run fails at startup */
 void fs_fini(void);
 

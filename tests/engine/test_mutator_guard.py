@@ -119,6 +119,33 @@ class MutatorGuardTests(unittest.TestCase):
         with patch.dict(os.environ, GC_SESSION_ID="other"), self.assertRaises(ValueError):
             self.check("Read", file_path=str(self.directory / "TASK.md"))
 
+    def test_symlinked_task_directory_is_denied(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        for name in ("TASK.md", "child.c"):
+            (elsewhere / name).write_text("outside the run\n")
+        self.directory.rmdir()
+        self.directory.symlink_to(elsewhere, target_is_directory=True)
+        for tool, name in (("Read", "TASK.md"), ("Read", "child.c"), ("Write", "child.c"),
+                           ("Edit", "child.c")):
+            with self.subTest(tool=tool, name=name), self.assertRaisesRegex(ValueError, "current task"):
+                self.check(tool, file_path=str(self.directory / name))
+        cli = str(PACK / "bin/funsearch")
+        for verb in ("try", "submit"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "current task"):
+                self.command(cli, verb, str(self.run), str(self.task.id), str(self.directory / "child.c"))
+
+    def test_slot_with_multiple_unfinished_tasks_is_denied(self):
+        self.db.add_task(0, [], slot="1")
+        cli = str(PACK / "bin/funsearch")
+        with self.assertRaisesRegex(ValueError, "multiple unfinished tasks"):
+            self.check("Read", file_path=str(self.directory / "TASK.md"))
+        for argv in ((cli, "next-task", str(self.run), "--slot", "1"),
+                     (cli, "try", str(self.run), str(self.task.id), str(self.directory / "child.c")),
+                     (cli, "submit", str(self.run), str(self.task.id), str(self.directory / "child.c"))):
+            with self.subTest(argv=argv[1]), self.assertRaisesRegex(ValueError, "multiple unfinished tasks"):
+                self.command(*argv)
+
     def test_installed_hook_emits_allow_and_fail_closed_deny(self):
         setup(self.home, PACK)
         settings = json.loads((self.home / ".claude/settings.json").read_text())

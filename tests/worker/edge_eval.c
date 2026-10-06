@@ -25,6 +25,12 @@ fs_result fs_score(fs_resolve_fn resolve, const char *instance)
         result.nsig = 2;
         result.sig[0] = 1;
         result.sig[1] = NAN;
+    } else if (strcmp(instance, "invalid-nan") == 0) {
+        result.status = FS_INVALID;
+        result.score = NAN;
+        result.nsig = 1;
+        result.sig[0] = NAN;
+        strcpy(result.msg, "cap has a line");
     } else if (strcmp(instance, "limit") == 0) {
         struct rlimit limit;
         if (getrlimit(RLIMIT_AS, &limit) != 0) {

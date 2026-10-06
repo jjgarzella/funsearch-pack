@@ -1,5 +1,6 @@
 """Run metadata and hook utilities shared by the CLI and daemon."""
 
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,18 @@ import shlex
 import subprocess
 
 from .config import Config, ConfigError
+
+
+# Run lifecycle, recorded as the "status" state key by the engine daemon:
+# starting -> running -> stopping -> one terminal status.
+STARTING, RUNNING, STOPPING = "starting", "running", "stopping"
+COMPLETED, STOPPED, FAILED = "completed", "stopped", "failed"
+TERMINAL_STATUSES = frozenset({COMPLETED, STOPPED, FAILED})
+HOOK_TIMEOUT_S = 120
+
+
+def is_terminal(status):
+    return status in TERMINAL_STATUSES
 
 
 class RunOver(RuntimeError):
@@ -32,7 +45,7 @@ def read_run(run_dir, *, require_db=True):
 
 
 def require_running(db):
-    if db.get_state("status") != "running" or db.get_state("stop_requested", False):
+    if db.get_state("status") != RUNNING or db.get_state("stop_requested", False):
         raise RunOver("RUN_OVER")
 
 
@@ -59,25 +72,24 @@ def run_hook(command, run_dir):
     process = subprocess.Popen(command + " " + shlex.quote(str(root)), shell=True,
                                env=env, start_new_session=True)
     try:
-        code = process.wait(timeout=120)
+        code = process.wait(timeout=HOOK_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         from ._process import kill_group
         kill_group(process)
-        raise RuntimeError("hook timed out after 120s") from None
+        raise RuntimeError(f"hook timed out after {HOOK_TIMEOUT_S}s") from None
     if code:
         raise RuntimeError(f"hook exited with code {code}")
 
 
 def top_programs(db, count=10):
     # Export unique candidates across islands, including archived history.
-    programs = sorted((p for p in db.list_programs(status="OK", active_only=False)
-                       if p.score is not None),
-                      key=lambda p: (-p.score, len(p.source), p.id))
+    # Rows stream best first, so only the ranked prefix is ever read.
     unique, seen = [], set()
-    for program in programs:
-        if program.norm_hash not in seen:
-            unique.append(program)
-            seen.add(program.norm_hash)
-        if len(unique) >= count:
-            break
+    with closing(db.ranked_programs(active_only=False)) as programs:
+        for program in programs:
+            if program.norm_hash not in seen:
+                unique.append(program)
+                seen.add(program.norm_hash)
+            if len(unique) >= count:
+                break
     return unique

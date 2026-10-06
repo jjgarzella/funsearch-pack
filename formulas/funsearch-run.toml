@@ -1,4 +1,5 @@
 # gc sling <rig>/<pool> funsearch-run --formula \
+#   --var pack=/abs/path/to/funsearch-pack \
 #   --var problem=/abs/path/to/problem --var notify=<recipient> \
 #   --var instance=n=6 --var 'overrides=search.mutators=3 stop.max_children=100'
 # A plain one-step v2 workflow runs on the selected general-purpose agent.
@@ -21,8 +22,8 @@ description = "Completion-mail recipient; required because no reliable slinger r
 required = true
 
 [vars.pack]
-description = "Absolute FunSearch pack root; empty uses this workflow's recorded gc.formula_source"
-default = ""
+description = "Absolute FunSearch pack root (the directory containing pack.toml)"
+required = true
 
 [vars.overrides]
 description = "Space-separated key=value overrides of search.* or stop.*; other keys are rejected"
@@ -40,17 +41,10 @@ overrides: {{overrides}}
 pack: {{pack}}
 
 Require GC_CITY_PATH and GC_RIG from the rig-scoped agent environment.
-The pack root <pack> comes from the runtime, never from a search or a guess:
-- If pack above is non-empty, use it.
-- Otherwise read this step's gc.root_bead_id metadata (the step itself when
-  absent), run `gc bd show <root> --json`, and take its gc.formula_source
-  metadata, which gc records when it instantiates the formula. Resolve it with
-  `realpath`; <pack> is the parent of the directory containing it.
-Then require <pack>/formulas/funsearch-run.toml, <pack>/bin/funsearch and
-<pack>/scripts/gc_lifecycle.py to exist. If gc.formula_source is missing, or
-those files are absent (for example a rig-local override of this formula),
-stop: record the reason in this step's notes, leave the step open, and ask the
-operator to re-sling with --var pack=<absolute pack root>.
+Use the pack value above as <pack>; never derive it from a search or a guess.
+Require <pack>/bin/funsearch and <pack>/scripts/gc_lifecycle.py to exist. If
+they are absent, stop: record the reason in this step's notes, leave the step
+open, and ask the operator to re-sling with --var pack=<absolute pack root>.
 
 Run `python3 <pack>/scripts/gc_lifecycle.py launch <problem> --instance <instance>
 --notify <notify> --overrides <overrides>` once, passing each value as one
@@ -58,11 +52,11 @@ literal argument (quote safely; do not evaluate variable values as shell code).
 The launcher invokes <pack>/bin/funsearch run start <problem> [--instance ...]
 [--set ...] --on-start <pack>/scripts/on-start.sh
 --on-finish <pack>/scripts/on-finish.sh. It supplies FS_NOTIFY and inherits the
-rig/city environment; the start hook persists that context in run.json for
-finish and sweep recovery.
+rig/city environment; the start hook persists that context in gc-lifecycle.json for
+finish and sweep recovery. The engine runs both hooks itself and logs their
+output to <run-dir>/engine.log.
 
-On success stdout is `<run-id> <absolute-run-dir>` (other hook diagnostics may
-precede it). Append the run id and directory to THIS step's bead note using
+On success stdout is `<run-id> <absolute-run-dir>`. Append the run id and directory to THIS step's bead note using
 gc bd update <step-id> --append-notes, then close this step. The engine and
 mutator slots continue independently; do not wait for the search to finish.
 On failure record the actual command output and leave this step open for

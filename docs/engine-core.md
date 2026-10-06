@@ -38,7 +38,11 @@ nested savepoints. `backup(path)` uses the SQLite backup API.
 The primary operations are:
 
 - Programs: `add_program`, `get_program`, `list_programs`, `best_program`,
-  `has_normalized_hash`, `recent_children`, `archive_island`.
+  `has_normalized_hash`, `recent_children`, `archive_island`. Hot paths filter
+  and rank in SQL: `best_program` and the lazy `ranked_programs` order scored
+  `OK` programs by score, then shorter source, then id; `scored_summaries` and
+  `count_programs` give sampling its fields without source text;
+  `has_scored_duplicate(score, sig)` is the submission duplicate check.
 - Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`;
   `open_tasks_for_slot(slot)` lists a slot's unfinished tasks (more than one
   means the slot is corrupt); `abandon_stale_tasks(cutoff)` abandons open tasks
@@ -53,9 +57,10 @@ The primary operations are:
   `running_evaluations()` lists running items. Queue items transition queued →
   running → done. Empty queue polls take no writer lock; a nonempty claim
   reselects under the writer transaction to remain atomic. If the engine dies, `funsearch run recover <run-dir>`
-  (`daemon.recover_outputs`, which the Gas City sweep calls) writes failed
-  outputs from the live database, or from the newest readable snapshot when
-  the live one is unreadable.
+  (`daemon.recover_outputs`, which the Gas City sweep calls) finishes
+  any request the dead engine still held as an error and writes failed outputs
+  from the live database, or from the newest readable snapshot when the live
+  one is unreadable.
 - State: `set_state`, `get_state`, `increment_state`, `all_state` (every key);
   values are JSON.
 

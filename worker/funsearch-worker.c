@@ -75,10 +75,12 @@ static void reply(fs_result result)
     }
     for (int32_t i = 0; i < result.nsig; ++i)
         sig_finite = sig_finite && isfinite(result.sig[i]);
-    if (!isfinite(result.score)) {
+    /* score and sig are meaningful only for FS_OK. A rejection may leave them
+     * NaN; keep its status and msg, and emit a null score and no sig. */
+    if (result.status == FS_OK && !isfinite(result.score)) {
         status = "ERROR";
         strcpy(result.msg, "non-finite score");
-    } else if (!sig_finite) {
+    } else if (result.status == FS_OK && !sig_finite) {
         /* JSON has no NaN/Inf, and a null entry would poison clustering. */
         status = "ERROR";
         strcpy(result.msg, "non-finite signature");

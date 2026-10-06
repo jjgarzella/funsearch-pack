@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import os
 from pathlib import Path
 import random
@@ -141,7 +142,7 @@ void fs_fini(void) {
 
     def test_normal_and_try_pools(self):
         normal = self.pool()
-        sanitizer = self.pool(extra_env=try_worker_env())
+        sanitizer = self.pool(extra_env=try_worker_env(self.cfg))
         self.assertEqual(normal.workers[0].env["FS_MEMORY_MB"], str(self.cfg.evaluator.memory_mb))
         self.assertNotIn("FS_MEMORY_MB", sanitizer.workers[0].env)
         final = self.candidate("good")
@@ -151,7 +152,7 @@ void fs_fini(void) {
         self.assertEqual(sanitizer.score(trial, 5)["score"], 3.5)
 
     def test_asan_detects_invalid_memory_and_recovers(self):
-        pool = self.pool(extra_env=try_worker_env())
+        pool = self.pool(extra_env=try_worker_env(self.cfg))
         source = self.source("#include <stdlib.h>\ndouble f(void) { volatile int *p=malloc(sizeof(int)); p[5]=7; return p[5]; }")
         ok, library, log = compile_candidate(self.cfg, source, self.root / "asan-bad", "try")
         self.assertTrue(ok, log)
@@ -159,6 +160,50 @@ void fs_fini(void) {
         self.assertEqual(result["status"], "ERROR")
         self.assertIn("worker crashed: signal", result["msg"])
         self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
+
+    def test_try_worker_memory_is_bounded_without_rlimit_as(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg.evaluator.memory_mb = 256
+        pool = WorkerPool(cfg, self.evaluator(), "n=1", 1, try_worker_env(cfg))
+        self.addCleanup(pool.close)
+        source = self.source("#include <stdlib.h>\n#include <string.h>\n"
+                             "double f(void) { for (;;) { char *p = malloc(32 << 20);"
+                             " if (!p) return -1; memset(p, 1, 32 << 20); } }")
+        ok, library, log = compile_candidate(cfg, source, self.root / "hog", "try")
+        self.assertTrue(ok, log)
+        result = pool.score(library, 20)
+        self.assertEqual(result["status"], "ERROR")
+        # ASan aborts at hard_rss_limit_mb rather than letting RSS grow.
+        self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
+                        result["msg"][:200])
+        self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
+
+    def test_oversized_reply_without_newline_fails_promptly(self):
+        source = self.source(r'''#include <string.h>
+#include <unistd.h>
+double f(void) {
+    static char chunk[4096];
+    memset(chunk, 'x', sizeof chunk);
+    for (int fd = 3; fd < 64; ++fd)
+        for (int i = 0; i < 32; ++i)
+            if (write(fd, chunk, sizeof chunk) < 0)
+                break;
+    sleep(30);
+    return 0;
+}
+''')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "flood", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        process = pool.workers[0].process
+        started = time.monotonic()
+        result = pool.score(library, 20)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertTrue(result["msg"].startswith(
+            "worker protocol error: worker response exceeds 64 KiB"), result["msg"])
+        self.assertIsNot(pool.workers[0].process, process)
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
     def test_blocking_pool_distributes_concurrent_requests(self):
         source = self.source("#define _DEFAULT_SOURCE\n#include <unistd.h>\ndouble f(void) { usleep(100000); return getpid(); }")
@@ -235,7 +280,7 @@ double f(void) {
             self.assertEqual(worker._scores, 1)
 
     def test_sanitizer_uses_same_fixed_budget(self):
-        pool = self.pool(extra_env=try_worker_env())
+        pool = self.pool(extra_env=try_worker_env(self.cfg))
         worker = pool.workers[0]
         good = self.candidate("good", "try")
         process = worker.process

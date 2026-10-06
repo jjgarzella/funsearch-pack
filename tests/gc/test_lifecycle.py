@@ -75,6 +75,7 @@ class LifecycleTests(HookFixture, unittest.TestCase):
 
     def test_start_finish_and_repeat(self):
         root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
         self.hook("on-start", root)
         beads = self.beads()
         self.assertEqual(len(beads), 4)
@@ -94,7 +95,9 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         entry = json.loads((self.registry / "run-one.json").read_text())
         self.assertEqual(entry, {"run_id": "run-one", "run_dir": str(root),
             "run_bead": "test-1", "rig": "example", "pid": os.getpid(), "notify": "operator"})
-        self.assertEqual(json.loads((root / "run.json").read_text())["run_bead"], "test-1")
+        self.assertEqual(json.loads((root / "gc-lifecycle.json").read_text())["run_bead"], "test-1")
+        # The engine's manifest stays write-once; Gas City state lives beside it.
+        self.assertEqual(json.loads((root / "run.json").read_text()), metadata)
         count = len(self.calls())
         self.hook("on-start", root)
         self.assertEqual(len(self.calls()), count)
@@ -143,7 +146,20 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         del self.env["FS_SHIM_FAIL"]
         self.hook("on-start", root)
         self.assertEqual(len(self.beads()), 4)
-        self.assertEqual(len(json.loads((root / "run.json").read_text())["fs"]["routed_slots"]), 3)
+        self.assertEqual(len(json.loads((root / "gc-lifecycle.json").read_text())["routed_slots"]), 3)
+
+    def test_legacy_run_json_state_is_still_finished(self):
+        # Runs started before the split kept lifecycle state in run.json.
+        root = self.run_dir()
+        self.hook("on-start", root)
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["fs"] = json.loads((root / "gc-lifecycle.json").read_text())
+        (root / "run.json").write_text(json.dumps(metadata))
+        (root / "gc-lifecycle.json").unlink()
+        self.summary(root)
+        self.hook("on-finish", root)
+        self.assertTrue(all(row["status"] == "closed" for row in self.beads().values()))
+        self.assertFalse((self.registry / "run-one.json").exists())
 
     def test_missing_context_fails_before_gc_mutation(self):
         root = self.run_dir()
@@ -283,9 +299,9 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.assertEqual(len(formula["steps"]), 1)
         self.assertTrue(formula["vars"]["problem"]["required"])
         self.assertTrue(formula["vars"]["notify"]["required"])
-        # The pack root comes from the runtime or the operator, never a search.
-        self.assertEqual(formula["vars"]["pack"]["default"], "")
-        self.assertIn("gc.formula_source", formula["steps"][0]["description"])
+        # The pack root comes from the operator, never a search or metadata walk.
+        self.assertTrue(formula["vars"]["pack"]["required"])
+        self.assertNotIn("gc.formula_source", formula["steps"][0]["description"])
         self.assertNotIn("formula list", formula["steps"][0]["description"])
         order = tomllib.loads((ROOT / "orders" / "funsearch-sweep.toml").read_text())["order"]
         self.assertEqual(order["trigger"], "condition")
@@ -362,7 +378,8 @@ class ToyHookTests(HookFixture, PipelineTestCase):
         metadata = json.loads((self.run / "run.json").read_text())
         self.assertEqual(metadata["instance"], "n=7")
         self.assertEqual(metadata["config"]["search"]["mutators"], 1)
-        self.assertEqual(metadata["fs"]["notify"], "launch-recipient")
+        self.assertEqual(json.loads((self.run / "gc-lifecycle.json").read_text())["notify"],
+                         "launch-recipient")
         self.assertEqual(len(self.beads()), 2)
 
     def test_sweep_recovers_database_after_killed_engine(self):

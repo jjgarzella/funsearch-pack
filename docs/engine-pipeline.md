@@ -15,7 +15,7 @@ cfg = load_config(problem_dir)
 evaluator = build_evaluator(cfg, problem_dir)
 with WorkerPool(cfg, evaluator, cfg.problem.instance, cfg.search.workers) as final_pool:
     with WorkerPool(cfg, evaluator, cfg.problem.instance, cfg.search.workers,
-                    extra_env=try_worker_env()) as try_pool:
+                    extra_env=try_worker_env(cfg)) as try_pool:
         ok, library, log = compile_candidate(cfg, candidate_c, trial_dir, "try")
         if ok:
             result = try_pool.score(library, cfg.evaluator.timeout_s)
@@ -101,13 +101,16 @@ active requests, sends QUIT, and allows one second for shutdown before killing
 and reaping each process and cleaning up its pipes and stderr reader.
 
 Try workers need the ASan runtime before loading sanitized candidate libraries.
-`try_worker_env()` asks `${CC:-cc} -print-file-name=libasan.so` for that runtime,
-prepends it to `LD_PRELOAD`, and sets
-`ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`. It also removes `FS_MEMORY_MB`:
+`try_worker_env(cfg)` asks `${CC:-cc} -print-file-name=libasan.so` for that runtime,
+prepends it to `LD_PRELOAD`, and sets `ASAN_OPTIONS` to
+`detect_leaks=0:abort_on_error=1:hard_rss_limit_mb=M:max_allocation_size_mb=M:allocator_may_return_null=1`
+with `M = evaluator.memory_mb`. It also removes `FS_MEMORY_MB`:
 ASan reserves a large virtual shadow address range, so the normal `RLIMIT_AS`
 limit makes sanitizer workers abort with `Failed to mmap` before evaluation.
 The normal pool retains the configured address-space limit. Sanitizer trials
-still have scoring timeouts but do not enforce that address-space limit. The
+keep the same bound in ASan's terms instead: a worker whose resident memory
+exceeds `memory_mb` aborts (an `ERROR` crash result and a replacement worker),
+and a single larger allocation returns NULL. The
 environment overlay accepts `None` to remove a variable explicitly.
 
 Run the pipeline acceptance checks from the pack root:

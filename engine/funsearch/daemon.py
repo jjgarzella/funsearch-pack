@@ -1,6 +1,6 @@
 """Run owner: asynchronous scoring, stop conditions, and durable outputs."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import faulthandler
 import json
 import os
@@ -14,7 +14,9 @@ import traceback
 from .compile import try_worker_env
 from .db import Database
 from .evolve import reset_weakest
-from .runtime import read_run, run_hook, top_programs
+from .normalize import normalized_hash
+from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
+                      read_run, run_hook, top_programs)
 from .workers import WorkerPool
 
 
@@ -23,6 +25,9 @@ STOP_GRACE_S = 120
 # Abandonment only matters after ~2 trial budgets of inactivity (>= 20 min at
 # defaults), so a write transaction every loop tick would be wasted contention.
 ABANDON_PERIOD_S = 30
+# Upper bound on one loop tick's wait. A finished evaluation wakes the loop at
+# once; new queue entries and state changes are noticed within this period.
+POLL_S = 0.1
 
 
 def log_event(message):
@@ -41,36 +46,46 @@ def snapshot(db, root):
 
 
 def stop_reason(db, cfg):
-    if db.get_state("stop_requested", False):
+    state = db.all_state()  # One read transaction for every condition.
+    if state.get("stop_requested", False):
         return "stop requested"
-    if time.time() - db.get_state("started_at") >= cfg.stop.duration_s:
+    if time.time() - state["started_at"] >= cfg.stop.duration_s:
         return "duration_s"
-    if db.get_state("children_scored", 0) >= cfg.stop.max_children:
+    if state.get("children_scored", 0) >= cfg.stop.max_children:
         return "max_children"
-    if cfg.stop.plateau_children and db.get_state("plateau_count", 0) >= cfg.stop.plateau_children:
+    if cfg.stop.plateau_children and state.get("plateau_count", 0) >= cfg.stop.plateau_children:
         return "plateau_children"
     return None
+
+
+def discard_candidate(evaluation):
+    """Drop a finished request's compiled library; its source stays for audit."""
+    try:
+        Path(evaluation.so_path).unlink(missing_ok=True)
+    except OSError as exc:
+        log_event(f"cannot remove {evaluation.so_path}: {exc}")
 
 
 def store_result(db, evaluation, result):
     """Commit the result, task completion, and counters as one transaction."""
     result = dict(result)
+    if evaluation.kind != "try":
+        # Read and tokenize before taking the writer lock.
+        source = Path(evaluation.src_path).read_text()
+        norm_hash = normalized_hash(source)
     with db.transaction():
         if evaluation.kind == "try":
             db.add_trial(evaluation.task_id, evaluation.trial_n,
                          status=result["status"], score=result["score"], msg=result["msg"])
         else:
             task = db.get_task(evaluation.task_id)
-            source = Path(evaluation.src_path).read_text()
             # Every scored submission spends budget, stored or not.
             db.increment_state("children_scored")
             if result["status"] == "OK":
                 db.increment_state("children_ok")
-            from .normalize import normalized_hash
-            duplicate = db.has_normalized_hash(normalized_hash(source))
+            duplicate = db.has_normalized_hash(norm_hash)
             if result["status"] == "OK":
-                duplicate = duplicate or any(p.score == result["score"] and p.sig == result["sig"]
-                                             for p in db.list_programs(status="OK"))
+                duplicate = duplicate or db.has_scored_duplicate(result["score"], result["sig"])
             if task.status != "open":
                 result["rejected"] = "task is no longer open"
             elif duplicate:
@@ -78,7 +93,7 @@ def store_result(db, evaluation, result):
             else:
                 program = db.add_program(task.island, source, parent_ids=task.parent_ids,
                                          status=result["status"], score=result["score"],
-                                         sig=result["sig"], msg=result["msg"])
+                                         sig=result["sig"], msg=result["msg"], norm_hash=norm_hash)
                 db.close_task(task.id)
                 result["program_id"] = program.id
             # Only a stored program can improve the best score; a rejected
@@ -99,6 +114,19 @@ def cancel_queued(db):
                 db.add_trial(evaluation.task_id, evaluation.trial_n,
                              status="ERROR", msg="RUN_OVER")
             db.finish_evaluation(evaluation.id, result)
+        discard_candidate(evaluation)
+
+
+def finish_unscored(db, reason):
+    """Finish every queued or running request; none of them will be scored."""
+    cancel_queued(db)
+    for evaluation in db.running_evaluations():
+        result = {"status": "ERROR", "score": 0, "sig": [], "msg": reason, "run_over": True}
+        with db.transaction():
+            if evaluation.kind == "try":
+                db.add_trial(evaluation.task_id, evaluation.trial_n, status="ERROR", msg=reason)
+            db.finish_evaluation(evaluation.id, result)
+        discard_candidate(evaluation)
 
 
 def write_outputs(db, root, metadata, cfg, status, reason):
@@ -147,7 +175,12 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
             continue
         try:
             with Database(database) as db:
-                write_outputs(db, root, metadata, cfg, "failed", reason)
+                try:
+                    # Clients may still wait on requests the dead engine held.
+                    finish_unscored(db, reason)
+                except Exception:
+                    traceback.print_exc()  # Outputs matter more than queue rows.
+                write_outputs(db, root, metadata, cfg, FAILED, reason)
             return database
         except Exception as exc:
             errors.append(f"{database}: {exc}")
@@ -158,7 +191,7 @@ def serve(run_dir, ready_fd):
     root, metadata, cfg = read_run(run_dir)
     pools, executors, pending = {}, {}, {}
     db = Database(root / "db.sqlite")
-    status, reason = "failed", "daemon startup failed"
+    status, reason = FAILED, "daemon startup failed"
     notified = False
     stop_deadline = None
     signal_stop = False
@@ -174,23 +207,32 @@ def serve(run_dir, ready_fd):
     log_event(f"starting run={metadata['run_id']} workers_per_pool={cfg.search.workers}")
     try:
         evaluator = metadata["evaluator_library"]
-        for kind, env in (("submit", None), ("try", try_worker_env())):
+        for kind, env in (("submit", None), ("try", try_worker_env(cfg))):
             pools[kind] = WorkerPool(cfg, evaluator, cfg.problem.instance,
                                      cfg.search.workers, env)
             executors[kind] = ThreadPoolExecutor(max_workers=cfg.search.workers)
         with db.transaction():
-            db.set_state("status", "running")
+            db.set_state("status", RUNNING)
             db.set_state("pid", os.getpid())
         (root / "engine.pid").write_text(str(os.getpid()) + "\n")
-        os.write(ready_fd, b"READY\n")
-        os.close(ready_fd)
-        notified = True
         log_event("worker pools ready")
+        # The engine owns startup as it owns shutdown: the on-start hook runs
+        # here, before readiness and before any evaluation is dispatched, so
+        # the run never depends on its launcher surviving. Requests that
+        # mutators enqueue meanwhile wait in the queue.
+        try:
+            run_hook(metadata.get("on_start"), root)
+        except Exception as exc:
+            raise RuntimeError(f"on-start hook: {exc}") from None
+        notified = True
+        try:
+            os.write(ready_fd, b"READY\n")
+        except BrokenPipeError:
+            log_event("launcher exited before readiness; the run continues")
+        os.close(ready_fd)
         last_reset = last_snapshot = last_abandon = time.monotonic()
         rng = random.Random()
         while True:
-            if db.get_state("start_error"):
-                raise RuntimeError(db.get_state("start_error"))
             if signal_stop:
                 db.set_state("stop_requested", True)
             for future, evaluation in list(pending.items()):
@@ -203,19 +245,20 @@ def serve(run_dir, ready_fd):
                         result = {"status": "ERROR", "score": 0, "sig": [],
                                   "msg": "evaluation interrupted at shutdown"}
                     store_result(db, evaluation, result)
+                    discard_candidate(evaluation)
                     del pending[future]
                     found = stop_reason(db, cfg)
                     if found and stop_deadline is None:
                         reason = found
-                        status = "stopped" if found == "stop requested" else "completed"
-                        db.set_state("status", "stopping")
+                        status = STOPPED if found == "stop requested" else COMPLETED
+                        db.set_state("status", STOPPING)
                         stop_deadline = time.monotonic() + STOP_GRACE_S
             if stop_deadline is None:
                 found = stop_reason(db, cfg)
                 if found:
                     reason = found
-                    status = "stopped" if found == "stop requested" else "completed"
-                    db.set_state("status", "stopping")
+                    status = STOPPED if found == "stop requested" else COMPLETED
+                    db.set_state("status", STOPPING)
                     stop_deadline = time.monotonic() + STOP_GRACE_S
             if stop_deadline is not None:
                 cancel_queued(db)
@@ -224,7 +267,7 @@ def serve(run_dir, ready_fd):
                 if time.monotonic() >= stop_deadline:
                     for pool in pools.values():
                         pool.abort()
-            elif db.get_state("start_hook_done", False):
+            else:
                 for kind in ("submit", "try"):
                     occupied = sum(e.kind == kind for e in pending.values())
                     capacity = cfg.search.workers - occupied
@@ -249,11 +292,14 @@ def serve(run_dir, ready_fd):
                 age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
                 db.abandon_stale_tasks(time.time() - age)
                 last_abandon = now
-            time.sleep(0.02)
+            if pending:
+                wait(pending, timeout=POLL_S, return_when=FIRST_COMPLETED)
+            else:
+                time.sleep(POLL_S)
     except BaseException as exc:
         traceback.print_exc()
         sys.stderr.flush()
-        status, reason = "failed", str(exc)
+        status, reason = FAILED, str(exc)
         # Interrupt workers even if persisting the failed state encounters an
         # error. Pool cleanup must not prevent outputs or the finish hook.
         for pool in pools.values():
@@ -262,7 +308,7 @@ def serve(run_dir, ready_fd):
             except BaseException:
                 traceback.print_exc()
         try:
-            db.set_state("status", "stopping")
+            db.set_state("status", STOPPING)
         except BaseException:
             traceback.print_exc()
     finally:
@@ -275,24 +321,18 @@ def serve(run_dir, ready_fd):
                 cleanup()
             except BaseException as exc:
                 traceback.print_exc()
-                status, reason = "failed", f"worker cleanup: {exc}"
+                status, reason = FAILED, f"worker cleanup: {exc}"
         try:
-            cancel_queued(db)
-            for evaluation in db.running_evaluations():
-                result = {"status": "ERROR", "score": 0, "sig": [], "msg": reason, "run_over": True}
-                with db.transaction():
-                    if evaluation.kind == "try":
-                        db.add_trial(evaluation.task_id, evaluation.trial_n, status="ERROR", msg=reason)
-                    db.finish_evaluation(evaluation.id, result)
+            finish_unscored(db, reason)
         except BaseException as exc:
             traceback.print_exc()
-            status, reason = "failed", f"queue cleanup: {exc}"
+            status, reason = FAILED, f"queue cleanup: {exc}"
         try:
             write_outputs(db, root, metadata, cfg, status, reason)
             snapshot(db, root)
         except BaseException as exc:
             traceback.print_exc()
-            status, reason = "failed", f"final outputs: {exc}"
+            status, reason = FAILED, f"final outputs: {exc}"
             try:
                 write_outputs(db, root, metadata, cfg, status, reason)
             except BaseException:
@@ -302,7 +342,7 @@ def serve(run_dir, ready_fd):
         except BaseException as exc:
             traceback.print_exc()
             try:
-                write_outputs(db, root, metadata, cfg, "failed", f"on-finish hook: {exc}")
+                write_outputs(db, root, metadata, cfg, FAILED, f"on-finish hook: {exc}")
                 snapshot(db, root)
             except BaseException:
                 traceback.print_exc()
@@ -315,6 +355,8 @@ def serve(run_dir, ready_fd):
                 if not notified:
                     try:
                         os.write(ready_fd, ("FAILED " + reason.replace("\n", " ") + "\n").encode())
+                    except BrokenPipeError:
+                        pass  # The launcher is gone; engine.log has the reason.
                     finally:
                         os.close(ready_fd)
 
@@ -392,7 +434,8 @@ def daemonize(run_dir):
     os.waitpid(first, 0)
     try:
         _, _, cfg = read_run(run_dir)
-        deadline = time.monotonic() + 60 + cfg.search.workers * 2 * 180
+        # Two pools of workers, each with bounded start attempts, then the hook.
+        deadline = time.monotonic() + 60 + cfg.search.workers * 2 * 180 + HOOK_TIMEOUT_S
         message = b""
         while b"\n" not in message:
             remaining = deadline - time.monotonic()
@@ -403,6 +446,6 @@ def daemonize(run_dir):
                 raise RuntimeError("daemon exited during startup")
             message += chunk
         if message != b"READY\n":
-            raise RuntimeError(message.decode().strip())
+            raise RuntimeError(f"{message.decode().strip()} (see {Path(run_dir) / 'engine.log'})")
     finally:
         os.close(reader)

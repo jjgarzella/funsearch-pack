@@ -15,14 +15,19 @@ import uuid
 
 from .compile import compile_candidate
 from .config import ConfigError, load_config
-from .daemon import daemonize, recover_outputs
+from .daemon import STOP_GRACE_S, daemonize, recover_outputs
 from .db import Database
-from .evaluator import build_evaluator
+from .evaluator import build_evaluator, library_digest, snapshot_evaluator
 from .evolve import seed_islands
 from .normalize import normalized_hash
-from .runtime import Rejected, RunOver, pid_alive, read_run, require_running, run_hook, top_programs
+from .runtime import (STARTING, Rejected, RunOver, is_terminal, pid_alive, read_run,
+                      require_running, top_programs)
 from .tasks import create_task
-from .workers import WorkerPool, worker_binary
+from .workers import START_ATTEMPTS, START_TIMEOUT_S, WorkerPool, worker_binary
+
+
+# A waiting client polls the database at this period.
+POLL_S = 0.1
 
 
 def parser():
@@ -62,8 +67,10 @@ def parser():
 
 
 def preflight(problem, cfg):
+    """Build the evaluator and score the seed; return (library, digest, source, result)."""
     worker_binary()  # Build/verify once before run setup and pool construction.
     library = build_evaluator(cfg, problem)
+    digest = library_digest(library)
     source = (problem / "seed.c").read_text()
     with tempfile.TemporaryDirectory(prefix="funsearch-check-") as directory:
         seed = Path(directory) / "seed.c"
@@ -71,10 +78,10 @@ def preflight(problem, cfg):
         (Path(directory) / "candidate.h").write_bytes((problem / "candidate.h").read_bytes())
         ok, candidate, log = compile_candidate(cfg, seed, directory, "final")
         if not ok:
-            return library, source, {"status": "ERROR", "score": 0, "sig": [], "msg": log}
+            return library, digest, source, {"status": "ERROR", "score": 0, "sig": [], "msg": log}
         with WorkerPool(cfg, library, cfg.problem.instance, 1) as pool:
             result = pool.score(candidate, cfg.evaluator.timeout_s)
-    return library, source, result
+    return library, digest, source, result
 
 
 def pack_version():
@@ -98,7 +105,7 @@ def start_run(args):
     root = problem / "runs" / run_id
     if root.exists():
         raise ConfigError(f"run already exists: {root}")
-    library, source, result = preflight(problem, cfg)
+    library, digest, source, result = preflight(problem, cfg)
     if result["status"] != "OK":
         print(json.dumps(result))
         return 1
@@ -113,28 +120,28 @@ def start_run(args):
     (root / "seed.c").write_text(source)
     for name in ("candidate.h", "problem.md"):
         (root / name).write_bytes((problem / name).read_bytes())
+    # The run owns the evaluator it scored the seed with, like its other inputs.
+    evaluator = snapshot_evaluator(library, problem, root)
+    if library_digest(evaluator) != digest:
+        raise RuntimeError(f"evaluator library changed during run start: {library}")
+    # run.json is the engine's write-once manifest; integrations keep their
+    # own state in separate files.
     metadata = {"run_id": run_id, "problem_dir": str(problem), "instance": cfg.problem.instance,
                 "config": cfg.to_dict(), "pack_version": pack_version(),
-                "evaluator_library": str(library), "on_start": args.on_start,
+                "evaluator_library": str(evaluator), "evaluator_source": str(library),
+                "evaluator_sha256": digest, "on_start": args.on_start,
                 "on_finish": args.on_finish}
     (root / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
     with Database(root / "db.sqlite") as db:
         with db.transaction():
             seed_islands(db, cfg, source, score=result["score"], sig=result["sig"], msg=result["msg"])
-            for key, value in {"status": "starting", "started_at": time.time(),
+            for key, value in {"status": STARTING, "started_at": time.time(),
                                "seed_score": result["score"], "best_score": result["score"],
                                "children_scored": 0, "children_ok": 0, "plateau_count": 0,
-                               "stop_requested": False, "start_hook_done": False}.items():
+                               "stop_requested": False}.items():
                 db.set_state(key, value)
+    # Returns once the daemon has started its workers and run the on-start hook.
     daemonize(root)
-    with Database(root / "db.sqlite") as db:
-        try:
-            run_hook(args.on_start, root)
-        except BaseException as exc:
-            db.set_state("start_error", f"on-start hook: {exc}")
-            raise
-        finally:
-            db.set_state("start_hook_done", True)
     print(f"{run_id} {root}")
     return 0
 
@@ -147,19 +154,28 @@ def open_task(db, task_id):
 
 
 def wait_result(db, evaluation, cfg):
-    deadline = time.monotonic() + cfg.evaluator.timeout_s + 60
-    while time.monotonic() < deadline:
+    """Wait while the engine lives; time out only a stuck claimed evaluation.
+
+    Queue time is not charged to the request: the engine finishes every queued
+    request when the run ends. Once claimed, scoring may also replace a worker
+    before (recycle) and after (crash) the candidate's own timeout.
+    """
+    scoring_s = cfg.evaluator.timeout_s + 2 * START_ATTEMPTS * START_TIMEOUT_S + 60
+    run_end = db.get_state("started_at") + cfg.stop.duration_s + STOP_GRACE_S + scoring_s
+    while True:
         current = db.get_evaluation(evaluation.id)
         if current.state == "done":
             if current.result.get("run_over"):
                 raise RunOver("RUN_OVER")
             return current.result
-        if db.get_state("status") in ("completed", "stopped", "failed"):
+        if is_terminal(db.get_state("status")):
             raise RunOver("RUN_OVER")
         if not pid_alive(db.get_state("pid")):
             raise RuntimeError("engine process is not alive")
-        time.sleep(0.02)
-    raise RuntimeError(f"timed out waiting for evaluation {evaluation.id}")
+        now = time.time()
+        if (current.state == "running" and now - current.started_at > scoring_s) or now > run_end:
+            raise RuntimeError(f"timed out waiting for evaluation {evaluation.id}")
+        time.sleep(POLL_S)
 
 
 def evaluate(args, root, cfg, db):
@@ -186,6 +202,7 @@ def evaluate(args, root, cfg, db):
             raise Rejected("duplicate candidate")
         ok, candidate, log = compile_candidate(cfg, source_path, request, "try" if kind == "try" else "final")
     except BaseException as exc:
+        (request / "candidate.so").unlink(missing_ok=True)
         if trial_n is not None:
             db.add_trial(task.id, trial_n, status="ERROR", msg=str(exc))
         raise
@@ -206,6 +223,8 @@ def evaluate(args, root, cfg, db):
                     raise Rejected("task already has a pending submission")
             evaluation = db.enqueue(kind, source_path, candidate, task_id=task.id, trial_n=trial_n)
     except BaseException as exc:
+        # Never queued, so the engine will not discard it after scoring.
+        candidate.unlink(missing_ok=True)
         if trial_n is not None:
             db.add_trial(task.id, trial_n, status="ERROR", msg=str(exc))
         raise
@@ -233,7 +252,7 @@ def dispatch(args):
     if args.command == "check":
         problem = Path(args.problem).resolve()
         cfg = load_config(problem, instance=args.instance)
-        _, _, result = preflight(problem, cfg)
+        _, _, _, result = preflight(problem, cfg)
         print(json.dumps(result))
         return 0 if result["status"] == "OK" else 1
     if args.command == "run" and args.run_command == "start":

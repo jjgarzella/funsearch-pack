@@ -137,8 +137,10 @@ direct bead-to-bead communication.
 The one-step v2 run formula starts a run with its instance, optional overrides
 and required notification recipient. The engine validates the problem, builds
 the evaluator, and requires the compiled seed to score \code{FS\_OK}.
-\item The engine saves the problem inputs and configuration, starts its detached
-observer and daemon, waits for worker-pool readiness, and invokes the start hook.
+\item The engine saves the problem inputs, configuration and a copy of the
+evaluator library's directory, and starts its detached observer and daemon. The
+daemon starts its worker pools and then runs the start hook itself, before
+dispatching any evaluation; the launcher waits for that readiness.
 The hook creates a run bead and K raw-routed slot beads and registers the engine
 PID. The launcher prints the run ID and path and returns without waiting for search.
 \item Each fresh mutator session claims a slot and performs N tasks:
@@ -313,7 +315,9 @@ embedded Julia uses its own. The daemon creates separate final and sanitizer
 pools, each with \code{search.workers} processes. Sanitizer workers preload
 libasan and remove \code{FS\_MEMORY\_MB}: ASan's virtual shadow mapping otherwise
 fails under \code{RLIMIT\_AS}. Final workers keep the configured address-space
-limit. Trials retain scoring timeouts but have no address-space limit. The engine
+limit. Trials keep scoring timeouts and bound memory in ASan's terms instead:
+\code{hard\_rss\_limit\_mb} and \code{max\_allocation\_size\_mb} equal
+\code{evaluator.memory\_mb}. The engine
 waits for worker initialization using a blank-request protocol probe; fatal
 initialization fails the run, while other startup failures have bounded retries.
 A warm evaluator process is therefore reused across
@@ -353,8 +357,12 @@ funsearch slot close <bead-id>
 \item[check] Validates the directory and TOML, builds the evaluator, compiles the
 seed, scores it with a fresh worker, and prints JSON. It performs no search.
 \item[run start] Performs pre-flight (seed must score \code{FS\_OK}), saves inputs
-and configuration, and starts the detached daemon. It returns after worker-pool
-readiness and the start hook, printing \code{<run-id> <absolute-run-dir>}.
+and configuration, snapshots the evaluator library's directory into
+\path{<run>/evaluator/} (workers and rescore load that copy; \code{run.json}
+records its SHA-256), and starts the detached daemon. The daemon owns both hooks:
+it runs the start hook after worker-pool readiness and before dispatching any
+evaluation, so the run never depends on the launcher surviving. \code{run start}
+returns after that readiness, printing \code{<run-id> <absolute-run-dir>}.
 Optional hook commands receive the run directory as an argument, with
 \code{FS\_RUN\_DIR} also set. The engine never calls \code{gc};
 \code{bin/funsearch} hands \code{slot} to the Gas City layer in
@@ -513,32 +521,32 @@ controller finishes drain. A different session ignores the old receipt.
 \section{Gas City integration}
 \subsection{Formula and beads}
 \path{formulas/funsearch-run.toml} is a single plain start step requiring
-formula compiler v2. \code{problem} and \code{notify} are required;
+formula compiler v2. \code{pack}, \code{problem} and \code{notify} are required;
 \code{instance} and \code{overrides} default to empty. Notify has no inferred
 slinger default: Gas City exports no reliable slinger recipient. After importing
 the pack into any rig, launch on that rig's general coding-agent pool:
 \begin{lstlisting}
 gc sling <rig>/<pool> funsearch-run --formula \
+  --var pack=/absolute/path/to/funsearch-pack \
   --var problem=/absolute/path/to/problem \
   --var instance=n=6 --var notify=<recipient> \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 \end{lstlisting}
-The start agent takes the pack root from the \code{pack} variable or, when
-that is empty, from the \code{gc.formula\_source} metadata gc records on the
-workflow root, and stops for the operator if neither yields the pack. It then
+The start agent takes the pack root from the required \code{pack} variable,
+and stops for the operator if that path does not contain the pack CLI. It then
 calls \path{scripts/gc_lifecycle.py} launch with literal quoted values.
 That helper parses overrides as data, invokes run start with on-start/on-finish
 hooks, and supplies \code{FS\_NOTIFY}. The start step records run ID/directory
-and closes while the search continues. A rig-local formula override needs the
-operator-supplied \code{pack} variable; there is no generic formula-agent
-\code{PACK\_DIR} assumption. Resume uses the recorded run rather than relaunching.
+and closes while the search continues. There is no generic formula-agent
+\code{PACK\_DIR} assumption, so the operator supplies \code{pack}. Resume uses the recorded run rather than relaunching.
 
 The start hook creates a \code{funsearch-run} bead in the starting rig and K
 child \code{funsearch-slot} beads, routed raw with \code{--no-formula} to
 \code{<rig>/funsearch.mutator}. Run metadata uses \code{fs.*} keys for problem,
 run directory, instance, PID, status, counters and notify. Slots carry run/slot,
-N and model metadata. \code{run.json} saves bead IDs, city/rig/notify context,
-and lifecycle checkpoints. The registry at
+N and model metadata. \path{gc-lifecycle.json} beside the engine's write-once
+\code{run.json} saves bead IDs, city/rig/notify context, and lifecycle
+checkpoints. The registry at
 \path{<city>/.gc/funsearch/active/<run-id>.json} stores run directory, run bead,
 rig and engine PID; run IDs must be unique across the city.
 
@@ -690,7 +698,8 @@ The report preserves these limits and earlier failure diagnoses.
 \item \textbf{Storage:} WAL became DELETE rollback journaling, with read-only
 inspection clients and backups, after mount-specific SIGBUS reproduction.
 \item \textbf{Native execution:} final and sanitizer pools are separate;
-ASan trials omit the optional address-space limit. Compilation uses immutable
+ASan trials replace the address-space limit with ASan RSS and allocation
+limits of the same size. Compilation uses immutable
 copies, bounded subprocesses and export inspection. The worker restores blocking
 stdin after Julia initialization and keeps native stdout off the JSON protocol.
 \item \textbf{Daemon lifecycle:} flushed signal/death diagnostics and an exit

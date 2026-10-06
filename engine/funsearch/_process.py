@@ -37,7 +37,7 @@ def worker_environment(cfg, extra_env=None):
 
     Worker spawn and the export checks (candidate and evaluator libraries)
     all use it, so constructors see what the worker will. extra_env is a
-    mode overlay such as try_worker_env(); None values remove variables.
+    mode overlay such as try_worker_env(cfg); None values remove variables.
     """
     return candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})},
                                  cfg.evaluator.env)

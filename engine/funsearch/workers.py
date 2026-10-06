@@ -352,7 +352,7 @@ class WorkerPool:
     """Blocking scoring API: call pool.score from a ThreadPoolExecutor.
 
     At most size requests execute concurrently. Others wait for an idle worker.
-    Construct a second pool with try_worker_env() for sanitizer candidates.
+    Construct a second pool with try_worker_env(cfg) for sanitizer candidates.
     close() rejects new/waiting calls, waits for active calls, then sends QUIT.
     """
 

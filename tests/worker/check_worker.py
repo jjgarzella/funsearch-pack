@@ -152,6 +152,14 @@ class WorkerTests(unittest.TestCase):
                 self.assertIsNone(result["score"])
                 self.assertEqual(result["msg"], "non-finite score")
 
+    def test_rejection_keeps_its_verdict_with_non_finite_values(self):
+        # score and sig are meaningful only for FS_OK; an INVALID result that
+        # leaves them NaN must keep its status and diagnostic message.
+        process = self.start("invalid-nan", "edge_eval")
+        self.assertEqual(self.score(process, "good"), {
+            "status": "INVALID", "score": None, "sig": [], "msg": "cap has a line",
+        })
+
     def test_non_finite_signature_is_an_error(self):
         process = self.start("nan-sig", "edge_eval")
         self.assertEqual(self.score(process, "good"), {
