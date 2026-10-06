@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from engine.funsearch.db import Database
+from engine.funsearch.runtime import top_programs
 
 
 class DatabaseTests(unittest.TestCase):
@@ -174,3 +175,80 @@ class DatabaseTests(unittest.TestCase):
         statements.clear()
         self.assertIsNone(self.db.claim_evaluation())
         self.assertFalse(any(sql.startswith("BEGIN") or sql.startswith("UPDATE") for sql in statements))
+
+    def test_scored_duplicate_needs_equal_score_and_signature_on_an_active_ok_program(self):
+        self.db.add_program(0, "a", score=2, sig=[1.5, 2])
+        self.db.add_program(1, "b", score=3, sig=[1])
+        self.db.add_program(0, "c", status="INVALID", score=4, sig=[1])
+        self.assertTrue(self.db.has_scored_duplicate(2, [1.5, 2]))
+        self.assertTrue(self.db.has_scored_duplicate(2.0, (1.5, 2.0)))
+        # Equal score alone is a different behaviour, not a duplicate.
+        self.assertFalse(self.db.has_scored_duplicate(2, [1.5, 3]))
+        self.assertFalse(self.db.has_scored_duplicate(2, []))
+        self.assertFalse(self.db.has_scored_duplicate(4, [1]))
+        self.db.archive_island(1)
+        self.assertFalse(self.db.has_scored_duplicate(3, [1]))
+
+    def test_ranking_order_filters_and_islands(self):
+        add = self.db.add_program
+        long = add(0, "long source", score=5)
+        short = add(1, "short", score=5)
+        older_tie = add(0, "tie-a", score=5)
+        newer_tie = add(1, "tie-b", score=5, norm_hash=older_tie.norm_hash)
+        add(0, "best but failed", status="INVALID", score=9)
+        add(0, "unscored", score=None)
+        archived = add(2, "archived best", score=7)
+        low = add(1, "low", score=1)
+        self.db.archive_island(2)
+        # Higher score, then shorter source, then the older program.
+        self.assertEqual([i for i, _ in self.db.ranked_ids()],
+                         [short.id, older_tie.id, newer_tie.id, long.id, low.id])
+        self.assertEqual(next(self.db.ranked_ids(active_only=False))[0], archived.id)
+        self.assertEqual(self.db.best_program(), short)
+        self.assertEqual(self.db.best_program(0), older_tie)
+        self.assertEqual(self.db.best_program(1), short)
+        self.assertIsNone(self.db.best_program(2))
+        self.assertIsNone(self.db.best_program(3))
+        # Exports keep archived history and drop repeated normalized sources.
+        self.assertEqual([p.id for p in top_programs(self.db, 10)],
+                         [archived.id, short.id, older_tie.id, long.id, low.id])
+        self.assertEqual([p.id for p in top_programs(self.db, 2)], [archived.id, short.id])
+        self.assertEqual([(s.id, s.length) for s in self.db.scored_summaries(0)],
+                         [(long.id, 11), (older_tie.id, 5)])
+
+    def test_ranking_and_sampling_never_read_program_source(self):
+        plans = []
+        for query in ("SELECT id,norm_hash FROM programs WHERE status='OK' AND score IS NOT NULL "
+                      "ORDER BY score DESC, source_length, id",
+                      "SELECT id FROM programs WHERE status='OK' AND score IS NOT NULL AND island=1 "
+                      "AND active=1 ORDER BY score DESC, source_length, id",
+                      "SELECT id,status,score,sig,source_length FROM programs WHERE island=1 "
+                      "AND active=1 AND status='OK' AND score IS NOT NULL ORDER BY id"):
+            plans.append(" ".join(row[3] for row in self.db.connection.execute("EXPLAIN QUERY PLAN " + query)))
+        for plan in plans:
+            self.assertIn("COVERING INDEX", plan)
+        self.assertNotIn("TEMP B-TREE", plans[0] + plans[1])
+
+    def test_older_database_gains_source_length(self):
+        legacy = self.path.with_name("legacy.sqlite")
+        with sqlite3.connect(legacy) as connection:
+            connection.executescript("""
+                CREATE TABLE programs (id INTEGER PRIMARY KEY, island INTEGER NOT NULL,
+                 parent_ids TEXT NOT NULL, source TEXT NOT NULL, norm_hash TEXT NOT NULL,
+                 status TEXT NOT NULL, score REAL, sig TEXT NOT NULL, msg TEXT NOT NULL,
+                 idea TEXT NOT NULL, created_at REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+                CREATE INDEX programs_score ON programs(status,active,score);
+                INSERT INTO programs VALUES (1,0,'[]','longer',  'a','OK',1,'[]','','',0,1);
+                INSERT INTO programs VALUES (2,0,'[]','short',   'b','OK',1,'[]','','',0,1);""")
+        connection.close()
+        # Read-only clients of an unmigrated run still rank by source length.
+        with Database(legacy, readonly=True) as client:
+            self.assertEqual(client.best_program().id, 2)
+            self.assertEqual([s.length for s in client.scored_summaries(0)], [6, 5])
+        with Database(legacy) as migrated:
+            self.assertEqual(migrated.best_program().id, 2)
+            indexes = {row[1] for row in migrated.connection.execute("PRAGMA index_list(programs)")}
+            self.assertNotIn("programs_score", indexes)
+            self.assertIn("programs_rank", indexes)
+        with Database(legacy, readonly=True) as client:
+            self.assertEqual([s.length for s in client.scored_summaries(0)], [6, 5])

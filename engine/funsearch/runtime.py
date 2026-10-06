@@ -83,13 +83,13 @@ def run_hook(command, run_dir):
 
 def top_programs(db, count=10):
     # Export unique candidates across islands, including archived history.
-    # Rows stream best first, so only the ranked prefix is ever read.
-    unique, seen = [], set()
-    with closing(db.ranked_programs(active_only=False)) as programs:
-        for program in programs:
-            if program.norm_hash not in seen:
-                unique.append(program)
-                seen.add(program.norm_hash)
-            if len(unique) >= count:
+    # Ids stream best first from an index; only the chosen rows' source is read.
+    chosen, seen = [], set()
+    with closing(db.ranked_ids(active_only=False)) as ranked:
+        for program_id, norm_hash in ranked:
+            if norm_hash not in seen:
+                chosen.append(program_id)
+                seen.add(norm_hash)
+            if len(chosen) >= count:
                 break
-    return unique
+    return [db.get_program(program_id) for program_id in chosen]

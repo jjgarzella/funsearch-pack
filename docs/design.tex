@@ -137,8 +137,8 @@ direct bead-to-bead communication.
 The one-step v2 run formula starts a run with its instance, optional overrides
 and required notification recipient. The engine validates the problem, builds
 the evaluator, and requires the compiled seed to score \code{FS\_OK}.
-\item The engine saves the problem inputs, configuration and a copy of the
-evaluator library's directory, and starts its detached observer and daemon. The
+\item The engine saves the problem inputs, configuration and the copy of the
+evaluator library's directory that scored the seed, and starts its detached observer and daemon. The
 daemon starts its worker pools and then runs the start hook itself, before
 dispatching any evaluation; the launcher waits for that readiness.
 The hook creates a run bead and K raw-routed slot beads and registers the engine
@@ -291,15 +291,18 @@ an error line and exits 3, failing run startup.
 There is one request per stdin line and one JSON result per stdout line:
 \begin{lstlisting}
 SCORE [#<hex token> ]<absolute path to candidate .so>
-{["nonce":"<token>",]"status":"OK|INVALID|ERROR","score":<num>,"sig":[...],"msg":"..."}
+{["nonce":"<token>",]"status":"OK|INVALID|ERROR","score":<num>|null,"sig":[...],"msg":"..."}
 QUIT
 \end{lstlisting}
 For each SCORE request, the worker opens the candidate using
 \code{dlopen} with flags \code{RTLD\_NOW|RTLD\_LOCAL}, binds a resolve function to
 \code{dlsym} on that handle, calls \code{fs\_score}, then \code{dlclose}s it.
-The worker evaluates one candidate at a time. A non-finite score or signature
-value becomes \code{ERROR} (``non-finite score''/``non-finite signature''), since
-JSON has no NaN. When the request carries a token, the reply echoes it; the
+The worker evaluates one candidate at a time. JSON has no NaN, so an
+\code{OK} result with a non-finite score or signature value becomes
+\code{ERROR} (``non-finite score''/``non-finite signature''). An
+\code{INVALID} or \code{ERROR} result keeps its own status and message: a
+non-finite score is sent as \code{null} and a non-finite signature is dropped
+(empty \code{sig}). When the request carries a token, the reply echoes it; the
 engine always sends one and discards replies without it, so candidate code
 cannot trivially forge a result on the inherited protocol fd. On \code{QUIT}, it calls
 \code{fs\_fini} if present and exits 0; EOF also runs finalization. The worker
@@ -356,10 +359,13 @@ funsearch slot close <bead-id>
 \begin{description}
 \item[check] Validates the directory and TOML, builds the evaluator, compiles the
 seed, scores it with a fresh worker, and prints JSON. It performs no search.
-\item[run start] Performs pre-flight (seed must score \code{FS\_OK}), saves inputs
-and configuration, snapshots the evaluator library's directory into
-\path{<run>/evaluator/} (workers and rescore load that copy; \code{run.json}
-records its SHA-256), and starts the detached daemon. The daemon owns both hooks:
+\item[run start] Snapshots the evaluator library's directory, performs pre-flight
+with that snapshot (seed must score \code{FS\_OK}), then saves inputs,
+configuration and the same snapshot as \path{<run>/evaluator/}. Workers and
+rescore load that copy, so the seed and the run are scored by identical files;
+\code{run.json} records a SHA-256 over every file and symlink in it. The library
+must therefore sit in its own subdirectory, never in a directory containing
+the problem's \path{runs/}. The command then starts the detached daemon. The daemon owns both hooks:
 it runs the start hook after worker-pool readiness and before dispatching any
 evaluation, so the run never depends on the launcher surviving. \code{run start}
 returns after that readiness, printing \code{<run-id> <absolute-run-dir>}.
@@ -377,14 +383,16 @@ PID is alive.
 a recent-history summary, trial budget, and instructions. If stopped it prints
 \code{RUN\_OVER} and exits 3.
 \item[try] Compiles with \code{compile\_try}, scores through the sanitizer pool,
-and prints \code{RESULT <status> <score> <message>}. Trial reservation is atomic;
+and prints \code{RESULT <status> <score> <message>}. The score is meaningful
+only for \code{OK}; a non-OK result without one prints 0. Trial reservation is atomic;
 a compile failure consumes a trial and records ERROR. Exhausted budgets refuse
 further trials.
 \item[submit] Normalizes and hashes code and rejects active normalized duplicates
 before scoring, or active OK behavior duplicates afterward. Rejection leaves
 the task open. Otherwise it compiles with \code{compile}, scores authoritatively,
 stores the child, and closes the task. Output is
-\code{ACCEPTED <program-id> <status> <score>}. INVALID/ERROR children are stored
+\code{ACCEPTED <program-id> <status> <score>}, with the same score rule as
+\code{try}. INVALID/ERROR children are stored
 as history but never sampled as parents. Mutator-reported scores are ignored.
 \item[rescore] Prints JSON from a temporary final worker scoring a stored program
 on another instance; the original run retains its single instance.

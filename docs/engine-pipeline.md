@@ -41,8 +41,14 @@ constructor crash cannot take down the engine. For try builds that fallback
 uses the ASan environment too. An installed but failing `nm` reports an error.
 
 `build_evaluator` runs the configured nonempty build command in the problem
-directory with a 15 minute timeout, verifies the library exists and defines
-`fs_score`, and returns its absolute path. Failures raise `EvaluatorBuildError`.
+directory with a 15 minute timeout, verifies the library exists, sits in a
+directory that does not contain the problem's `runs/`, and defines `fs_score`,
+and returns its absolute path. Failures raise `EvaluatorBuildError`.
+`snapshot_evaluator(library, directory)` copies the library's directory to
+`directory/evaluator` (symlinks as links) and returns the copied library;
+`evaluator_digest(directory)` hashes every file's content and every symlink's
+target in such a snapshot. `run start` scores the seed with a staged snapshot
+and moves it into the run.
 An empty build command supports prebuilt evaluators. The toy fixture's build
 command references the evaluator and header shipped elsewhere in this repo.
 
@@ -96,7 +102,11 @@ timeouts return ERROR with `timeout after Ns`; crashes return ERROR with
 process group and start a replacement before returning. A failure to start that
 replacement raises `WorkerError` or `EvaluatorInitError`. The timeout starts
 once a worker becomes available; time waiting for an idle worker and restarting
-a process is additional. `close()` rejects new/waiting pool requests, waits for
+a process is additional. `start_budget_s()` and `score_budget_s(timeout_s)`
+bound a worker start and a whole `score` call (a recycle before the candidate
+and a replacement after it); the daemon publishes its client deadlines from
+them as the `claim_timeout_s` and `end_by` state keys, which waiting `try` and
+`submit` clients compare against. `close()` rejects new/waiting pool requests, waits for
 active requests, sends QUIT, and allows one second for shutdown before killing
 and reaping each process and cleaning up its pipes and stderr reader.
 

@@ -120,12 +120,18 @@ bin/funsearch run recover /path/to/problem/runs/experiment
 
 `run start` checks the seed and returns after the daemon's worker pools are
 ready. Configuration, the seed, the problem statement, and the candidate
-header are saved in the run directory. Each try or submission compiles a
+header are saved in the run directory, together with a snapshot of the
+evaluator library's directory (`<run>/evaluator/`) that scored the seed.
+The run's workers and `rescore` load that snapshot, so rebuilding or fixing
+the problem's evaluator never changes a run, and a rescore of an old run
+uses that run's evaluator; `run.json` records its SHA-256. Keep the library
+in its own small subdirectory, such as `evaluator/`. Each try or submission compiles a
 private source copy; includes of `candidate.h` work there and during rescore.
 Candidate source may not include absolute or `..` paths, use computed
 includes, `#embed`, inline assembly or `##` token pasting (see Security notes).
 Try results print `RESULT <status> <score> <message>`; accepted submissions
-print `ACCEPTED <program-id> <status> <score>`. A rejected submission leaves
+print `ACCEPTED <program-id> <status> <score>`. The score is meaningful only
+for status `OK`; a non-OK result without one prints `0`. A rejected submission leaves
 its task open. A compile failure during try consumes a trial and records an
 ERROR result. Invalid and crashing submissions are stored so future mutators
 can see what was tried. Exact and normalized duplicates are rejected before

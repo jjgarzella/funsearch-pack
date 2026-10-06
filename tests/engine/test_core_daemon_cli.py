@@ -129,6 +129,64 @@ class RecoverTests(unittest.TestCase):
         self.assertFalse((self.run / "summary.json").exists())
 
 
+class WaitResultTests(unittest.TestCase):
+    """The client waits within the deadlines the engine published, on a fake clock."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.db = Database(Path(temp.name) / "db.sqlite")
+        self.addCleanup(self.db.close)
+        for key, value in {"status": "running", "pid": 1, "claim_timeout_s": 100,
+                           "end_by": 1000}.items():
+            self.db.set_state(key, value)
+        self.evaluation = self.db.enqueue("try", "a.c", "a.so")
+        self.now = 0.0
+
+    def claim(self):
+        self.db.claim_evaluation()
+        self.db.connection.execute("UPDATE evalq SET started_at=? WHERE id=?", (self.now, self.evaluation.id))
+
+    def wait(self, engine=lambda now: None):
+        """Run wait_result; engine(now) acts for the engine after each 10 s poll."""
+        def sleep(_):
+            self.now += 10
+            engine(self.now)
+        clock = SimpleNamespace(time=lambda: self.now, sleep=sleep)
+        with patch.object(cli, "time", clock), patch.object(cli, "pid_alive", return_value=True):
+            return cli.wait_result(self.db, self.evaluation)
+
+    def test_queue_time_is_not_charged(self):
+        result = {"status": "OK", "score": 1, "sig": [], "msg": ""}
+        def engine(now):
+            if now == 500:  # Long past claim_timeout_s, though never claimed.
+                self.claim()
+            if now == 590:
+                self.db.finish_evaluation(self.evaluation.id, result)
+        self.assertEqual(self.wait(engine), result)
+
+    def test_stuck_claimed_evaluation_times_out(self):
+        self.now = 300
+        self.claim()
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            self.wait()
+        self.assertEqual(self.now, 410)
+
+    def test_unclaimed_request_times_out_when_the_run_must_have_ended(self):
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            self.wait()
+        self.assertEqual(self.now, 1010)
+
+    def test_run_over_and_dead_engine(self):
+        self.db.set_state("status", "stopped")
+        with self.assertRaises(cli.RunOver):
+            self.wait()
+        self.db.set_state("status", "running")
+        with patch.object(cli, "pid_alive", return_value=False), \
+                self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
+            cli.wait_result(self.db, self.evaluation)
+
+
 class ErrorReportingTests(unittest.TestCase):
     def report(self, exc, **env):
         stderr = io.StringIO()

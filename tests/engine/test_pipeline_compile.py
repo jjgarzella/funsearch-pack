@@ -7,7 +7,8 @@ import time
 from unittest.mock import patch
 
 from engine.funsearch.compile import check_exports, compile_candidate, source_policy_error, try_worker_env
-from engine.funsearch.evaluator import EvaluatorBuildError, build_evaluator
+from engine.funsearch.evaluator import (EvaluatorBuildError, build_evaluator, evaluator_digest,
+                                       snapshot_evaluator)
 from tests.engine.pipeline_support import PipelineTestCase
 
 
@@ -240,3 +241,36 @@ class EvaluatorTests(PipelineTestCase):
         self.cfg.evaluator.library = str(library)
         with self.assertRaisesRegex(EvaluatorBuildError, "missing required exports: fs_score"):
             self.evaluator()
+
+    def test_library_directory_must_not_contain_the_runs(self):
+        built = self.evaluator()
+        for library in (self.problem / "libevaluator.so", self.root / "libevaluator.so"):
+            with self.subTest(library=library):
+                shutil.copy(built, library)
+                self.cfg.evaluator.build = ""
+                self.cfg.evaluator.library = os.path.relpath(library, self.problem)
+                with self.assertRaisesRegex(EvaluatorBuildError, "own subdirectory"):
+                    self.evaluator()
+
+    def test_snapshot_copies_siblings_and_links_and_digests_them(self):
+        library = self.evaluator()
+        (library.parent / "scorer.jl").write_text("score() = 1\n")
+        (library.parent / "data").mkdir()
+        (library.parent / "data" / "table.txt").write_text("1 2 3\n")
+        os.symlink("scorer.jl", library.parent / "current.jl")
+        first = snapshot_evaluator(library, self.root / "first")
+        self.assertEqual(first, self.root / "first" / "evaluator" / library.name)
+        self.assertEqual(first.read_bytes(), library.read_bytes())
+        self.assertEqual((first.parent / "data" / "table.txt").read_text(), "1 2 3\n")
+        self.assertEqual(os.readlink(first.parent / "current.jl"), "scorer.jl")
+        digest = evaluator_digest(first.parent)
+        self.assertEqual(evaluator_digest(snapshot_evaluator(library, self.root / "same").parent), digest)
+        # Any scoring resource, not just the library, distinguishes snapshots.
+        for change in (lambda d: (d / "scorer.jl").write_text("score() = 2\n"),
+                       lambda d: (d / "data" / "table.txt").write_text("1 2\n"),
+                       lambda d: ((d / "current.jl").unlink(), os.symlink("data", d / "current.jl")),
+                       lambda d: (d / "extra").write_text("")):
+            copy = snapshot_evaluator(library, self.root / f"changed-{time.monotonic_ns()}").parent
+            change(copy)
+            with self.subTest(change=change):
+                self.assertNotEqual(evaluator_digest(copy), digest)

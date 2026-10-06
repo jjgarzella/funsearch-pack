@@ -27,7 +27,8 @@ File tools may only read TASK.md/child.c and write child.c in your current task.
    to expand your permissions. Never read or guess the evaluator or write
    outside child.c. The whole candidate must be self-contained.
    You may use `{{.ConfigDir}}/bin/funsearch try <run_dir> <task-id> <absolute-task-dir>/child.c`
-   at most the trial budget in TASK.md. Read RESULT and fix errors.
+   at most the trial budget in TASK.md. Read RESULT and fix errors
+   (`RESULT <status> <score> <message>`; the score means nothing unless OK).
    Then use `{{.ConfigDir}}/bin/funsearch submit <run_dir> <task-id> <absolute-task-dir>/child.c`.
    ACCEPTED completes the task. Exit 4 / REJECTED leaves it open: read the
    reason, change the idea for duplicates (comments alone do not suffice),

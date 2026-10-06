@@ -39,10 +39,14 @@ The primary operations are:
 
 - Programs: `add_program`, `get_program`, `list_programs`, `best_program`,
   `has_normalized_hash`, `recent_children`, `archive_island`. Hot paths filter
-  and rank in SQL: `best_program` and the lazy `ranked_programs` order scored
-  `OK` programs by score, then shorter source, then id; `scored_summaries` and
-  `count_programs` give sampling its fields without source text;
+  and rank in SQL: `best_program` and the lazy `ranked_ids` order scored `OK`
+  programs by score, then shorter source, then id. A stored `source_length`
+  column and two rank-ordered covering indexes let ranking stop after its
+  prefix without sorting or reading source text; `scored_summaries` and
+  `count_programs` give sampling its fields from the same indexes;
   `has_scored_duplicate(score, sig)` is the submission duplicate check.
+  Writable opens add `source_length` to older databases; read-only opens of an
+  unmigrated database see it through a temporary view.
 - Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`;
   `open_tasks_for_slot(slot)` lists a slot's unfinished tasks (more than one
   means the slot is corrupt); `abandon_stale_tasks(cutoff)` abandons open tasks

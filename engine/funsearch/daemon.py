@@ -17,9 +17,11 @@ from .evolve import reset_weakest
 from .normalize import normalized_hash
 from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
                       read_run, run_hook, top_programs)
-from .workers import WorkerPool
+from .workers import WorkerPool, score_budget_s, start_budget_s
 
 
+# Engine periods. daemonize reads these when it launches an engine and passes
+# them to serve() as arguments; a running engine never reads the globals.
 SNAPSHOT_PERIOD_S = 600
 STOP_GRACE_S = 120
 # Abandonment only matters after ~2 trial budgets of inactivity (>= 20 min at
@@ -28,6 +30,8 @@ ABANDON_PERIOD_S = 30
 # Upper bound on one loop tick's wait. A finished evaluation wakes the loop at
 # once; new queue entries and state changes are noticed within this period.
 POLL_S = 0.1
+# Scheduling slack on top of the scoring budget before a waiting client gives up.
+CLAIM_SLACK_S = 60
 
 
 def log_event(message):
@@ -187,7 +191,7 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
     raise RuntimeError("no readable run database" + "".join(f"\n{e}" for e in errors))
 
 
-def serve(run_dir, ready_fd):
+def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s):
     root, metadata, cfg = read_run(run_dir)
     pools, executors, pending = {}, {}, {}
     db = Database(root / "db.sqlite")
@@ -211,7 +215,13 @@ def serve(run_dir, ready_fd):
             pools[kind] = WorkerPool(cfg, evaluator, cfg.problem.instance,
                                      cfg.search.workers, env)
             executors[kind] = ThreadPoolExecutor(max_workers=cfg.search.workers)
+        # Publish how long a waiting client may expect: a claimed evaluation
+        # finishes within claim_timeout_s, and every request by end_by.
+        claim_timeout_s = score_budget_s(cfg.evaluator.timeout_s) + CLAIM_SLACK_S
         with db.transaction():
+            db.set_state("claim_timeout_s", claim_timeout_s)
+            db.set_state("end_by", db.get_state("started_at") + cfg.stop.duration_s
+                         + stop_grace_s + claim_timeout_s)
             db.set_state("status", RUNNING)
             db.set_state("pid", os.getpid())
         (root / "engine.pid").write_text(str(os.getpid()) + "\n")
@@ -252,14 +262,14 @@ def serve(run_dir, ready_fd):
                         reason = found
                         status = STOPPED if found == "stop requested" else COMPLETED
                         db.set_state("status", STOPPING)
-                        stop_deadline = time.monotonic() + STOP_GRACE_S
+                        stop_deadline = time.monotonic() + stop_grace_s
             if stop_deadline is None:
                 found = stop_reason(db, cfg)
                 if found:
                     reason = found
                     status = STOPPED if found == "stop requested" else COMPLETED
                     db.set_state("status", STOPPING)
-                    stop_deadline = time.monotonic() + STOP_GRACE_S
+                    stop_deadline = time.monotonic() + stop_grace_s
             if stop_deadline is not None:
                 cancel_queued(db)
                 if not pending:
@@ -285,10 +295,10 @@ def serve(run_dir, ready_fd):
             if stop_deadline is None and now - last_reset >= cfg.search.reset_period_s:
                 reset_weakest(db, rng)
                 last_reset = now
-            if now - last_snapshot >= SNAPSHOT_PERIOD_S:
+            if now - last_snapshot >= snapshot_period_s:
                 snapshot(db, root)
                 last_snapshot = now
-            if now - last_abandon >= ABANDON_PERIOD_S:
+            if now - last_abandon >= abandon_period_s:
                 age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
                 db.abandon_stale_tasks(time.time() - age)
                 last_abandon = now
@@ -363,8 +373,6 @@ def serve(run_dir, ready_fd):
 
 def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_period_s):
     """Wait for a detached engine with no launching-agent process identity."""
-    global SNAPSHOT_PERIOD_S, STOP_GRACE_S, ABANDON_PERIOD_S
-    SNAPSHOT_PERIOD_S, STOP_GRACE_S, ABANDON_PERIOD_S = snapshot_period_s, stop_grace_s, abandon_period_s
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
     engine = os.fork()
@@ -375,12 +383,15 @@ def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_per
         evidence = {"pid": engine, "ended_at": time.time(),
                     "exitcode": exitcode,
                     "signal": -exitcode if exitcode < 0 else None}
-        Path("engine-exit.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        # Readers poll for this file, so it must appear complete.
+        Path("engine-exit.json.tmp").write_text(json.dumps(evidence, indent=2) + "\n")
+        Path("engine-exit.json.tmp").replace("engine-exit.json")
         log_event(f"engine pid={engine} exited exitcode={exitcode} signal={evidence['signal']}")
         os._exit(0)
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
-        serve(run_dir, writer)
+        serve(run_dir, writer, snapshot_period_s=snapshot_period_s,
+              stop_grace_s=stop_grace_s, abandon_period_s=abandon_period_s)
     except BaseException:
         traceback.print_exc()
         try:
@@ -435,7 +446,7 @@ def daemonize(run_dir):
     try:
         _, _, cfg = read_run(run_dir)
         # Two pools of workers, each with bounded start attempts, then the hook.
-        deadline = time.monotonic() + 60 + cfg.search.workers * 2 * 180 + HOOK_TIMEOUT_S
+        deadline = time.monotonic() + 60 + 2 * cfg.search.workers * start_budget_s() + HOOK_TIMEOUT_S
         message = b""
         while b"\n" not in message:
             remaining = deadline - time.monotonic()

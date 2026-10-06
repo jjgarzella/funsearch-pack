@@ -1,7 +1,6 @@
 """Real CLI/daemon/worker integration, with a scripted C mutator."""
 
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,8 +14,11 @@ import time
 import unittest
 from unittest.mock import patch
 
+from engine.funsearch import daemon
 from engine.funsearch.db import Database
+from engine.funsearch.evaluator import evaluator_digest
 from engine.funsearch.runtime import pid_alive
+from engine.funsearch.workers import score_budget_s
 from .pipeline_support import PipelineTestCase, ROOT
 
 
@@ -86,6 +88,12 @@ class EndToEndTests(PipelineTestCase):
         path.write_text(source or f"// IDEA: improve to {value}\n#include \"candidate.h\"\ndouble f(void) {{ return {value}; }}\n")
         return path
 
+    def assert_requests_compiled_out(self, root, sources):
+        """Every finished request dropped its library and kept its source."""
+        requests = root / "requests"
+        self.assertEqual(list(requests.glob("*/*.so")), [])
+        self.assertEqual(len(list(requests.glob("*/candidate.c"))), sources)
+
     def finished(self, root, status="completed"):
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
@@ -103,6 +111,11 @@ class EndToEndTests(PipelineTestCase):
         with Database(root / "db.sqlite", readonly=True) as db:
             self.assertEqual(db.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(db.get_program(0).source, (self.problem / "seed.c").read_text())
+            # The engine publishes the deadlines its waiting clients use.
+            claim_timeout_s = score_budget_s(self.cfg.evaluator.timeout_s) + daemon.CLAIM_SLACK_S
+            self.assertEqual(db.get_state("claim_timeout_s"), claim_timeout_s)
+            self.assertEqual(db.get_state("end_by"), db.get_state("started_at") + 60
+                             + daemon.STOP_GRACE_S + claim_timeout_s)
         engine_pid = int((root / "engine.pid").read_text())
         # Linux process groups let us verify both pools have been shut down.
         process_text = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
@@ -138,6 +151,7 @@ class EndToEndTests(PipelineTestCase):
         self.assertEqual(summary["ok_rate"], 1)
         self.assertIn("return 10", (root / "best.c").read_text())
         self.assertEqual(len(list((root / "top").glob("*.c"))), 10)
+        self.assert_requests_compiled_out(root, 20)
         self.assertTrue((root / "finished.marker").exists())
         self.assertFalse(pid_alive(engine_pid))
         self.assertTrue(all(not pid_alive(pid) for pid in workers))
@@ -180,6 +194,9 @@ class EndToEndTests(PipelineTestCase):
         self.cli("stop", root)
         summary = self.finished(root, "stopped")
         self.assertEqual(summary["best_score"], 3)
+        # Scored, failed, and rejected requests alike; the try over budget
+        # was refused before it made a request.
+        self.assert_requests_compiled_out(root, 8)
         with Database(root / "db.sqlite") as db:
             self.assertEqual(len(db.list_programs(status="ERROR")), 1)
 
@@ -225,7 +242,7 @@ class EndToEndTests(PipelineTestCase):
         metadata = json.loads((root / "run.json").read_text())
         library = Path(metadata["evaluator_library"])
         self.assertEqual(library.parent, root / "evaluator")
-        self.assertEqual(metadata["evaluator_sha256"], hashlib.sha256(library.read_bytes()).hexdigest())
+        self.assertEqual(metadata["evaluator_sha256"], evaluator_digest(library.parent))
         # Rebuilding or breaking the problem's evaluator cannot reach the run:
         # a fresh rescore worker still loads the run-owned copy.
         Path(metadata["evaluator_source"]).write_bytes(b"not a shared library")
@@ -245,6 +262,8 @@ class EndToEndTests(PipelineTestCase):
             self.assertEqual(self.cli("submit", root, task_id, second, code=4),
                              "REJECTED task already has a pending submission")
             self.assertIn("ACCEPTED", first.result())
+        # The second request compiled but was never queued.
+        self.assert_requests_compiled_out(root, 2)
         with Database(root / "db.sqlite") as db:
             self.assertEqual(db.get_state("children_scored"), 1)
             self.assertEqual(db.get_task(task_id).status, "done")
@@ -362,6 +381,7 @@ class EndToEndTests(PipelineTestCase):
             self.assertIn("ACCEPTED", inflight.result())
             self.assertEqual(queued.result(), "RUN_OVER")
         summary = self.finished(root, "stopped")
+        self.assert_requests_compiled_out(root, 2)  # Including the cancelled one.
         self.assertEqual(summary["children_scored"], 1)
         with Database(root / "db.sqlite") as db:
             self.assertEqual(db.get_task(first).status, "done")

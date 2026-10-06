@@ -97,10 +97,13 @@ replaces each one after a crash, a timeout or a fixed number of scores, so
 `fs_init` may run many times over a run.
 
 When a run starts, the directory containing the evaluator library is copied
-into the run (`<run>/evaluator/`) and the run's workers load that copy, so
-rebuilding or editing the evaluator never changes a live run's scoring. Keep
-files the evaluator loads at runtime (such as an embedded script it finds
-next to its own library) in that directory, and keep the directory small.
+into the run (`<run>/evaluator/`); that copy scores the seed and the run's
+workers load it, so rebuilding or editing the evaluator never changes a live
+run's scoring. Keep files the evaluator loads at runtime (such as an embedded
+script it finds next to its own library) in that directory, and keep the
+directory small. The library must sit in its own subdirectory such as
+`evaluator/`: `run start` refuses one at the problem root, since that
+directory holds the runs themselves.
 
 `fs_result` contains `status`, `double score`, `int32_t nsig`, `double sig[8]`,
 and `char msg[256]`. Initialize every field. Use a NUL-terminated message:

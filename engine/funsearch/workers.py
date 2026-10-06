@@ -28,6 +28,20 @@ STDERR_TAIL_BYTES = 2048
 _build_lock = threading.Lock()
 
 
+def start_budget_s():
+    """Longest one worker start may take: every attempt times out."""
+    return START_ATTEMPTS * START_TIMEOUT_S
+
+
+def score_budget_s(timeout_s):
+    """Longest one Worker.score call may take.
+
+    A recycle may replace the worker before the candidate runs, and a timeout
+    or crash replaces it again before the call returns.
+    """
+    return timeout_s + 2 * start_budget_s()
+
+
 class WorkerError(RuntimeError):
     """A worker could not start, or the pool is closed."""
 

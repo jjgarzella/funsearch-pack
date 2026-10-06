@@ -88,11 +88,9 @@ CREATE TABLE IF NOT EXISTS programs (
  parent_ids TEXT NOT NULL, source TEXT NOT NULL, norm_hash TEXT NOT NULL,
  status TEXT NOT NULL, score REAL, sig TEXT NOT NULL, msg TEXT NOT NULL,
  idea TEXT NOT NULL, created_at REAL NOT NULL,
- active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+ active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+ source_length INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS programs_island ON programs(island,active,status);
-CREATE INDEX IF NOT EXISTS programs_hash ON programs(norm_hash);
-CREATE INDEX IF NOT EXISTS programs_score ON programs(status,active,score);
 CREATE TABLE IF NOT EXISTS tasks (
  id INTEGER PRIMARY KEY, island INTEGER NOT NULL, parent_ids TEXT NOT NULL,
  slot TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open'
@@ -117,6 +115,20 @@ CREATE INDEX IF NOT EXISTS evalq_state ON evalq(state,id);
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
+# Ranking and sampling read only these covering indexes, in rank order, so
+# they never sort or touch program source text: best first is higher score,
+# then shorter source, then older program.
+_INDEXES = """
+DROP INDEX IF EXISTS programs_island;
+DROP INDEX IF EXISTS programs_score;
+CREATE INDEX IF NOT EXISTS programs_hash ON programs(norm_hash);
+CREATE INDEX IF NOT EXISTS programs_rank
+ ON programs(status,score DESC,source_length,id,active,norm_hash);
+CREATE INDEX IF NOT EXISTS programs_island_rank
+ ON programs(island,active,status,score DESC,source_length,id,sig);
+"""
+_RANK_ORDER = "ORDER BY score DESC, source_length, id"
+
 
 class Database:
     def __init__(self, path, *, busy_timeout_ms=5000, readonly=False):
@@ -127,15 +139,29 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self._depth = 0
         if not readonly:
             # Host-mounted run directories may not support WAL's shared -shm
             # mmap reliably (live acceptance saw SIGBUS). Rollback journaling
             # avoids that mapping and also migrates existing WAL databases.
             self.connection.execute("PRAGMA journal_mode=DELETE")
             self.connection.executescript(_SCHEMA)
-            if "trial_n" not in {row[1] for row in self.connection.execute("PRAGMA table_info(evalq)")}:
+            if "trial_n" not in self._columns("evalq"):
                 self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
-        self._depth = 0
+            if "source_length" not in self._columns("programs"):
+                with self.transaction():
+                    self.connection.execute(
+                        "ALTER TABLE programs ADD COLUMN source_length INTEGER NOT NULL DEFAULT 0")
+                    self.connection.execute("UPDATE programs SET source_length=length(source)")
+            self.connection.executescript(_INDEXES)
+        elif "source_length" not in self._columns("programs"):
+            # A read-only client cannot migrate an older run; present the same
+            # columns through a temporary view, which shadows the table.
+            self.connection.execute("CREATE TEMP VIEW programs AS "
+                                    "SELECT *, length(source) AS source_length FROM main.programs")
+
+    def _columns(self, table):
+        return {row[1] for row in self.connection.execute(f"PRAGMA main.table_info({table})")}
 
     def __enter__(self):
         return self
@@ -174,6 +200,7 @@ class Database:
         data["parent_ids"] = json.loads(data["parent_ids"])
         data["sig"] = json.loads(data["sig"])
         data["active"] = bool(data["active"])
+        del data["source_length"]  # Program.length derives it from source.
         return Program(**data)
 
     @staticmethod
@@ -203,10 +230,11 @@ class Database:
             json.dumps(score, allow_nan=False)
         with self.transaction():
             cursor = self.connection.execute(
-                "INSERT INTO programs(id,island,parent_ids,source,norm_hash,status,score,sig,msg,idea,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO programs(id,island,parent_ids,source,norm_hash,status,score,sig,msg,idea,"
+                "created_at,source_length) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (program_id, island, json.dumps(list(parent_ids)), source, norm_hash or normalized_hash(source),
-                 status, score, encoded_sig, msg, extract_idea(source) if idea is None else idea, time.time()))
+                 status, score, encoded_sig, msg, extract_idea(source) if idea is None else idea, time.time(),
+                 len(source)))
             return self.get_program(cursor.lastrowid)
 
     def get_program(self, program_id: int) -> Program | None:
@@ -236,35 +264,34 @@ class Database:
     def scored_summaries(self, island: int) -> list[ProgramSummary]:
         """Active OK programs with a score, oldest first, without source text."""
         rows = self.connection.execute(
-            "SELECT id,status,score,sig,length(source) AS length FROM programs "
+            "SELECT id,status,score,sig,source_length FROM programs "
             "WHERE island=? AND active=1 AND status='OK' AND score IS NOT NULL ORDER BY id",
             (island,))
-        return [ProgramSummary(row["id"], row["status"], row["score"], json.loads(row["sig"]), row["length"])
-                for row in rows]
+        return [ProgramSummary(row["id"], row["status"], row["score"], json.loads(row["sig"]),
+                               row["source_length"]) for row in rows]
 
-    # Best first: higher score, then shorter source, then older program.
-    _RANKED = ("SELECT * FROM programs WHERE status='OK' AND score IS NOT NULL{} "
-               "ORDER BY score DESC, length(source), id")
+    def ranked_ids(self, island=None, *, active_only=True):
+        """Yield (id, norm_hash) of scored OK programs best first, lazily.
 
-    def ranked_programs(self, island=None, *, active_only=True):
-        """Yield scored OK programs best first, reading rows lazily."""
+        The rows come straight from a rank-ordered index: stopping early reads
+        only the prefix, and no source text is read at all.
+        """
         clauses, args = "", []
         if island is not None:
             clauses += " AND island=?"
             args.append(island)
         if active_only:
             clauses += " AND active=1"
-        with closing(self.connection.execute(self._RANKED.format(clauses), args)) as cursor:
+        query = ("SELECT id,norm_hash FROM programs WHERE status='OK' AND score IS NOT NULL"
+                 + clauses + " " + _RANK_ORDER)
+        with closing(self.connection.execute(query, args)) as cursor:
             while rows := cursor.fetchmany(64):
-                yield from map(self._program, rows)
+                yield from map(tuple, rows)
 
     def best_program(self, island=None) -> Program | None:
-        clauses, args = " AND active=1", []
-        if island is not None:
-            clauses += " AND island=?"
-            args.append(island)
-        return self._program(self.connection.execute(
-            self._RANKED.format(clauses) + " LIMIT 1", args).fetchone())
+        with closing(self.ranked_ids(island)) as ranked:
+            first = next(ranked, None)
+        return None if first is None else self.get_program(first[0])
 
     def has_scored_duplicate(self, score: float, sig) -> bool:
         """Whether an active OK program has exactly this score and signature."""
