@@ -17,16 +17,18 @@
   flow/.style={-{Latex},thick},
   lab/.style={font=\scriptsize,align=center,fill=white,inner sep=2pt}}
 \title{FunSearch pack v1: design and operating contract\\[0.5em]
-  \large Status: as designed (2026-10-05); refreshed at epic close-out}
+  \large Status: as built (2026-10-06)}
 \author{Math City / FunSearch pack}
-\date{2026-10-05}
+\date{2026-10-06}
 \begin{document}
 \maketitle
 \noindent This article records the decisions in the authoritative DESIGN field of
 Gas City epic \code{mc-h4zx}, designed by kurt with the overseer on 2026-10-05.
-It is a design record; the close-out bead refreshes it against the implementation.
-The epic DESIGN wins if a child bead disagrees, and real conflicts are recorded
-on that bead. This document does not gate implementation work.
+This as-built record was refreshed by close-out bead \code{mc-h4zx.12} against
+the implemented CLI, hooks, mutator policy, closed sibling notes, README, and
+\path{docs/acceptance-capset.md}. The original design remains the decision
+baseline; implementation changes and acceptance limitations are recorded below.
+The whole-epic review and publication follow this refresh.
 \tableofcontents
 
 \section{Overview}
@@ -94,7 +96,7 @@ terms are used in code, documentation, and prompts.
 \node[outer] (formula) at (0,3) {Run formula\\\code{funsearch-run}};
 \node[outer] (run) at (5.5,3) {Run bead\\status, summary};
 \node[box] (mutator) at (0,0) {Mutator agents\\task-local files};
-\node[box] (engine) at (5.5,0) {Engine\\program database\\Python + SQLite WAL};
+\node[box] (engine) at (5.5,0) {Engine\\program database\\SQLite DELETE journal};
 \node[box] (worker) at (11,0) {Worker pool\\C host processes};
 \node[outer] (slots) at (0,-3) {K slot beads\\fresh sessions};
 \node[outer] (registry) at (5.5,-3) {Active-run registry\\engine PID};
@@ -132,35 +134,40 @@ direct bead-to-bead communication.
 \section{Run life cycle}
 \begin{enumerate}
 \item An experimenter prepares a problem and uses \code{check} for pre-flight.
-The thin run formula starts a run with its instance, optional overrides and
-notification recipient. The engine validates the problem, builds the evaluator,
-and requires the compiled seed to score \code{FS\_OK}.
-\item The engine creates a run directory, daemonizes, and prints its ID and path.
-The start hook receives that path, creates the run bead and K raw-routed slot
-beads, and registers the engine PID in the city's active-run registry.
+The one-step v2 run formula starts a run with its instance, optional overrides
+and required notification recipient. The engine validates the problem, builds
+the evaluator, and requires the compiled seed to score \code{FS\_OK}.
+\item The engine saves the problem inputs and configuration, starts its detached
+observer and daemon, waits for worker-pool readiness, and invokes the start hook.
+The hook creates a run bead and K raw-routed slot beads and registers the engine
+PID. The launcher prints the run ID and path and returns without waiting for search.
 \item Each fresh mutator session claims a slot and performs N tasks:
-\code{next-task} $\to$ write \code{child.c} $\to$ bounded \code{try} $\to$
-\code{submit}. After N tasks it releases the still-routed, unassigned, open
-slot bead and exits; another fresh session takes the seat. A duplicate submission
-does not consume the task, so the mutator must revise and submit again.
-\item The engine keeps scoring and evolving until duration, maximum children,
-plateau, or an explicit \code{stop} ends the run. \code{next-task} then reports
-\code{RUN\_OVER}, exiting 3, and mutators close their slots.
-\item At stop the engine writes \code{summary.json}, exports \code{best.c} and
-\code{top/<k>.c}, backs up SQLite, and stops workers. It invokes the finish hook
-with the run directory and \code{FS\_RUN\_DIR} set, then exits.
-\item The finish hook updates the run bead with its summary, closes it and any
-remaining slot beads, mails the \code{notify} recipient, and deletes the registry
-entry. No result or source is automatically committed.
-\item If the engine dies before clean finish, the dormant condition-triggered
-sweep runs only with active entries and a last-sweep age greater than 30 minutes.
-For each dead PID it marks the run failed using the last summary or snapshot,
-closes its slots, mails notify, and removes the entry; it updates the sweep timestamp.
+\code{next-task} $\to$ read \code{TASK.md} $\to$ write \code{child.c} $\to$
+bounded \code{try} $\to$ \code{submit}. After N accepted submissions it releases
+the still-routed, unassigned, open slot, writes a retirement receipt, and calls
+\code{gc runtime drain-ack}. Another fresh session takes the seat. Rejection
+does not consume the task; a fresh session can also resume an unfinished task.
+\item Duration, maximum submitted evaluations, plateau, or explicit \code{stop}
+ends the run. Task commands then report \code{RUN\_OVER}, exiting 3.
+Mutators close their slots and drain. Queued requests are rejected; in-flight
+scoring may finish for at most 120 seconds.
+\item The engine writes \code{summary.json}, exports \code{best.c} and
+\code{top/<rank>-<score>.c}, backs up SQLite, and stops workers. It invokes the
+finish hook with the run directory and \code{FS\_RUN\_DIR} set, then exits.
+\item The finish hook updates the run summary, force-closes remaining slot
+beads before closing their parent run bead, mails \code{notify}, then deletes
+the active registry entry. No result or source is automatically committed.
+\item If the engine dies before clean finish, the condition-triggered sweep runs
+with active entries and a last-sweep age greater than 30 minutes. A dead PID
+without a terminal summary is marked failed with reason ``engine died'', using
+live database/backup results. A terminal summary is preserved and its finish
+hook retried. Failed deliveries retain the entry; the sweep always updates its
+timestamp under a city-wide lock.
 \end{enumerate}
-This sequence separates normal completion, which the engine owns, from crash
-recovery, which the EXEC order owns. N controls context recycling; K controls
-concurrent mutator seats. Each slot incurs one bead write per N mutations,
-acceptable at roughly 100 mutations per hour.
+Normal completion belongs to the engine; crash recovery belongs to the EXEC
+order. N controls context recycling; K controls concurrent seats. Recycling is
+amortized over N accepted submissions, with additional claim and lifecycle bead
+writes. The measured fresh-context cost motivates the N recommendation below.
 
 \section{Problem directory and configuration}
 A problem may live anywhere on disk. Except for the bundled example it lives in
@@ -175,10 +182,14 @@ presentation rather than direct access to this directory.
   evaluator/      # evaluator source + build script (or a prebuilt .so)
   runs/           # created by the engine, gitignored: one subdirectory per run
 \end{lstlisting}
-The v1 \code{problem.toml} schema below is copied verbatim, including comments,
-from the epic. The instance is opaque to the engine: exactly one is used for a
-run, and it is passed unchanged to \code{fs\_init} and \code{fs\_score}. A run can
-override \code{instance}, \code{[search]}, and \code{[stop]} keys on the command line.
+The v1 \code{problem.toml} schema below preserves the epic's generic example
+and defaults; the bundled cap-set evaluator instead uses
+\code{evaluator/libcapset.so} and \code{memory\_mb = 4096} for embedded Julia.
+The instance is opaque to the engine: exactly one is used per run, passed
+unchanged to \code{fs\_init} and \code{fs\_score}. Override it with
+\code{--instance}; repeat \code{--set key=val} for typed dotted-key overrides.
+The config loader accepts all known schema keys (also \code{instance=S} as an
+alias for \code{problem.instance}); the formula documents search/stop overrides.
 \begin{lstlisting}
 [problem]
 name = "cap-set"
@@ -214,8 +225,18 @@ plateau_children = 0             # 0 = disabled; else stop after this many child
 model = "claude-haiku-4-5-20251001"
 \end{lstlisting}
 The normal compiler is used for authoritative submission; \code{compile\_try}
-adds sanitizers for trial evaluation. The configured exports must be present
-in the resulting library, checked with \code{nm} / \code{dlsym}.
+adds sanitizers for trial evaluation. Required exports are checked with
+\code{nm -D --defined-only}, or isolated \code{ctypes.CDLL} inspection when
+\code{nm} is unavailable. Each compilation uses a private immutable source
+copy and the saved \code{candidate.h}, a 60-second compiler timeout, and a
+4 KiB diagnostic limit. Evaluator builds run in the problem directory with
+a 15-minute timeout; an empty build command supports a prebuilt library.
+
+The problem-setup skill and templates live in
+\path{skills/funsearch-problem-setup/}. A copied template should set its build
+command to \code{make -C evaluator FS\_PACK=/absolute/path/to/pack}, since a
+formula agent need not inherit the experimenter's exported \code{FS\_PACK}.
+Use \code{check} before launching a search.
 
 \section{Evaluator C contract and author rules}
 The following is the verbatim design-section-5 contract for the pack's
@@ -270,23 +291,37 @@ For each SCORE request, the worker opens the candidate using
 \code{dlopen} with flags \code{RTLD\_NOW|RTLD\_LOCAL}, binds a resolve function to
 \code{dlsym} on that handle, calls \code{fs\_score}, then \code{dlclose}s it.
 The worker evaluates one candidate at a time. On \code{QUIT}, it calls
-\code{fs\_fini} if present and exits 0.
+\code{fs\_fini} if present and exits 0; EOF also runs finalization. The worker
+reserves a protocol stream and redirects evaluator/candidate stdout to stderr
+so native output does not corrupt JSON replies. It restores blocking stdin
+after evaluator initialization, including when embedded Julia changes its flags.
 
 The engine owns timeouts and crash handling: it kills the worker on timeout,
 records \code{ERROR} with ``timeout'' or ``worker crashed: signal N'', and
 starts a replacement worker. If \code{FS\_MEMORY\_MB} is set, the worker uses its value to apply the
 \code{RLIMIT\_AS} memory limit through \code{setrlimit}. It must not install SIGSEGV handlers:
-embedded Julia uses its own. A warm evaluator process is therefore reused across
+embedded Julia uses its own. The daemon creates separate final and sanitizer
+pools, each with \code{search.workers} processes. Sanitizer workers preload
+libasan and remove \code{FS\_MEMORY\_MB}: ASan's virtual shadow mapping otherwise
+fails under \code{RLIMIT\_AS}. Final workers keep the configured address-space
+limit. Trials retain scoring timeouts but have no address-space limit. The engine
+waits for worker initialization using a blank-request protocol probe; fatal
+initialization fails the run, while other startup failures have bounded retries.
+A warm evaluator process is therefore reused across
 candidates, while each candidate library has a per-request lifetime.
+The cap-set C wrapper disables libblastrampoline deep binding only when a
+preloaded ASan runtime is detected, allowing embedded Julia sanitizer trials;
+normal final evaluation keeps its usual loading behavior.
 
 \section{Engine: CLI, database, and evolution}
-The engine uses Python 3's standard library and SQLite, without third-party
-Python dependencies. Its entry point is \code{bin/funsearch}.
+The engine uses Python 3.11 or later, its standard library and SQLite, without
+third-party Python dependencies. Its entry point is \code{bin/funsearch}.
+A C compiler, \code{make}, and POSIX process facilities are also required.
 \subsection{Command-line contract}
 \begin{lstlisting}
 funsearch check <problem> [--instance S]
 funsearch run start <problem> [--instance S] [--run-id ID]
-    [--set key=val ...] [--on-start CMD] [--on-finish CMD]
+    [--set key=val]... [--on-start CMD] [--on-finish CMD]
 funsearch run status <run-dir>
 funsearch best <run-dir> [-k N]
 funsearch stop <run-dir>
@@ -294,98 +329,205 @@ funsearch next-task <run-dir> [--slot ID]
 funsearch try <run-dir> <task-id> <candidate.c>
 funsearch submit <run-dir> <task-id> <candidate.c>
 funsearch rescore <run-dir> <program-id|best> --instance S
+funsearch slot show <bead-id>
+funsearch slot release <bead-id>
+funsearch slot close <bead-id>
 \end{lstlisting}
 \begin{description}
 \item[check] Validates the directory and TOML, builds the evaluator, compiles the
-seed, scores it with a fresh worker, and prints the result. It performs no search.
-\item[run start] Performs pre-flight (seed must score \code{FS\_OK}), creates the
-run directory, and daemonizes the loop. It prints the run ID and directory.
-Optional start/finish hook commands receive the run directory as their only
-argument, with \code{FS\_RUN\_DIR} also set. The engine itself never calls \code{gc}.
-\item[run status / best / stop] Inspect the run, retrieve the best programs
-(optionally top N), or request engine-owned termination.
-\item[next-task] Prints a task ID and directory containing \code{TASK.md}:
-\code{problem.md}, \code{candidate.h}, scored parents and messages, a short
-``already tried'' summary, trial budget, and instructions. If stopped it prints
+seed, scores it with a fresh worker, and prints JSON. It performs no search.
+\item[run start] Performs pre-flight (seed must score \code{FS\_OK}), saves inputs
+and configuration, and starts the detached daemon. It returns after worker-pool
+readiness and the start hook, printing \code{<run-id> <absolute-run-dir>}.
+Optional hook commands receive the run directory as an argument, with
+\code{FS\_RUN\_DIR} also set. The core never calls \code{gc}; only the separate
+slot adapters do so within this CLI.
+\item[run status / best / stop] Inspect JSON run state, list top programs
+(default ten), or request graceful termination through SQLite.
+\item[next-task] Prints \code{TASK <task-id> <absolute-task-dir>} containing
+\code{TASK.md}: problem prose, candidate header, scored parents and messages,
+a recent-history summary, trial budget, and instructions. If stopped it prints
 \code{RUN\_OVER} and exits 3.
-\item[try] Compiles with \code{compile\_try}, scores through the daemon's worker
-pool, and prints the result. It refuses calls once that task's trial budget is used.
-\item[submit] Normalizes and hashes code, rejects exact and normalized duplicates,
-and rejects a child whose signature and score equal an existing program's.
-Rejection does not consume the task. Otherwise it compiles with \code{compile},
-scores authoritatively (ignoring any mutator-reported score), stores the child,
-and closes the task.
-\item[rescore] Uses a temporary worker to score a stored program on another
-instance; the original run still has its single instance.
+\item[try] Compiles with \code{compile\_try}, scores through the sanitizer pool,
+and prints \code{RESULT <status> <score> <message>}. Trial reservation is atomic;
+a compile failure consumes a trial and records ERROR. Exhausted budgets refuse
+further trials.
+\item[submit] Normalizes and hashes code and rejects active normalized duplicates
+before scoring, or active OK behavior duplicates afterward. Rejection leaves
+the task open. Otherwise it compiles with \code{compile}, scores authoritatively,
+stores the child, and closes the task. Output is
+\code{ACCEPTED <program-id> <status> <score>}. INVALID/ERROR children are stored
+as history but never sampled as parents. Mutator-reported scores are ignored.
+\item[rescore] Prints JSON from a temporary final worker scoring a stored program
+on another instance; the original run retains its single instance.
+\item[slot show / release / close] Inspect a claimed slot and unfinished task,
+return it to the pool, or close it on RUN\_OVER. These Gas City adapters check
+session ownership and are described below.
 \end{description}
+Exit codes are 0 (success), 1 (runtime/seed failure), 2 (usage/configuration
+error), 3 (RUN\_OVER for task commands), and 4 (rejection or exhausted budget).
+Status, best, and rescore remain usable after completion. Each try/submission
+compiles a private source copy with the saved \code{candidate.h}; the immutable
+request sources remain available for independent verification.
+
 \subsection{Storage and evolutionary policy}
-The program database is \code{<run-dir>/db.sqlite} in WAL mode. It stores programs
-(ID, parent IDs, island, source, normalized hash, status, score, signature,
-message, timestamps), tasks, trials, an evaluation queue, and run state.
-The daemon owns the worker pool and handles queued trial/submission evaluations.
+\code{<run-dir>/db.sqlite} uses DELETE rollback journaling, foreign keys, and a
+5000 ms busy timeout. Writable opens migrate existing WAL databases; stop legacy
+engines/clients before migration. Status, best, rescore, and mutator inspection
+open read-only \code{mode=ro} connections without schema writes. WAL was replaced
+after a two-process probe reproduced SIGBUS on the host-mounted pack directory
+but not on the overlay filesystem. Snapshots also use DELETE.
+
+The database stores programs (ID, parent IDs, island, source, normalized hash,
+status, score, signature, message, timestamps), tasks, trials, an evaluation
+queue, and run state. The daemon owns the worker pools and queued evaluations;
 CLI processes and the daemon communicate only through SQLite.
 
-Evolution follows FunSearch / kitft: maintain islands, grouping programs within
-an island in clusters keyed by (score, signature). Sample parents using a
-Boltzmann distribution over cluster scores, with temperature decreasing as the
-island grows; prefer shorter programs within a cluster. Periodically reset the
-weakest half of islands, reseeding them from the best programs of the survivors.
-Signatures are grouping and duplicate-rejection information, never a ranking
-objective; score alone determines quality.
+Evolution maintains islands with clusters keyed by (score, signature rounded
+to eight decimal places). Tasks rotate through islands. Parents are sampled
+without replacement using Boltzmann weights over range-normalized cluster scores,
+with a cyclic temperature schedule decreasing within each 30,000-program period;
+shorter programs are preferred within a cluster. Periodic resets archive the
+weakest floor(number of islands / 2) islands and reseed from randomly selected
+survivors' best programs. Old programs remain readable by existing tasks.
+Signatures never rank programs; score alone determines quality.
+
+Duplicate checks cover active programs: normalization hashes C tokens while
+preserving literals and preprocessor distinctions; behavior duplicates require
+an exactly equal OK score and signature, unlike rounded clustering. Recent
+history includes archived children and the first real \code{// IDEA:} comment.
 
 \subsection{Stop and durable output}
 The engine owns duration, \code{max\_children}, plateau, and explicit-stop
 conditions. \code{plateau\_children = 0} disables plateau stopping; otherwise
-stop after that many children without improvement. On stopping, it writes
-\code{summary.json}, exports \code{best.c} and \code{top/<k>.c}, shuts down
-workers, runs the finish hook, and exits. Periodic snapshots and the final
-snapshot copy SQLite using its backup API.
+stop after that many submitted evaluations without improvement.
+\code{children\_scored} counts authoritative submitted evaluations, including
+post-score duplicate rejections; trials and compile failures do not count.
+In-flight reservations prevent max-child overshoot. Queued requests receive
+RUN\_OVER at stop, and active work gets a bounded 120-second completion window.
+Open tasks older than twice (trial budget times scoring timeout plus 600 seconds)
+are abandoned when they have no queued or running evaluation.
+
+On stopping, the engine writes \code{summary.json}, exports \code{best.c} and
+up to ten distinct OK programs as \code{top/<rank>-<score>.c}, shuts down workers,
+runs the finish hook, and exits. Snapshots every 600 seconds and at completion
+use SQLite's backup API; the latest five live in \code{snapshots/}.
+
+\code{engine.log} contains flushed UTC startup, shutdown and signal events,
+worker errors, and fatal-signal tracebacks. SIGTERM, SIGHUP and SIGINT request
+graceful shutdown. A detached parent waits for the daemon and records its exit
+code and signal in \code{engine-exit.json}. Before forking the engine, that
+observer execs with the launching agent's identity removed, including
+\code{GC\_SESSION\_ID}, \code{GC\_SESSION\_NAME}, and \code{GC\_AGENT}, so Gas
+City's process-table orphan reaper cannot retire it with the launcher.
+City, rig and notification context remain available to hooks. The exit record
+requires the observer to survive; SIGKILL alone does not establish an OOM cause.
 
 \section{Mutator role}
-The pack's \code{agents/mutator/} role uses provider \code{claude}, default model
-\code{claude-haiku-4-5-20251001}; the problem's \code{[mutator] model} can override
-it. It is a pool with \code{max\_active\_sessions} large enough for K (default 3)
-and \code{wake\_mode} fresh.
+\path{agents/mutator/agent.toml} defines the rig-scoped
+\code{funsearch.mutator} Claude pool with default model
+\code{claude-haiku-4-5-20251001}, zero minimum sessions, cap three, and
+\code{wake\_mode = fresh}. Increase the importing rig's cap for larger K or
+concurrent runs, allowing for rig/workspace limits. The problem's
+\code{[mutator] model} is copied to slot \code{opt\_model} metadata.
+Each concrete session has a private working directory under
+\path{<city>/.gc/funsearch/mutators/}.
 
-Allowed tools are shell only for the pack's \code{funsearch next-task|try|submit}
-and file reads/writes only inside the task directory. No web, git, direct
-problem-directory reads, or evaluator-source reads are allowed. The slot
-bootstrap claims its routed bead using \code{gc hook --claim}; run directory
-and slot ID come from metadata. These lifecycle bead operations accompany the
-restricted mutation loop, rather than giving general shell access.
+\subsection{Actual tool restriction and trust boundary}
+The \code{pre\_start} command runs \path{scripts/mutator_setup.py} to install
+project Claude settings and a mandatory \code{PreToolUse} guard.
+Claude runs in \code{dontAsk} mode (the provider's \code{full-auto} option),
+with Bash/Read/Write/Edit only, project settings only, an empty strict MCP
+configuration, and slash commands disabled. \path{scripts/mutator_guard.py}
+grants only literal calls to this pack's next-task/try/submit and slot helpers,
+\code{gc hook --claim --json} (optionally \code{--drain-ack}), and
+\code{gc runtime drain-ack}. Shell composition/substitution, other commands,
+and wrong runs/slots/tasks are denied. File tools can read only the current
+\code{TASK.md} and \code{child.c}; only \code{child.c} is writable.
+Paths with shell metacharacters are unsupported; quoted spaces are allowed.
 
-The session repeats N times: obtain a task, write a child, try at most the
-budget, and submit. It releases the slot back to the queue after N tasks,
-keeping it routed, unassigned, and open, then exits for clean-context recycling.
-On \code{RUN\_OVER}, it closes the slot and exits.
+This enforces a Claude tool policy. Gas City's agent schema supplies no OS
+filesystem/network sandbox; native compilation and scoring retain the host
+user's access, including through C includes and candidate code. It therefore
+provides no adversarial evaluator-hiding boundary. Symlink swaps by other
+processes remain a race. Pack code/settings must be trusted, and launch overrides
+must preserve hooks, project settings, permission mode, tool and MCP restrictions.
+City-managed trusted lifecycle hooks operate outside the model's tool allowlist.
+OS/container isolation remains backlog work.
+
+\subsection{Slot ownership, release and fresh retirement}
+A session claims with \code{gc hook --claim --drain-ack --json}.
+It uses \code{funsearch slot show <bead>} to load \code{fs.run\_dir}, \code{fs.slot},
+and \code{fs.tasks\_per\_session}. Show also reports an unfinished task and
+used trials so a replacement resumes it without allocating a second task.
+After N accepted submissions, release performs a guarded \code{gc bd update}
+with \code{--if-assignee} and \code{--if-status=in\_progress},
+\code{--status=open}, and an empty assignee. It clears session/claim/worktree
+metadata while preserving \code{gc.routed\_to}.
+
+On RUN\_OVER, close uses the same guards with \code{--status=closed}; an
+already closed slot is a read-only success. Neither helper drains. A successful
+release/close writes \code{.funsearch-retired.json}, making the tool guard
+permit only \code{gc runtime drain-ack} for that retiring session. This prevents
+a late nudge from reclaiming the slot in the same provider context before the
+controller finishes drain. A different session ignores the old receipt.
 
 \section{Gas City integration}
 \subsection{Formula and beads}
-The thin \code{funsearch-run} formula has variables \code{problem}, optional
-\code{instance}, \code{notify} (default the slinger), and optional
-\code{overrides}. Its single step executes \code{funsearch run start ...}
-and records the outcome. Slot beads are routed raw with \code{--no-formula}
-to \code{<rig>/funsearch.mutator}; they use no review/PR formula.
+\path{formulas/funsearch-run.toml} is a single plain start step requiring
+formula compiler v2. \code{problem} and \code{notify} are required;
+\code{instance} and \code{overrides} default to empty. Notify has no inferred
+slinger default: Gas City exports no reliable slinger recipient. After importing
+the pack into any rig, launch on that rig's general coding-agent pool:
+\begin{lstlisting}
+gc sling <rig>/<pool> funsearch-run --formula \
+  --var problem=/absolute/path/to/problem \
+  --var instance=n=6 --var notify=<recipient> \
+  --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
+\end{lstlisting}
+The start agent resolves the pack through \code{gc formula list --json},
+then calls \path{scripts/gc_lifecycle.py} launch with literal quoted values.
+That helper parses overrides as data, invokes run start with on-start/on-finish
+hooks, and supplies \code{FS\_NOTIFY}. The start step records run ID/directory
+and closes while the search continues. A rig-local formula override needs the
+operator-supplied pack location; there is no generic formula-agent
+\code{PACK\_DIR} assumption. Resume uses the recorded run rather than relaunching.
 
-Each run has one run bead in its starting rig, labelled \code{funsearch-run}.
-Its metadata includes problem, run directory, instance, engine PID, status,
-best score, children scored, and notify. Its final summary note records best
-score, \code{best.c} path, throughput, and fraction of children scoring OK.
-The active registry at \code{<city>/.gc/funsearch/active/<run-id>.json} is
-written at start and deleted after a clean finish.
+The start hook creates a \code{funsearch-run} bead in the starting rig and K
+child \code{funsearch-slot} beads, routed raw with \code{--no-formula} to
+\code{<rig>/funsearch.mutator}. Run metadata uses \code{fs.*} keys for problem,
+run directory, instance, PID, status, counters and notify. Slots carry run/slot,
+N and model metadata. \code{run.json} saves bead IDs, city/rig/notify context,
+and lifecycle checkpoints. The registry at
+\path{<city>/.gc/funsearch/active/<run-id>.json} stores run directory, run bead,
+rig and engine PID; run IDs must be unique across the city.
 
 \subsection{Completion and crash sweep}
-The engine finishes its own runs through the finish hook: update and close the
-run bead, close any remaining slots, and send \code{gc mail} to notify. This is
-mail, not a nudge.
+The start and finish shell hooks delegate to \path{scripts/gc_lifecycle.py}.
+Finish records best versus seed, scored children,
+throughput, OK rate, reason and \code{best.c}. It lists all slot children,
+including claimed/blocked/deferred slots, force-closes them before their parent,
+sends completion mail (not a nudge) to notify, and removes the registry entry.
+The engine/sweep owns terminal cleanup even when a live mutator owns a slot.
 
-\code{funsearch-sweep} is a condition-triggered EXEC order, with no agent.
-Its check exits 0 only when the active directory is nonempty and the timestamp
-of the last sweep is more than 30 minutes old. For each registered run with a
-dead engine PID, the script marks the run bead failed with the latest summary
-or snapshot information, closes slots, mails notify, removes the registry file,
-and updates the timestamp. It remains dormant without active runs. Run
-directories are gitignored, and nothing is committed automatically.
+\path{orders/funsearch-sweep.toml} is a condition-triggered EXEC order, without
+an agent, with a ten-second check timeout and five-minute execution timeout.
+The shell wrappers invoke the Python sweep. Its check returns 0 only with active
+JSON entries and a missing or more-than-30-minute-old last-sweep timestamp.
+False checks create no tracking beads. A city-wide lock prevents overlapping
+sweeps from importing rigs. Live PIDs are untouched; dead/zombie PIDs without a
+terminal summary recover database or latest readable backup results as
+failed/engine died. Dead engines with a terminal summary retry delivery with
+the actual outcome preserved. The sweep updates its timestamp even on errors,
+which retain registry entries for another retry.
+
+Hooks serialize per run and checkpoint completed actions. Sequential retries do
+not resend completion mail, but a crash between an external successful action
+and its JSON checkpoint can repeat a note, bead creation or mail: the stores do
+not share a transaction. A manual retry is
+\code{<pack>/scripts/on-finish.sh <run-dir>}; saved context restores rig/recipient
+from any cwd. Direct hooks require city, rig and notify environment. Runs are
+gitignored and no source or result is automatically committed.
 
 \section{Cap-set example and acceptance}
 The bundled problem lives at \code{examples/cap-set/}. Its candidate ABI is
@@ -403,35 +545,161 @@ forbidden condition is
 \]
 The verifier does not call the candidate. Score is the cap size $|C|$ at n
 from the instance (default \code{n=6}), and the signature contains cap sizes
-at $n=4,5,6$. The seed returns constant priority. The design records known
-optimum sizes $2,4,9,20,45,112$ for $n=1,\ldots,6$.
+at $n=4,5,6$ for the default instance. For $n<4$ it evaluates sizes $1,\ldots,n$;
+for $n=4,5$ it evaluates $4,\ldots,n$; for $n>6$ it also appends the target n.
+The evaluator rejects non-finite priorities and input mutation and uses
+lexicographic tie breaking. The seed returns constant priority. The original
+design records known optimum sizes $2,4,9,20,45,112$ for $n=1,\ldots,6$.
+The independent checker is \path{tools/check_cap.py}; \code{FS\_CAPSET\_DUMP}
+optionally records generated caps. The formula provides no documented
+environment passthrough, so acceptance enabled dumps during independent replay.
 
 The acceptance bead runs in rig \code{math-experiments}, with 3 mutators,
 for about one hour or 100 children. It passes when the run completes unattended,
 the best score strictly exceeds the seed score, and every recorded cap passes
 an independent re-check. It reports throughput, share of children scoring OK,
-session startup cost, and a recommended N (tasks per session). These are future
-acceptance criteria, not results claimed by this design document.
+session startup cost, and a recommended N (tasks per session). The final
+acceptance result follows; earlier failures remain in the acceptance report.
+
+\section{Acceptance results}
+\path{docs/acceptance-capset.md} is the detailed evidence record. Final acceptance
+\textbf{PASS} was recorded on 2026-10-06 by \code{mc-h4zx.11}. Run
+\code{20261006-001523-cdca}, launched by formula \code{mx-npjn} from pack
+\code{9cf05f0} in rig \code{math-experiments}, used the original parameters:
+\code{n=6}, 3600-second duration, 100-child cap, K=3, N=1, four islands,
+two workers per pool, three trials per task, and evaluator memory 4096 MiB.
+The run bead was \code{mx-etl6}, with three child slots.
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule Measure & Final value \\ \midrule
+Seed / best score & 64 / 82 \\
+Gain over seed & 18 (28.125\%) \\
+Scored submitted evaluations / OK & 63 / 63 \\
+OK rate & 100\% \\
+Elapsed to summary & 5271.617 s (87.860 min) \\
+Throughput, actual wall-time denominator & 43.023 evaluations/hour \\
+Distinct stored evolved programs & 5 \\
+Allocated / completed / abandoned tasks & 7 / 5 / 2 \\
+Reserved / recorded tries & 19 / 19 \\
+Mean tries per allocated / completed task & 2.714 / 3.000 \\
+Mean completed-task duration & 304.600 s \\
+\bottomrule
+\end{tabular}
+\end{center}
+Scored submissions include post-score behavior duplicates, so 63 evaluations
+are not 63 stored children. The best priority, program 8 with signature
+$[17,40,82]$, rewards balanced coordinate counts via negative weighted variance
+(weights 1.5 for count0 and 0.75 for count1/count2).
+
+\subsection{Completion, verification and crash recovery}
+The engine finished unattended with \code{completed / duration\_s} and observer
+exit code 0, no signal. The finish hook closed all slots and the run with a
+summary, sent completion mail, and removed the registry entry. Actual
+\code{/proc} environments confirmed launcher identity was absent from observer
+and engine, while city/rig/notify remained. The engine survived launcher
+retirement and the database remained DELETE.
+
+Best plus all six available distinct top candidates reproduced their scores;
+fewer than ten existed. All 82 completed evaluations (63 submissions and
+19 trials) were independently recompiled with their original compilation mode
+and reproduced status, score and signature. All nine stored programs matched,
+and all 534 generated verification cap dumps passed the exact Python checker.
+One trial's n=5 signature changed between O1 sanitizers and final O2; replaying
+its original mode matched exactly, with n=6 score unchanged. Trial signatures
+therefore need not equal final signatures. Authoritative final scores reproduced.
+The earlier real SIGKILL/forced-sweep gate also passed: failed/engine died,
+run and slots closed, mail sent and registry removed. It was retained because
+the later fixes did not change sweep logic.
+
+The acceptance work's final prescribed build/test gate passed: 106 Python tests,
+21 Julia assertions, nine cap-set checks, the skill-template check and 13 worker
+checks. Fourteen focused retirement/identity tests, \code{gc lint}, and whitespace
+checks passed. These are recorded predecessor results, not reruns by this
+documentation bead. Direct embedded Julia gates were retained because Kaimon's
+managed-project allow-list excluded the exact FunSearch project/worktree;
+no shared Julia session or service was changed.
+
+\subsection{Startup measurements, recommended N and limits}
+Five fresh replacements had distinct Gas City session IDs and Claude provider
+keys, with zero same-session post-release claims. Release-to-first-next-task
+costs were 58.434, 130.587, 192.564, 116.397 and 1071.987 seconds:
+mean 313.994 s, median 130.587 s, and four ordinary samples' mean 124.495 s.
+Initial session-to-task costs were 53.714 and 56.975 s (mean 55.344 s).
+These measure controller/provider/claim/startup together, not inference alone.
+
+Recommend \textbf{N=5} for the next operating run: ordinary startup amortizes
+to about 24.9 s/task, median to 26.1 s/task, or full observed mean to 62.8 s/task.
+N=1 remains the acceptance configuration and shipped default. Validate N=5
+on a stable host before treating those projections as tuned throughput.
+Fifteen real restricted Haiku sessions were observed, and all three slots were
+routed, but only slots 1 and 2 received tasks; full K=3 utilization was not proven.
+
+Configured duration was 3600 seconds, while recorded completion took 5271.617
+seconds. Shared monitor/engine execution gaps of 893, 971 and 1854 seconds
+prevent treating duration as a strict wall-clock deadline on this host; their
+specific host/kernel cause was not established. The shell monitor eventually
+reported MONITOR\_TIMEOUT after delayed resumption, despite persisted normal
+completion. Terminal artifacts and bead state establish the pass. Global
+\code{oom\_kill} rose from 3 to 5 while engine/observer survived; the samples
+identify no killed process and do not attribute OOM to mutators/evaluators.
+The report preserves these limits and earlier failure diagnoses.
+
+\section{As built: changelog versus original design}
+\begin{itemize}
+\item \textbf{Storage:} WAL became DELETE rollback journaling, with read-only
+inspection clients and backups, after mount-specific SIGBUS reproduction.
+\item \textbf{Native execution:} final and sanitizer pools are separate;
+ASan trials omit the optional address-space limit. Compilation uses immutable
+copies, bounded subprocesses and export inspection. The worker restores blocking
+stdin after Julia initialization and keeps native stdout off the JSON protocol.
+\item \textbf{Daemon lifecycle:} flushed signal/death diagnostics and an exit
+observer were added. Observer re-exec strips launcher identity to survive Gas
+City's orphan reaper; setsid alone was insufficient.
+\item \textbf{CLI and configuration:} repeated \code{--set}, slot
+show/release/close adapters, actual output/exit conventions, all-known-key typed
+overrides, top-file naming, snapshot retention, and child-count semantics are
+specified here. Cap-set uses \code{libcapset.so} and 4096 MiB instead of the
+generic schema example's library and 2048 MiB.
+\item \textbf{Gas City mechanics:} a plain one-step v2 formula requires explicit
+notify, resolves the imported pack through CLI introspection, and raw-routes
+slot children. Finish force-closes claimed slots before the parent; locked,
+checkpointed retries and the city-wide sweep preserve terminal outcomes.
+\item \textbf{Mutator restriction and recycling:} Claude project settings and
+PreToolUse implement a tool policy, not OS isolation. Ownership/status-guarded
+slot updates preserve routing. A retirement receipt enforces drain-only behavior
+and prevents same-context reclaim during delayed controller retirement.
+\item \textbf{Evidence:} live cap-set acceptance passed with score 82 versus 64,
+independent replay and exact checks. Measured startup recommends testing N=5;
+wall-time, host resource, compiler-mode and seat-utilization limits remain explicit.
+\end{itemize}
 
 \section{Local landing and epic close-out}
-All implementation beads land on the pack's local \code{main}. Nothing is
-pushed until the close-out bead. Each bead creates a worktree on
-\code{fs/<bead>} off local main, implements, runs its acceptance commands,
-rebases, fast-forwards the pack's main, removes the worktree/branch, records
-results, closes the bead, and dispatches ready successors. Beads labelled
-\code{fs-manual} are never auto-dispatched. This documentation bead changes
-only the pack, not the Math City repository.
+All implementation beads land on the pack's local \code{main}. Each bead uses
+an isolated \code{fs/<bead>} worktree, implements, runs its acceptance commands,
+rebases and fast-forwards main, then removes its worktree/branch and records
+results. Beads labelled \code{fs-manual} are never auto-dispatched. This
+close-out documentation bead changes only the pack, not the Math City repository.
 
-The final review is one \code{mol-review-loop-standard} pass over
-\code{origin/main..funsearch-v1}. After convergence, the authorized close-out
-pushes \code{funsearch-v1:main} and bumps only the relevant submodule-pointer
-and Math City import lines. The overseer waived the human merge gate for this
-epic. The design document is refreshed at close-out to match what was built.
+After this refresh lands, \code{mc-h4zx.12} fetches origin and points
+\code{funsearch-v1} at local main. It creates \path{worktrees/fs-review} and
+starts review bead \code{mc-h4zx.13} using the following formula settings:
+\begin{lstlisting}
+--on mol-review-loop-standard
+--var base_branch=origin/main --var notify_target=kurt
+\end{lstlisting}
+The six-lens review/fix loop examines the whole
+\code{origin/main..funsearch-v1} epic,
+with at most three attempts, and commits fixes on that review branch. No push
+occurs here. After convergence, landing bead \code{mc-h4zx.14} publishes
+\code{funsearch-v1:main} and commits the relevant submodule pointer and
+Math City import lines. The overseer waived the human merge gate for this epic.
 
 \section{Decision log: Q1--Q24}
 The epic records the resolved design, not the original interview transcript.
 Except for the supplied Q16 example, the Q labels below are a reconstruction
 for this record, derived from the design; they do not claim original question wording.
+They preserve the original decisions; the changelog above records as-built changes.
 \begin{enumerate}
 \renewcommand{\labelenumi}{Q\arabic{enumi}:}
 \item Package the search as a project-agnostic Gas City pack named \code{funsearch}.
