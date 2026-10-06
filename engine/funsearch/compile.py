@@ -183,8 +183,8 @@ def try_worker_env():
 def check_exports(so_path, exports, env):
     """Return (ok, message); only fall back to dlsym when nm is unavailable.
 
-    The ctypes fallback runs in isolation so constructors (or an ASan library)
-    cannot crash the engine process. Those constructors are evaluator or
+    The ctypes fallback runs in a separate process so a constructor crash
+    cannot take down the engine. This does not sandbox native code. Those constructors are evaluator or
     candidate code, so the child gets env (from worker_environment()), not the
     engine's environment.
     """

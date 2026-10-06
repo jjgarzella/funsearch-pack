@@ -191,8 +191,9 @@ unchanged to \code{fs\_init} and \code{fs\_score}. Override it with
 \code{--instance}; repeat \code{--set key=val} for typed dotted-key overrides.
 The config loader accepts all known schema keys (also \code{instance=S} as an
 alias for \code{problem.instance}). The formula launcher accepts only
-\code{search.*}, \code{stop.*}, \code{mutator.model} and \code{instance}
-overrides; shell-command keys (\code{candidate.compile*}, \code{evaluator.build})
+\code{search.*} and \code{stop.*} overrides; instance uses its separate
+formula variable and mutator model comes from \code{problem.toml};
+shell-command keys (\code{candidate.compile*}, \code{evaluator.build})
 come only from \code{problem.toml}.
 \begin{lstlisting}
 [problem]
@@ -317,6 +318,12 @@ waits for worker initialization using a blank-request protocol probe; fatal
 initialization fails the run, while other startup failures have bounded retries.
 A warm evaluator process is therefore reused across
 candidates, while each candidate library has a per-request lifetime.
+Both pools recycle after 100 completed scoring replies, before the next
+request and its timeout. The fixed budget avoids allocator/GC memory-noise
+restarts and bounds retained candidate state; it cannot prevent an individual
+candidate or burst of leaks from exhausting memory earlier. Native stderr is
+continuously drained into a bounded 1 MiB tail, with the last 2 KiB included
+in startup, crash, protocol and timeout failures.
 The cap-set C wrapper disables libblastrampoline deep binding only when a
 preloaded ASan runtime is detected, allowing embedded Julia sanitizer trials;
 normal final evaluation keeps its usual loading behavior.
@@ -324,7 +331,7 @@ normal final evaluation keeps its usual loading behavior.
 \section{Engine: CLI, database, and evolution}
 The engine uses Python 3.11 or later, its standard library and SQLite, without
 third-party Python dependencies. Its entry point is \code{bin/funsearch}.
-A C compiler, \code{make}, and POSIX process facilities are also required.
+A C compiler, \code{make}, \code{flock}, and POSIX process facilities are also required.
 \subsection{Command-line contract}
 \begin{lstlisting}
 funsearch check <problem> [--instance S]
@@ -690,8 +697,8 @@ stdin after Julia initialization and keeps native stdout off the JSON protocol.
 observer were added. Observer re-exec strips launcher identity to survive Gas
 City's orphan reaper; setsid alone was insufficient.
 \item \textbf{CLI and configuration:} repeated \code{--set}, slot
-show/release/close adapters, actual output/exit conventions, all-known-key typed
-overrides, top-file naming, snapshot retention, and child-count semantics are
+show/release/close adapters, actual output/exit conventions, typed engine
+overrides and search/stop-only formula overrides, top-file naming, snapshot retention, and child-count semantics are
 specified here. Cap-set uses \code{libcapset.so} and 4096 MiB instead of the
 generic schema example's library and 2048 MiB.
 \item \textbf{Gas City mechanics:} a plain one-step v2 formula requires explicit

@@ -25,7 +25,7 @@ description = "Absolute FunSearch pack root; empty uses this workflow's recorded
 default = ""
 
 [vars.overrides]
-description = "Space-separated key=value overrides of search.*, stop.*, mutator.model or instance; other keys are rejected"
+description = "Space-separated key=value overrides of search.* or stop.*; other keys are rejected"
 default = ""
 
 [[steps]]

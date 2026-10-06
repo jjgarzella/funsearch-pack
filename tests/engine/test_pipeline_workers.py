@@ -1,15 +1,34 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import random
 import signal
+import subprocess
 import time
+import unittest
 from unittest.mock import patch
 
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
-    RECYCLE_FRACTION, RECYCLE_STEP_FRACTION, STDERR_LIMIT_BYTES, EvaluatorInitError, Worker,
-    WorkerError, WorkerPool, _checked_reply, worker_binary)
+    RECYCLE_SCORES, STDERR_LIMIT_BYTES, STDERR_TAIL_BYTES, EvaluatorInitError, Worker,
+    WorkerError, WorkerPool, _StderrTail, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
+
+
+class StderrTailTests(unittest.TestCase):
+    def test_close_stops_reader_even_when_writer_keeps_pipe_open(self):
+        read_fd, write_fd = os.pipe()
+        reader = _StderrTail(os.fdopen(read_fd, "rb", buffering=0))
+        self.addCleanup(reader.close)
+        self.addCleanup(os.close, write_fd)
+        os.write(write_fd, b"last diagnostic\n")
+        # An escaped descendant can retain the write end; close must not
+        # require that descendant to cooperate or wait for EOF.
+        started = time.monotonic()
+        reader.close()
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertFalse(reader.thread.is_alive())
+        self.assertEqual(reader.tail(), "last diagnostic")
 
 
 class WorkerPoolTests(PipelineTestCase):
@@ -32,7 +51,8 @@ class WorkerPoolTests(PipelineTestCase):
         process = pool.workers[0].process
         result = pool.score(self.candidate("segv"), 5)
         self.assertEqual(result["status"], "ERROR")
-        self.assertEqual(result["msg"], f"worker crashed: signal {signal.SIGSEGV}")
+        self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGSEGV}"))
+        self.assertIn("toy evaluator", result["msg"])
         self.assertIsNot(pool.workers[0].process, process)
         self.assertEqual(process.returncode, -signal.SIGSEGV)
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
@@ -43,7 +63,7 @@ class WorkerPoolTests(PipelineTestCase):
         process.terminate()
         process.wait(timeout=5)
         good = self.candidate("good")
-        self.assertEqual(pool.score(good, 5)["msg"], f"worker crashed: signal {signal.SIGTERM}")
+        self.assertTrue(pool.score(good, 5)["msg"].startswith(f"worker crashed: signal {signal.SIGTERM}"))
         self.assertEqual(pool.score(good, 5)["status"], "OK")
 
     def test_timeout_and_recovery(self):
@@ -51,7 +71,7 @@ class WorkerPoolTests(PipelineTestCase):
         process = pool.workers[0].process
         result = pool.score(self.candidate("loop"), 1)
         self.assertEqual(result["status"], "ERROR")
-        self.assertEqual(result["msg"], "timeout after 1s")
+        self.assertTrue(result["msg"].startswith("timeout after 1s"))
         self.assertEqual(process.returncode, -signal.SIGKILL)
         self.assertEqual(pool.score(self.candidate("good"), 5)["status"], "OK")
 
@@ -159,8 +179,7 @@ void fs_fini(void) {
         for _ in range(2):
             self.assertEqual(pool.score(library, 5)["score"], 2)
             # Output beyond the cap is discarded rather than kept for the run.
-            self.assertLessEqual(os.fstat(pool.workers[0]._stderr.fileno()).st_size,
-                                 STDERR_LIMIT_BYTES)
+            self.assertLessEqual(len(pool.workers[0]._stderr.buffer), STDERR_LIMIT_BYTES)
 
     def test_candidate_cannot_forge_a_reply_on_the_protocol_fd(self):
         source = self.source(r'''#define _GNU_SOURCE
@@ -195,137 +214,112 @@ double f(void) {
                 self.assertEqual(_checked_reply(dict(good, nonce="n", **change), "n"), {
                     "status": "ERROR", "score": 0, "sig": [], "msg": "non-finite score or signature"})
 
-    def memory(self, values):
-        """Report worker memory from values (field -> KiB), which tests mutate."""
-        patcher = patch("engine.funsearch.workers._memory_kb",
-                        side_effect=lambda pid, field: values[field])
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def recycle_levels(self, baseline):
-        """(threshold, step) in KiB above the baseline for a VmSize worker."""
-        budget = self.cfg.evaluator.memory_mb * 1024 - baseline
-        return RECYCLE_FRACTION * budget, RECYCLE_STEP_FRACTION * budget
-
-    def test_leaking_worker_is_recycled_before_the_next_request(self):
-        baseline = 100_000
-        values = {"VmSize": baseline}
-        self.memory(values)
+    def test_fixed_score_budget_recycles_before_next_request(self):
+        self.assertEqual(RECYCLE_SCORES, 100)
         pool = self.pool()
         worker = pool.workers[0]
-        process = worker.process
         good = self.candidate("good")
-        threshold, step = self.recycle_levels(baseline)
-        mark = int(baseline + threshold - 1000)
-        # A high but stable level is a retained peak (allocator or GC heap),
-        # not a leak: page-level jitter above the threshold never recycles.
-        for level in (mark, mark + 2000, mark + 6000, mark + 2000, mark + 6004, mark + 6008):
-            values["VmSize"] = level
-            self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-        # Growth of a step past the mark recycles, but only before the next
-        # request: the reply already in hand is returned first.
-        values["VmSize"] = int(mark + step)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-        values["VmSize"] = baseline + 7
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIsNot(worker.process, process)
-        self.assertEqual(process.returncode, 0)
-        # The replacement measures its own baseline, not the old reading.
-        self.assertEqual(worker._baseline_kb, baseline + 7)
-
-    def test_one_shot_leak_after_start_is_recycled(self):
-        # The first score after a (re)start counts: a candidate that leaks
-        # past the threshold at once, followed by flat ones, is still replaced.
-        baseline = 100_000
-        values = {"VmSize": baseline}
-        self.memory(values)
-        pool = self.pool()
-        worker = pool.workers[0]
-        process = worker.process
-        good = self.candidate("good")
-        threshold, _ = self.recycle_levels(baseline)
-        values["VmSize"] = int(baseline + threshold + 1)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIsNot(worker.process, process)
-
-    def test_slow_leak_past_the_threshold_adds_up(self):
-        baseline = 100_000
-        values = {"VmSize": baseline}
-        self.memory(values)
-        pool = self.pool()
-        worker = pool.workers[0]
-        process = worker.process
-        good = self.candidate("good")
-        threshold, step = self.recycle_levels(baseline)
-        mark = int(baseline + threshold)
-        for growth in (0, step / 4, step / 2, 3 * step / 4):
-            values["VmSize"] = int(mark + growth)
-            self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-        values["VmSize"] = int(mark + step)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIsNot(worker.process, process)
-
-    def test_growth_up_to_the_threshold_does_not_recycle(self):
-        baseline = 100_000
-        values = {"VmSize": baseline}
-        self.memory(values)
-        pool = self.pool()
-        worker = pool.workers[0]
-        process = worker.process
-        good = self.candidate("good")
-        threshold, _ = self.recycle_levels(baseline)
-        for level in (baseline + threshold - 10, baseline + threshold, baseline):
-            values["VmSize"] = level
-            self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-
-    def test_sanitizer_worker_recycles_on_resident_size(self):
-        # Without FS_MEMORY_MB there is no RLIMIT_AS: only VmRSS is read
-        # (VmSize would raise KeyError), and the baseline is not taken off
-        # the budget, which has no address-space limit to share with it.
-        baseline = 50_000
-        values = {"VmRSS": baseline}
-        self.memory(values)
-        pool = self.pool(extra_env={"FS_MEMORY_MB": None})
-        worker = pool.workers[0]
-        process = worker.process
-        good = self.candidate("good")
-        budget = self.cfg.evaluator.memory_mb * 1024
-        unreduced = RECYCLE_FRACTION * budget
-        reduced = RECYCLE_FRACTION * (budget - baseline)
-        # Past the reduced threshold by more than a step, under the real one.
-        between = int(baseline + (reduced + unreduced) / 2)
-        self.assertGreater(between - baseline - reduced, 0)
-        self.assertGreater(between - baseline, RECYCLE_STEP_FRACTION * budget)
         for _ in range(2):
-            values["VmRSS"] = between
+            process = worker.process
+            reader = worker._stderr
+            for n in range(worker._scores, RECYCLE_SCORES):
+                self.assertEqual(pool.score(good, 5)["score"], 3.5)
+                self.assertIs(worker.process, process)
+                self.assertEqual(worker._scores, n + 1)
+            # Recycling must not delay returning score 100 or affect its value.
+            self.assertTrue(worker._recycle_due)
             self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        self.assertIs(worker.process, process)
-        values["VmRSS"] = int(baseline + unreduced + RECYCLE_STEP_FRACTION * budget)
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        values["VmRSS"] = baseline
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+            self.assertIsNot(worker.process, process)
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse(reader.thread.is_alive())
+            self.assertEqual(worker._scores, 1)
+
+    def test_sanitizer_uses_same_fixed_budget(self):
+        pool = self.pool(extra_env=try_worker_env())
+        worker = pool.workers[0]
+        good = self.candidate("good", "try")
+        process = worker.process
+        with patch("engine.funsearch.workers.RECYCLE_SCORES", 3):
+            for _ in range(3):
+                self.assertEqual(pool.score(good, 5)["score"], 3.5)
+                self.assertIs(worker.process, process)
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIsNot(worker.process, process)
+        self.assertEqual(worker._scores, 1)
+
+    def test_invalid_and_error_replies_count_toward_recycling(self):
+        pool = self.pool()
+        worker = pool.workers[0]
+        process = worker.process
+        with patch("engine.funsearch.workers.RECYCLE_SCORES", 3):
+            for library, status in ((self.candidate("good"), "OK"),
+                                    (self.candidate("neg"), "INVALID"),
+                                    (self.root / "absent.so", "ERROR")):
+                self.assertEqual(pool.score(library, 5)["status"], status)
+                self.assertIs(worker.process, process)
+            self.assertEqual(pool.score(self.candidate("good"), 5)["status"], "OK")
         self.assertIsNot(worker.process, process)
 
-    def test_failed_recycle_fails_later_requests(self):
-        values = {"VmSize": 100_000}
-        self.memory(values)
+    def test_failed_recycle_preserves_last_reply_and_fails_later_requests(self):
         pool = self.pool()
         worker = pool.workers[0]
         good = self.candidate("good")
-        values["VmSize"] = self.cfg.evaluator.memory_mb * 1024 - 2
-        self.assertEqual(pool.score(good, 5)["score"], 3.5)
-        with patch.object(worker, "_start", side_effect=WorkerError("cannot restart")):
-            with self.assertRaisesRegex(WorkerError, "cannot restart"):
-                pool.score(good, 5)
-        with self.assertRaisesRegex(WorkerError, "cannot restart"):
-            pool.score(good, 5)
+        with patch("engine.funsearch.workers.RECYCLE_SCORES", 1), \
+                patch.object(worker, "_start", side_effect=WorkerError("cannot restart")) as start:
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+            start.assert_not_called()
+            for _ in range(2):
+                with self.assertRaisesRegex(WorkerError, "cannot restart"):
+                    pool.score(good, 5)
+            self.assertEqual(start.call_count, 1)
+
+    def test_stderr_is_bounded_during_scoring_and_crash_tail_survives(self):
+        source = self.source(r'''#include <stdio.h>
+#include <unistd.h>
+double f(void) {
+    for (int i=0; i<300000; ++i) fputs("discard this native output\n", stderr);
+    fputs("LAST-DIAGNOSTIC-MARKER\n", stderr);
+    sleep(1);
+    _exit(1);
+}
+''')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "crash-tail", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        reader = pool.workers[0]._stderr
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(pool.score, library, 10)
+            deadline = time.monotonic() + 5
+            while "LAST-DIAGNOSTIC-MARKER" not in reader.tail():
+                self.assertFalse(future.done())
+                self.assertLess(time.monotonic(), deadline)
+                self.assertLessEqual(len(reader.buffer), STDERR_LIMIT_BYTES)
+                time.sleep(0.01)
+            self.assertFalse(future.done())
+            result = future.result(timeout=10)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertTrue(result["msg"].startswith("worker crashed: exit code 1"))
+        self.assertIn("LAST-DIAGNOSTIC-MARKER", result["msg"])
+        self.assertLessEqual(len(result["msg"].encode()), STDERR_TAIL_BYTES + 100)
+        self.assertFalse(reader.thread.is_alive())
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    def test_nonfinite_evaluator_signature_does_not_poison_sampling(self):
+        import shlex
+        from engine.funsearch.db import Database
+        from engine.funsearch.evolve import sample_parents
+        self.cfg.evaluator.build = ("mkdir -p evaluator && cc -shared -fPIC "
+            f"-I{shlex.quote(str(ROOT / 'include'))} -o evaluator/libevaluator.so "
+            f"{shlex.quote(str(ROOT / 'tests' / 'worker' / 'edge_eval.c'))}")
+        pool = self.pool(instance="nan-sig")
+        result = pool.score(self.candidate("good"), 5)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["sig"], [])
+        self.assertIn("non-finite signature", result["msg"])
+        with Database(self.root / "db.sqlite") as db:
+            db.add_program(0, "double f(void){return 0;}", score=0, sig=[0])
+            db.add_program(0, "double f(void){return 1;}", **result)
+            self.assertTrue(sample_parents(db, 0, 1, random.Random(1)))
 
     def test_candidate_environment_is_an_allowlist(self):
         private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
@@ -393,7 +387,7 @@ double f(void) {
         ok, library, log = compile_candidate(self.cfg, source, self.root / "fork", "final")
         self.assertTrue(ok, log)
         pool = self.pool(extra_env={"CHILD_PID_FILE": str(marker)})
-        self.assertEqual(pool.score(library, 1)["msg"], "timeout after 1s")
+        self.assertTrue(pool.score(library, 1)["msg"].startswith("timeout after 1s"))
         pid = int(marker.read_text())
         # A killed grandchild may briefly remain a zombie until init reaps it.
         for _ in range(50):
@@ -443,3 +437,34 @@ double f(void) {
         (root / "Makefile").write_text(".PHONY: worker\nworker:\n\tfalse\n")
         with patch("engine.funsearch.workers.__file__", str(module)):
             self.assertEqual(worker_binary(), binary)
+
+    def test_concurrent_process_builds_are_serial_and_atomic(self):
+        import shutil
+        root = self.root / "atomic pack"
+        root.mkdir()
+        shutil.copy(ROOT / "Makefile", root / "Makefile")
+        for name in ("worker/funsearch-worker.c", "include/funsearch.h"):
+            path = root / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("source")
+        compiler = root / "fake-cc"
+        compiler.write_text("#!/bin/sh\necho build >> builds\nwhile [ \"$1\" != -o ]; do shift; done\nshift\nprintf partial > \"$1\"\nsleep 0.3\nprintf complete > \"$1\"\n")
+        compiler.chmod(0o755)
+        binary = root / "build" / "funsearch-worker"
+        binary.parent.mkdir()
+        binary.write_text("old")
+        os.utime(binary, (1, 1))
+        processes = [subprocess.Popen(["make", "worker", "CC=./fake-cc"], cwd=root,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
+        observations = set()
+        try:
+            while any(p.poll() is None for p in processes):
+                observations.add(binary.read_text())
+                time.sleep(0.01)
+        finally:
+            for process in processes:
+                output, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output + errors)
+        self.assertLessEqual(observations, {"old", "complete"})
+        self.assertEqual(binary.read_text(), "complete")
+        self.assertEqual((root / "builds").read_text().splitlines(), ["build"])

@@ -43,14 +43,16 @@ The primary operations are:
   `open_tasks_for_slot(slot)` lists a slot's unfinished tasks (more than one
   means the slot is corrupt); `abandon_stale_tasks(cutoff)` abandons open tasks
   created before `cutoff` that have no queued or running evaluation, and returns
-  how many it closed.
+  how many it closed. Empty abandonment sweeps take no writer lock; the daemon
+  runs them at most once every 30 seconds.
 - Trials: `reserve_trial(task_id, budget)` atomically consumes a budget slot;
   `add_trial` stores its eventual result; `list_trials` reads results in order.
 - Queue: `enqueue`, `claim_evaluation` (oldest queued item, atomically),
   `finish_evaluation`, `get_evaluation`; `has_pending_submission(task_id)` is
   true while a submission for the task is queued or running, and
   `running_evaluations()` lists running items. Queue items transition queued →
-  running → done. If the engine dies, `funsearch run recover <run-dir>`
+  running → done. Empty queue polls take no writer lock; a nonempty claim
+  reselects under the writer transaction to remain atomic. If the engine dies, `funsearch run recover <run-dir>`
   (`daemon.recover_outputs`, which the Gas City sweep calls) writes failed
   outputs from the live database, or from the newest readable snapshot when
   the live one is unreadable.

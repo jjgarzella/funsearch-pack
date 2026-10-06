@@ -28,7 +28,6 @@ SLOT_RETIRED_FILE = ".funsearch-retired.json"
 # Formula/launch overrides tune the search only. Command-bearing keys
 # (candidate.compile*, evaluator.build) stay in the problem's own problem.toml.
 LAUNCH_OVERRIDE_SECTIONS = ("search.", "stop.")
-LAUNCH_OVERRIDE_KEYS = ("mutator.model", "instance", "problem.instance")
 
 
 class UsageError(ValueError):
@@ -108,7 +107,8 @@ def scoped_gc(city, rig, *args):
 
 
 def registry_path(city, run_id):
-    if not run_id or Path(run_id).name != run_id or run_id in (".", ".."):
+    if (not run_id or Path(run_id).name != run_id or run_id in (".", "..")
+            or any(char in run_id for char in "\n\r\0")):
         raise ValueError("invalid run id")
     return city / ".gc" / "funsearch" / "active" / (run_id + ".json")
 
@@ -306,9 +306,9 @@ def launch(args):
         command += ["--instance", args.instance]
     for override in shlex.split(args.overrides):
         key = override.partition("=")[0]
-        if not (key.startswith(LAUNCH_OVERRIDE_SECTIONS) or key in LAUNCH_OVERRIDE_KEYS):
-            raise ValueError(f"launch overrides may set only search.*, stop.*, mutator.model "
-                             f"or instance, not {key!r}; edit problem.toml instead")
+        if not key.startswith(LAUNCH_OVERRIDE_SECTIONS):
+            raise ValueError(f"launch overrides may set only search.* or stop.*, "
+                             f"not {key!r}; edit problem.toml or use --instance instead")
         command += ["--set", override]
     command += ["--on-start", shlex.quote(str(PACK / "scripts" / "on-start.sh")),
                 "--on-finish", shlex.quote(str(PACK / "scripts" / "on-finish.sh"))]

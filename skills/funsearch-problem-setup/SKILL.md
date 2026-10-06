@@ -130,14 +130,18 @@ with an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
 An evaluator that reads any other variable (an embedded runtime's `JULIA_*`,
 your own `MYEVAL_DEBUG`) must list it in `evaluator.env` as an fnmatch pattern,
 or `getenv` returns NULL under the engine although it works in your shell.
-Candidates can read every variable a worker has, so never pass a token, API
-key or licence secret this way: read it from a file only the evaluator needs,
-or hard-code non-secret settings. If `fs_init` fails, its stderr (last 2 KiB)
+Candidates can read every variable a worker has. Use non-secret settings;
+neither environment filtering nor storing a secret in a file protects it from
+native candidate code running as the same user. V1 supports trusted local
+experiments only; see the [Trust model](../../README.md#trust-model-v1).
+If `fs_init` fails, its stderr (last 2 KiB)
 is appended to the startup error, so print the reason before returning nonzero.
 
-Candidate source, including `seed.c`, may not use absolute or `..` includes,
-computed includes, `#embed`, inline assembly or `##` token pasting; these
-words are rejected even in comments.
+The compile source policy is a best-effort lint for common mutator accidents.
+Candidate source, including `seed.c`, is checked for absolute or `..` includes,
+computed includes, `#embed`, inline assembly and `##` token pasting. The lint
+may reject inert text or miss compiler-specific forms. It is not a security
+boundary and does not isolate compiler filesystem or network access.
 
 ## 5. Harden the evaluator before searching
 

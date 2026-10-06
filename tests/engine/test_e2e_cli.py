@@ -209,7 +209,7 @@ class EndToEndTests(PipelineTestCase):
         self.assertTrue((root / "finished.marker").exists())
 
     def test_run_id_validation_and_existing_run(self):
-        for run_id in ("..", ".", "a/b", "../escape", "line\nbreak"):
+        for run_id in ("", "..", ".", "a/b", "../escape", "/absolute", "line\nbreak", "line\rbreak"):
             with self.subTest(run_id=run_id):
                 self.cli("run", "start", self.problem, "--run-id", run_id, code=2)
         self.assertFalse((self.problem / "runs").exists())

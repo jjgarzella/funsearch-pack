@@ -13,8 +13,12 @@ worker: build/funsearch-worker
 # Install with a rename so a concurrent engine never executes a partial binary.
 build/funsearch-worker: worker/funsearch-worker.c include/funsearch.h
 	mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@.tmp worker/funsearch-worker.c $(LDLIBS)
-	mv -f $@.tmp $@
+	@set -e; exec 9>build/.worker-build.lock; flock -x 9; \
+		if test -f $@ && test $@ -nt worker/funsearch-worker.c && test $@ -nt include/funsearch.h; then exit 0; fi; \
+		tmp=$$(mktemp build/.funsearch-worker.XXXXXX); \
+		trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+		$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o "$$tmp" worker/funsearch-worker.c $(LDLIBS); \
+		mv -f "$$tmp" $@
 
 test: worker
 	@if test -n "$$(find tests -type f -name 'test_*.py' -print)"; then \

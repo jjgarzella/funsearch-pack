@@ -256,7 +256,8 @@ class LifecycleTests(HookFixture, unittest.TestCase):
     def test_launch_rejects_command_bearing_overrides(self):
         problem = self.root / "problem"
         for override in ("evaluator.build=touch pwned", "candidate.compile=sh -c id",
-                         "candidate.compile_try=id", "evaluator.library=x.so", "problem.name=x"):
+                         "candidate.compile_try=id", "evaluator.library=x.so", "problem.name=x",
+                         "mutator.model=x", "instance=n=7", "problem.instance=n=7"):
             with self.subTest(override=override):
                 result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
                                          str(problem), "--notify", "n", "--overrides", override],
@@ -265,6 +266,17 @@ class LifecycleTests(HookFixture, unittest.TestCase):
                 self.assertIn("launch overrides may set only", result.stderr)
         self.assertFalse((self.root / "pwned").exists())
         self.assertFalse(problem.exists())
+
+    def test_invalid_registry_run_ids_do_not_create_state(self):
+        # Run ids from persisted metadata get the same validation as the CLI.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fs_lifecycle", SCRIPTS / "gc_lifecycle.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for name in ("", ".", "..", "a/b", "../escape", "/absolute", "x\ny", "x\ry", "x\0y"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid run id"):
+                module.registry_path(self.city, name)
+        self.assertFalse(self.registry.exists())
 
     def test_formula_and_order_contract(self):
         formula = tomllib.loads((ROOT / "formulas" / "funsearch-run.toml").read_text())

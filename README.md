@@ -51,7 +51,8 @@ Omit `instance` and `overrides` to use the problem defaults. The start step
 finds the pack from the formula source gc records on the workflow; if you
 override `funsearch-run` locally in a rig, add `--var pack=/absolute/path/to/funsearch-pack`.
 Overrides may set
-only `search.*`, `stop.*`, `mutator.model` and `instance`; keys that hold shell
+only `search.*` and `stop.*`; use the separate `instance` variable for the
+instance and `problem.toml` for the mutator model. Keys that hold shell
 commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
 `problem.toml`. The seed must score
 `FS_OK`. For the copied evaluator template, set `evaluator.build` to
@@ -96,7 +97,7 @@ selects the correct rig even from another cwd. Direct hook launches require
 
 ## Using the engine directly
 
-The engine needs Python 3.11 or later, a C compiler, and `make`; its Python
+The engine needs Python 3.11 or later, a C compiler, `make`, and `flock`; its Python
 modules use only the standard library. It also works without Gas City:
 
 ```sh
@@ -138,8 +139,12 @@ in-flight submissions so multiple workers cannot overshoot it. Evaluations
 already running can finish for up to two minutes after stopping; queued
 requests receive RUN_OVER. Runs export `summary.json`, `best.c`, and the top
 ten distinct OK candidates in `top/`. The final and periodic SQLite backups
-live in `snapshots/`, with the latest five retained. Worker errors and daemon
-tracebacks appear in `engine.log`.
+live in `snapshots/`, with the latest five retained. Worker failure results
+include the last 2 KiB of native stderr from a
+continuously drained, bounded 1 MiB tail; daemon tracebacks appear in
+`engine.log`. Both pools recycle workers after 100 scoring replies, before
+the next request, to bound retained candidate state without memory-noise
+restarts.
 
 Run databases and snapshots use SQLite DELETE rollback journaling and a
 5000 ms busy timeout. WAL is avoided because its shared-memory mmap can

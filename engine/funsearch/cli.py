@@ -22,7 +22,7 @@ from .evolve import seed_islands
 from .normalize import normalized_hash
 from .runtime import Rejected, RunOver, pid_alive, read_run, require_running, run_hook, top_programs
 from .tasks import create_task
-from .workers import WorkerPool
+from .workers import WorkerPool, worker_binary
 
 
 def parser():
@@ -62,6 +62,7 @@ def parser():
 
 
 def preflight(problem, cfg):
+    worker_binary()  # Build/verify once before run setup and pool construction.
     library = build_evaluator(cfg, problem)
     source = (problem / "seed.c").read_text()
     with tempfile.TemporaryDirectory(prefix="funsearch-check-") as directory:
@@ -89,8 +90,10 @@ def pack_version():
 def start_run(args):
     problem = Path(args.problem).resolve()
     cfg = load_config(problem, args.set, instance=args.instance)
-    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
-    if not run_id or run_id in (".", "..") or Path(run_id).name != run_id or "\n" in run_id:
+    run_id = (args.run_id if args.run_id is not None else
+              datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
+    if (not run_id or run_id in (".", "..") or Path(run_id).name != run_id
+            or any(char in run_id for char in "\n\r\0")):
         raise ConfigError("run id must be a single directory name")
     root = problem / "runs" / run_id
     if root.exists():

@@ -149,3 +149,28 @@ class DatabaseTests(unittest.TestCase):
                 plan = " ".join(row[3] for row in db.connection.execute(
                     "EXPLAIN QUERY PLAN SELECT id FROM tasks WHERE status='open' AND created_at<1"))
                 self.assertIn("tasks_status", plan)
+
+    def test_idle_abandonment_does_not_take_writer_lock(self):
+        stale = self.db.add_task(0)
+        busy = self.db.add_task(0)
+        self.db.connection.execute("UPDATE tasks SET created_at=0 WHERE id=?", (busy.id,))
+        self.db.enqueue("submit", "busy.c", "busy.so", task_id=busy.id)
+        statements = []
+        self.db.connection.set_trace_callback(statements.append)
+        self.assertEqual(self.db.abandon_stale_tasks(100), 0)
+        self.assertFalse(any(sql.startswith("BEGIN") or sql.startswith("UPDATE") for sql in statements))
+        self.db.connection.execute("UPDATE tasks SET created_at=0 WHERE id=?", (stale.id,))
+        self.assertEqual(self.db.abandon_stale_tasks(100), 1)
+        self.assertEqual(self.db.get_task(busy.id).status, "open")
+
+    def test_idle_queue_polling_does_not_take_writer_lock(self):
+        queued = self.db.enqueue("try", "a.c", "a.so")
+        statements = []
+        self.db.connection.set_trace_callback(statements.append)
+        for _ in range(3):
+            self.assertIsNone(self.db.claim_evaluation("submit"))
+        self.assertFalse(any(sql.startswith("BEGIN") or sql.startswith("UPDATE") for sql in statements))
+        self.assertEqual(self.db.claim_evaluation("try").id, queued.id)
+        statements.clear()
+        self.assertIsNone(self.db.claim_evaluation())
+        self.assertFalse(any(sql.startswith("BEGIN") or sql.startswith("UPDATE") for sql in statements))

@@ -267,11 +267,19 @@ class Database:
 
     def abandon_stale_tasks(self, cutoff: float) -> int:
         """Abandon open tasks created before cutoff with no queued/running evaluation."""
+        # Avoid taking SQLite's writer lock when there is nothing to abandon.
+        # Recheck under the transaction so an evaluation enqueued in between
+        # cannot race maintenance into closing its task.
+        predicate = ("status='open' AND created_at<? AND id NOT IN "
+                     "(SELECT task_id FROM evalq WHERE state IN ('queued','running') "
+                     "AND task_id IS NOT NULL)")
+        if self.connection.execute("SELECT 1 FROM tasks WHERE " + predicate + " LIMIT 1",
+                                   (cutoff,)).fetchone() is None:
+            return 0
         with self.transaction():
             return self.connection.execute(
-                "UPDATE tasks SET status='abandoned',closed_at=? WHERE status='open' AND created_at<? "
-                "AND id NOT IN (SELECT task_id FROM evalq WHERE state IN ('queued','running') "
-                "AND task_id IS NOT NULL)", (time.time(), cutoff)).rowcount
+                "UPDATE tasks SET status='abandoned',closed_at=? WHERE " + predicate,
+                (time.time(), cutoff)).rowcount
 
     def reserve_trial(self, task_id: int, budget: int) -> int:
         """Atomically consume a try slot before queuing its evaluation."""
@@ -317,13 +325,18 @@ class Database:
             "SELECT * FROM evalq WHERE state='running' ORDER BY id")]
 
     def claim_evaluation(self, kind=None) -> Evaluation | None:
+        query = "SELECT id FROM evalq WHERE state='queued'"
+        args = ()
+        if kind is not None:
+            query += " AND kind=?"
+            args = (kind,)
+        query += " ORDER BY id LIMIT 1"
+        # Empty queues are polled frequently. Read first without reserving a
+        # writer; reselect under the transaction to preserve atomic claims.
+        if self.connection.execute(query, args).fetchone() is None:
+            return None
         with self.transaction():
-            query = "SELECT id FROM evalq WHERE state='queued'"
-            args = ()
-            if kind is not None:
-                query += " AND kind=?"
-                args = (kind,)
-            row = self.connection.execute(query + " ORDER BY id LIMIT 1", args).fetchone()
+            row = self.connection.execute(query, args).fetchone()
             if row is None:
                 return None
             self.connection.execute("UPDATE evalq SET state='running',started_at=? WHERE id=?", (time.time(), row["id"]))

@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +72,21 @@ class StoreResultTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(task.id).status, "done")
         self.assertEqual(self.db.get_state("best_score"), 3)
         self.assertEqual(self.db.get_state("plateau_count"), 0)
+
+    def test_cli_rejects_done_and_abandoned_tasks_before_compiling(self):
+        self.db.set_state("status", "running")
+        for status in ("done", "abandoned"):
+            task = self.db.add_task(0)
+            self.db.close_task(task.id, status=status)
+            for verb in ("try", "submit"):
+                args = SimpleNamespace(command=verb, task=task.id, source="unused")
+                with self.subTest(status=status, verb=verb), \
+                        patch.object(cli, "compile_candidate") as compile_, \
+                        self.assertRaisesRegex(cli.Rejected, "is not open"):
+                    cli.evaluate(args, self.root, Config(), self.db)
+                compile_.assert_not_called()
+            self.assertEqual(self.db.get_task(task.id).trials_used, 0)
+        self.assertEqual(self.db.get_state("children_scored"), 0)
 
 
 class RecoverTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 # Compile and evaluator pipeline
 
-The pipeline requires Python's standard library, a C compiler, `make`, and a
+The pipeline requires Python's standard library, a C compiler, `make`, `flock`, and a
 POSIX host with process groups and `select`. Import from `engine.funsearch` at
 the pack root, or add `engine/` to the module path and import `funsearch`.
 
@@ -35,7 +35,7 @@ seconds, and stderr logs are truncated to 4 KiB. Timeout kills the compiler's
 whole process group.
 
 Every required export must be defined in `nm -D --defined-only` output. Undefined
-references do not satisfy this check. When `nm` is unavailable, an isolated
+references do not satisfy this check. When `nm` is unavailable, a separate
 Python process loads the library with `ctypes.CDLL` and checks `hasattr`; a
 constructor crash cannot take down the engine. For try builds that fallback
 uses the ASan environment too. An installed but failing `nm` reports an error.
@@ -49,8 +49,9 @@ command references the evaluator and header shipped elsewhere in this repo.
 `worker_binary()` locates the pack relative to this module and invokes
 `make -C <pack> worker` if `build/funsearch-worker` is missing or older than
 the worker source or `funsearch.h`. The build holds an flock on
-`build/.build.lock` across processes, and the Makefile installs the binary by
-rename, so concurrent engines never execute a partial binary. A current binary
+`build/.build.lock` across processes. Direct Makefile builds also serialize
+on `build/.worker-build.lock` and install from a unique temporary path by
+atomic rename, so concurrent engines never execute a partial binary. A current binary
 needs neither the lock nor a writable pack. `Worker` and
 `WorkerPool` both support context managers and idempotent `close()`.
 
@@ -60,11 +61,11 @@ The engine sends a blank request and reads its `bad request` response to ensure
 A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup
 failures retry at most three times, with a 60 second limit per attempt. A failed
 replacement remains failed and raises on later calls instead of retrying forever.
-Worker stderr is written to a temporary file so noisy evaluator output cannot
-block the protocol. Startup failures (including `EvaluatorInitError`) append
-its last 2 KiB, which only the worker and evaluator have written at that point.
-Stderr written while scoring may come from candidate code, so it never reaches
-results; the engine truncates the file after a score once it exceeds 1 MiB.
+Worker stderr is continuously drained by a reader thread, retaining only its
+last 1 MiB in memory throughout initialization and scoring. Startup failures,
+crashes, protocol failures and timeouts append the last 2 KiB to the diagnostic.
+Native output is untrusted diagnostic text within the v1 trusted-local model.
+The reader closes with the process, and no stderr temporary file accumulates.
 Workers get `worker_environment(cfg)`: the `CANDIDATE_ENV` allowlist, plus
 variables matching `evaluator.env` and `FS_MEMORY_MB`. The export check's
 ctypes fallback loads both candidate and evaluator libraries under the same
@@ -78,20 +79,16 @@ forging a reply on the inherited protocol fd. Replies must also carry a finite
 score (or null for non-OK statuses) and at most eight finite signature values;
 otherwise the result becomes ERROR.
 
-A warm worker accumulates whatever earlier candidates leaked. After each score,
-the engine compares the worker's memory with its post-startup baseline:
-virtual size against the `FS_MEMORY_MB` address-space limit for final workers,
-and resident size against `evaluator.memory_mb` for sanitizer workers. When it
-is past half of the remaining budget and has grown by at least 1/16 of the
-budget beyond its mark (the highest level seen below the threshold, the
-baseline at start), the worker is replaced at the start of the next request,
-before that request's timeout starts, so leaks do not fail a later, innocent
-candidate. That catches a leak past the threshold in one score, including the
-first after a restart, and a slow leak that adds up. A stable high level, give
-or take page-level jitter, is a retained peak (allocator arenas, an embedded GC
-heap such as Julia's) that later candidates reuse, so it does not recycle the
-worker. A legitimate first score that retains more than half the budget does
-recycle every time; raise `evaluator.memory_mb` for such evaluators.
+A warm worker accumulates whatever earlier candidates retained. The engine
+recycles it after 100 completed scoring replies (OK, INVALID or ERROR), at the
+start of the next request, before that request's timeout begins. This fixed
+budget applies to both normal and sanitizer workers on every host. It avoids
+restarts based on noisy resident/virtual memory measurements or GC high-water
+marks, preserves the result already in hand, and bounds the lifetime of leaked
+state. It does not guarantee that a single candidate or a burst of leaks cannot
+exhaust memory before the budget; crashes and timeouts still replace workers.
+A replacement starts its own fresh 100-score budget. If replacement fails,
+subsequent calls fail without repeatedly attempting startup.
 
 `score(library, timeout_s)` returns `status`, `score`, `sig`, and `msg`. Scoring
 timeouts return ERROR with `timeout after Ns`; crashes return ERROR with
@@ -101,7 +98,7 @@ replacement raises `WorkerError` or `EvaluatorInitError`. The timeout starts
 once a worker becomes available; time waiting for an idle worker and restarting
 a process is additional. `close()` rejects new/waiting pool requests, waits for
 active requests, sends QUIT, and allows one second for shutdown before killing
-and reaping each process and cleaning up its pipes and stderr file.
+and reaping each process and cleaning up its pipes and stderr reader.
 
 Try workers need the ASan runtime before loading sanitized candidate libraries.
 `try_worker_env()` asks `${CC:-cc} -print-file-name=libasan.so` for that runtime,

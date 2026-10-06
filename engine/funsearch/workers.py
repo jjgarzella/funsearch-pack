@@ -9,7 +9,6 @@ import secrets
 import select
 import shlex
 import subprocess
-import tempfile
 import threading
 import time
 
@@ -20,13 +19,11 @@ START_TIMEOUT_S = 60
 START_ATTEMPTS = 3
 # Candidate output is diagnostics only; keep at most this much per worker.
 STDERR_LIMIT_BYTES = 1 << 20
-# Replace a warm worker once candidates have consumed this fraction of its
-# memory budget and it is still growing, before leaks from earlier candidates
-# fail an innocent one. Growth counts only in steps of at least
-# RECYCLE_STEP_FRACTION of the budget, so page-level jitter is not a leak.
-RECYCLE_FRACTION = 0.5
-RECYCLE_STEP_FRACTION = 1 / 16
-# Startup failures carry this much of the worker's stderr (evaluator output).
+# A deterministic score cap avoids allocator/GC high-water noise and bounds
+# retained candidate state on every supported host. Restart before score K+1,
+# never while returning score K's result.
+RECYCLE_SCORES = 100
+# Startup and scoring failures carry this much of the worker's stderr (evaluator output).
 STDERR_TAIL_BYTES = 2048
 _build_lock = threading.Lock()
 
@@ -71,15 +68,45 @@ def worker_binary():
     return binary
 
 
-def _memory_kb(pid, field):
-    """Return a /proc/<pid>/status size in KiB, or None where unavailable."""
-    try:
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith(field + ":"):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
+class _StderrTail:
+    """Continuously drain a pipe while retaining at most STDERR_LIMIT_BYTES.
+
+    Native output never creates a growing temporary file or fills an unread
+    pipe. The reader owns its descriptor, and disposal stops it even if a
+    descendant escaped the worker process group with the pipe still open.
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self.buffer = bytearray()
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while True:
+                readable, _, _ = select.select([self.pipe], [], [], 0.1)
+                if readable:
+                    chunk = os.read(self.pipe.fileno(), 65536)
+                    if not chunk:
+                        break
+                    with self.lock:
+                        del self.buffer[:max(0, len(self.buffer) + len(chunk) - STDERR_LIMIT_BYTES)]
+                        self.buffer.extend(chunk[-STDERR_LIMIT_BYTES:])
+                if self.stop.is_set():
+                    break
+        finally:
+            self.pipe.close()
+
+    def tail(self):
+        with self.lock:
+            return bytes(self.buffer[-STDERR_TAIL_BYTES:]).decode('utf-8', errors='replace').strip()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
 
 
 def _finite_number(value):
@@ -111,8 +138,8 @@ class Worker:
     """One serial worker; score/close are safe to call from different threads.
 
     A blank protocol request acknowledges completed initialization, since the
-    C worker does not send a ready line. Stderr goes to a file, never a pipe
-    that evaluator output could fill. Each process owns a new process group.
+    C worker does not send a ready line. A dedicated reader continuously drains
+    stderr into a bounded tail. Each process owns a new process group.
     """
 
     def __init__(self, cfg, evaluator_so, instance, extra_env=None):
@@ -127,8 +154,7 @@ class Worker:
         self._lock = threading.Lock()
         self._closed = False
         self._failure = None
-        self._baseline_kb = None
-        self._mark_kb = None
+        self._scores = 0
         self._recycle_due = False
         self._start()
 
@@ -174,7 +200,6 @@ class Worker:
                 self.process = None
         if self._stderr is not None:
             self._stderr.close()
-            self._stderr = None
         self._buffer.clear()
 
     def _crash_message(self):
@@ -187,21 +212,9 @@ class Worker:
         detail = f"signal {-code}" if code < 0 else f"exit code {code}"
         return "worker crashed: " + detail
 
-    def _with_startup_stderr(self, message):
-        """Append the tail of a starting worker's stderr to message.
-
-        Only the worker and evaluator have run at startup, so this is the
-        evaluator author's diagnostic. Stderr written while scoring may come
-        from candidate code and is never copied into results the mutator sees.
-        """
-        if self._stderr is None:
-            return message
-        try:
-            size = os.fstat(self._stderr.fileno()).st_size
-            self._stderr.seek(max(0, size - STDERR_TAIL_BYTES))
-            tail = self._stderr.read().decode("utf-8", errors="replace").strip()
-        except OSError:
-            return message
+    def _with_stderr(self, message):
+        """Include bounded native diagnostics in trusted-local v1 failures."""
+        tail = self._stderr.tail() if self._stderr is not None else ""
         return f"{message}\nworker stderr:\n{tail}" if tail else message
 
     def _start(self):
@@ -211,11 +224,12 @@ class Worker:
                 self._dispose()
                 raise WorkerError("worker is closed")
             try:
-                self._stderr = tempfile.TemporaryFile()
+                self._stderr = None
                 self.process = subprocess.Popen(
                     [str(self.binary), str(self.evaluator_so), self.instance],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     env=self.env, start_new_session=True, bufsize=0)
+                self._stderr = _StderrTail(self.process.stderr)
                 if self._closed:
                     self._dispose()
                     raise WorkerError("worker is closed")
@@ -227,66 +241,28 @@ class Worker:
                     raise EvaluatorInitError(str(reply["fatal"]))
                 if reply != _error("bad request"):
                     raise WorkerError(f"unexpected worker startup response: {reply!r}")
-                self._baseline_kb = self._mark_kb = _memory_kb(self.process.pid, self._memory_field())
+                self._scores = 0
+                self._recycle_due = False
                 return
             except EvaluatorInitError as exc:
-                message = self._with_startup_stderr(str(exc))
                 self._dispose()
+                message = self._with_stderr(str(exc))
                 raise EvaluatorInitError(message) from None
             except (EOFError, OSError, TimeoutError, ValueError, WorkerError) as exc:
                 if isinstance(exc, (EOFError, BrokenPipeError)) and self.process is not None:
                     try:
                         last_error = self._crash_message()
                     except EvaluatorInitError as init_error:
-                        message = self._with_startup_stderr(str(init_error))
                         self._dispose()
+                        message = self._with_stderr(str(init_error))
                         raise EvaluatorInitError(message) from None
                 elif isinstance(exc, TimeoutError):
                     last_error = f"worker startup timeout after {START_TIMEOUT_S:g}s"
                 else:
                     last_error = str(exc)
-                last_error = self._with_startup_stderr(last_error)
                 self._dispose()
+                last_error = self._with_stderr(last_error)
         raise WorkerError(f"worker failed to start after {START_ATTEMPTS} attempts: {last_error}")
-
-    def _memory_field(self):
-        # RLIMIT_AS bounds virtual size; sanitizer workers run without it,
-        # and their shadow mapping makes resident size the meaningful measure.
-        return "VmSize" if "FS_MEMORY_MB" in self.env else "VmRSS"
-
-    def _should_recycle(self):
-        """Whether candidates leaked: memory is past the threshold and grew.
-
-        Allocators and GC runtimes (an embedded Julia) keep their peak mapped
-        and reuse it, so a high but stable level is not a leak; recycling on it
-        would cold-start the worker after every score. The mark is the
-        high-water level below the threshold (the baseline at start). Past the
-        threshold it stays fixed, and the worker recycles once memory exceeds
-        it by a step: a leak past the threshold in one score, or a slow leak
-        that keeps adding up. Smaller jitter around a retained peak does not.
-        """
-        if self._baseline_kb is None or self.process is None:
-            return False
-        current = _memory_kb(self.process.pid, self._memory_field())
-        if current is None:
-            return False
-        budget = self.cfg.evaluator.memory_mb * 1024
-        if "FS_MEMORY_MB" in self.env:
-            budget -= self._baseline_kb
-        if current - self._baseline_kb <= RECYCLE_FRACTION * budget:
-            self._mark_kb = max(self._mark_kb, current)
-            return False
-        # Without budget left past the baseline, a fresh worker is no better.
-        return budget > 0 and current - self._mark_kb >= RECYCLE_STEP_FRACTION * budget
-
-    def _trim_stderr(self):
-        # The worker shares this file's offset, so rewinding it here bounds
-        # the file without the worker reopening anything.
-        if self._stderr is not None:
-            descriptor = self._stderr.fileno()
-            if os.fstat(descriptor).st_size > STDERR_LIMIT_BYTES:
-                os.ftruncate(descriptor, 0)
-                os.lseek(descriptor, 0, os.SEEK_SET)
 
     def score(self, so_path, timeout_s):
         """Return a protocol result; replace a timed-out or crashed worker."""
@@ -319,18 +295,19 @@ class Worker:
                 try:
                     result = _error(self._crash_message())
                 except EvaluatorInitError as exc:
-                    self._failure = exc
                     self._dispose()
-                    raise
+                    self._failure = EvaluatorInitError(self._with_stderr(str(exc)))
+                    raise self._failure from None
             except (OSError, ValueError, WorkerError) as exc:
                 result = _error(f"worker protocol error: {exc}")
             else:
-                self._trim_stderr()
+                self._scores += 1
                 # Replace a leaking worker before the next request, not while
                 # this caller waits for the reply already in hand.
-                self._recycle_due = self._should_recycle()
+                self._recycle_due = self._scores >= RECYCLE_SCORES
                 return reply
             self._dispose()
+            result["msg"] = self._with_stderr(result["msg"])
             if self._closed:
                 return _error("evaluation interrupted at shutdown")
             try:
@@ -343,7 +320,7 @@ class Worker:
             return result
 
     def _recycle(self):
-        """Replace a healthy worker whose candidates leaked too much memory."""
+        """Replace a healthy worker after its fixed score budget."""
         self._recycle_due = False
         self._dispose(graceful=True)
         try:
