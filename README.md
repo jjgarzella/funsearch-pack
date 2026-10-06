@@ -124,8 +124,13 @@ header are saved in the run directory, together with a snapshot of the
 evaluator library's directory (`<run>/evaluator/`) that scored the seed.
 The run's workers and `rescore` load that snapshot, so rebuilding or fixing
 the problem's evaluator never changes a run, and a rescore of an old run
-uses that run's evaluator; `run.json` records its SHA-256. Keep the library
-in its own small subdirectory, such as `evaluator/`. Each try or submission compiles a
+uses that run's evaluator. `run.json`'s `evaluator_sha256` is a digest of the
+whole snapshot, not a `sha256sum` of the library: `evaluator_digest` hashes
+the sorted list of every file's SHA-256 and every symlink's target. (Earlier
+builds of this pack stored the library file's plain SHA-256 under that key.)
+Keep the library in its own small subdirectory, such as `evaluator/`. A
+symlink in that directory must be relative and stay inside it, or `check` and
+`run start` refuse the evaluator. Each try or submission compiles a
 private source copy; includes of `candidate.h` work there and during rescore.
 Candidate source may not include absolute or `..` paths, use computed
 includes, `#embed`, inline assembly or `##` token pasting (see Security notes).
@@ -158,7 +163,11 @@ Run databases and snapshots use SQLite DELETE rollback journaling and a
 SIGBUS on host-mounted run directories (observed on a Docker Desktop host
 mount). Writable opens convert existing WAL databases to DELETE; stop old
 engines/clients before migrating a legacy run. Status, best, rescore, and
-mutator inspection open read-only connections without schema writes.
+mutator inspection open read-only connections without schema writes. The
+database layout is versioned (`PRAGMA user_version`); only the engine
+upgrades an older run, when it starts or when `run recover` runs after it
+exits. `next-task`, `try`, `submit` and `stop` refuse a run whose layout
+differs, rather than change it under an older engine that is still running.
 
 The engine flushes timestamped startup, shutdown, and SIGTERM/SIGHUP/SIGINT
 events to `engine.log`; those signals request normal shutdown. Python's

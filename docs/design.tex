@@ -363,9 +363,12 @@ seed, scores it with a fresh worker, and prints JSON. It performs no search.
 with that snapshot (seed must score \code{FS\_OK}), then saves inputs,
 configuration and the same snapshot as \path{<run>/evaluator/}. Workers and
 rescore load that copy, so the seed and the run are scored by identical files;
-\code{run.json} records a SHA-256 over every file and symlink in it. The library
-must therefore sit in its own subdirectory, never in a directory containing
-the problem's \path{runs/}. The command then starts the detached daemon. The daemon owns both hooks:
+\code{run.json}'s \code{evaluator\_sha256} is \code{evaluator\_digest} of it: the
+SHA-256 of the sorted JSON list of \code{["file", path, sha256]} and
+\code{["link", path, target]} entries, not a \code{sha256sum} of the library. The
+library must therefore sit in its own subdirectory, never in a directory containing
+the problem's \path{runs/}. Symlinks are copied as links, so each must be
+relative and resolve inside that directory; any other link is refused. The command then starts the detached daemon. The daemon owns both hooks:
 it runs the start hook after worker-pool readiness and before dispatching any
 evaluation, so the run never depends on the launcher surviving. \code{run start}
 returns after that readiness, printing \code{<run-id> <absolute-run-dir>}.
@@ -410,7 +413,10 @@ request sources remain available for independent verification.
 \code{<run-dir>/db.sqlite} uses DELETE rollback journaling, foreign keys, and a
 5000 ms busy timeout. Writable opens migrate existing WAL databases; stop legacy
 engines/clients before migration. Status, best, rescore, and mutator inspection
-open read-only \code{mode=ro} connections without schema writes. WAL was replaced
+open read-only \code{mode=ro} connections without schema writes. The layout is
+versioned by \code{PRAGMA user\_version}; only the engine (daemon start, and
+recovery after it exits) migrates an older run, and clients refuse a run whose
+version differs. WAL was replaced
 after a two-process probe reproduced SIGBUS on the host-mounted pack directory
 but not on the overlay filesystem. Snapshots also use DELETE.
 

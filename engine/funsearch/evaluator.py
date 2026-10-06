@@ -33,6 +33,7 @@ def build_evaluator(cfg, problem_dir):
         raise EvaluatorBuildError(
             f"evaluator library must be in its own subdirectory (such as evaluator/), "
             f"not in {library.parent}: each run copies the library's directory")
+    check_links(library.parent)
     ok, message = check_exports(library, ["fs_score"], worker_environment(cfg))
     if not ok:
         raise EvaluatorBuildError(f"invalid evaluator library: {message}")
@@ -46,12 +47,35 @@ def snapshot_evaluator(library, directory):
     editing the evaluator in the problem directory never changes a live run's
     scoring function. The library's siblings come along because an evaluator
     may find resources next to itself, as cap-set finds capset.jl. Symlinks
-    are copied as links.
+    are copied as links, so check_links first confines them to the directory.
     """
     library = Path(library).resolve()
+    check_links(library.parent)
     target = Path(directory) / "evaluator"
     shutil.copytree(library.parent, target, symlinks=True)
     return target / library.name
+
+
+def check_links(directory):
+    """Refuse symlinks that an evaluator snapshot could not own.
+
+    A link copied verbatim must resolve inside the copy: an absolute link, or
+    one that leaves the directory, would keep a run scoring with files outside
+    its snapshot (and outside its digest), or resolve differently once the
+    snapshot moves into the run.
+    """
+    root = Path(os.path.realpath(directory))
+    for parent, directories, files in os.walk(root):
+        for name in directories + files:
+            path = Path(parent, name)
+            if not path.is_symlink():
+                continue
+            target = os.readlink(path)
+            if os.path.isabs(target) or not Path(os.path.realpath(path)).is_relative_to(root):
+                raise EvaluatorBuildError(
+                    f"evaluator symlink {path.relative_to(root)} -> {target} leaves {root}: "
+                    f"each run copies links as links, so copy the resource into the "
+                    f"directory or link within it")
 
 
 def evaluator_digest(directory):

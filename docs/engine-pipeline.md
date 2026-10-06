@@ -106,7 +106,13 @@ a process is additional. `start_budget_s()` and `score_budget_s(timeout_s)`
 bound a worker start and a whole `score` call (a recycle before the candidate
 and a replacement after it); the daemon publishes its client deadlines from
 them as the `claim_timeout_s` and `end_by` state keys, which waiting `try` and
-`submit` clients compare against. `close()` rejects new/waiting pool requests, waits for
+`submit` clients compare against. `claim_timeout_s` is a duration in seconds
+(`score_budget_s(timeout_s)` plus 60 s of slack), measured from a claimed
+evaluation's `started_at`. `end_by` is an absolute `time.time()` epoch:
+`started_at` plus `stop.duration_s`, the stop grace and `claim_timeout_s`. The
+daemon writes both in the transaction that sets status `running`, so a running
+run always has them; a client that finds them missing reports that the engine
+predates it. `close()` rejects new/waiting pool requests, waits for
 active requests, sends QUIT, and allows one second for shutdown before killing
 and reaping each process and cleaning up its pipes and stderr reader.
 

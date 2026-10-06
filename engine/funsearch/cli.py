@@ -163,9 +163,13 @@ def wait_result(db, evaluation):
     Queue time is not charged to the request: the engine finishes every queued
     request by end_by. A claimed evaluation finishes within claim_timeout_s,
     which covers worker replacement around the candidate's own timeout.
+    The engine publishes both keys together with status running.
     """
     claim_timeout_s = db.get_state("claim_timeout_s")
     end_by = db.get_state("end_by")
+    if claim_timeout_s is None or end_by is None:
+        raise RuntimeError("the engine published no client deadlines (claim_timeout_s, end_by); "
+                           "it predates this funsearch, so restart the run")
     while True:
         current = db.get_evaluation(evaluation.id)
         if current.state == "done":

@@ -103,7 +103,9 @@ run's scoring. Keep files the evaluator loads at runtime (such as an embedded
 script it finds next to its own library) in that directory, and keep the
 directory small. The library must sit in its own subdirectory such as
 `evaluator/`: `run start` refuses one at the problem root, since that
-directory holds the runs themselves.
+directory holds the runs themselves. Symlinks are copied as links, so a
+symlink there must be relative and point inside the directory; copy a shared
+resource in rather than linking to it.
 
 `fs_result` contains `status`, `double score`, `int32_t nsig`, `double sig[8]`,
 and `char msg[256]`. Initialize every field. Use a NUL-terminated message:

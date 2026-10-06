@@ -178,7 +178,7 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
         if not database.exists():
             continue
         try:
-            with Database(database) as db:
+            with Database(database, migrate=True) as db:
                 try:
                     # Clients may still wait on requests the dead engine held.
                     finish_unscored(db, reason)
@@ -194,7 +194,7 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
 def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s):
     root, metadata, cfg = read_run(run_dir)
     pools, executors, pending = {}, {}, {}
-    db = Database(root / "db.sqlite")
+    db = Database(root / "db.sqlite", migrate=True)
     status, reason = FAILED, "daemon startup failed"
     notified = False
     stop_deadline = None

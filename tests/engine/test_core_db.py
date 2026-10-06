@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from engine.funsearch.db import Database
+from engine.funsearch.db import SCHEMA_VERSION, Database, SchemaMismatch
 from engine.funsearch.runtime import top_programs
 
 
@@ -111,7 +111,7 @@ class DatabaseTests(unittest.TestCase):
             connection.execute("CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             connection.execute("INSERT INTO state VALUES ('legacy', '42')")
         connection.close()
-        with Database(legacy) as migrated:
+        with Database(legacy, migrate=True) as migrated:
             self.assertEqual(migrated.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(migrated.get_state("legacy"), 42)
             migrated.set_state("new", "value")
@@ -228,6 +228,12 @@ class DatabaseTests(unittest.TestCase):
         for plan in plans:
             self.assertIn("COVERING INDEX", plan)
         self.assertNotIn("TEMP B-TREE", plans[0] + plans[1])
+        # recent_children walks the island newest first and stops at its limit.
+        recent = " ".join(row[3] for row in self.db.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM programs WHERE island=1 AND parent_ids != '[]' "
+            "ORDER BY id DESC LIMIT 10"))
+        self.assertIn("programs_island_recent", recent)
+        self.assertNotIn("TEMP B-TREE", recent)
 
     def test_older_database_gains_source_length(self):
         legacy = self.path.with_name("legacy.sqlite")
@@ -245,10 +251,41 @@ class DatabaseTests(unittest.TestCase):
         with Database(legacy, readonly=True) as client:
             self.assertEqual(client.best_program().id, 2)
             self.assertEqual([s.length for s in client.scored_summaries(0)], [6, 5])
-        with Database(legacy) as migrated:
+        # Only the engine migrates: a client never upgrades a run that an older
+        # engine may still be writing.
+        with self.assertRaisesRegex(SchemaMismatch, "schema version 0"):
+            Database(legacy)
+        with Database(legacy, migrate=True) as migrated:
             self.assertEqual(migrated.best_program().id, 2)
+            self.assertEqual(migrated._version(), SCHEMA_VERSION)
+            self.assertIn("trial_n", migrated._columns("evalq"))
             indexes = {row[1] for row in migrated.connection.execute("PRAGMA index_list(programs)")}
             self.assertNotIn("programs_score", indexes)
             self.assertIn("programs_rank", indexes)
         with Database(legacy, readonly=True) as client:
             self.assertEqual([s.length for s in client.scored_summaries(0)], [6, 5])
+        with Database(legacy) as client:
+            self.assertEqual(client.best_program().id, 2)
+
+    def test_migration_repairs_lengths_an_older_engine_left_at_zero(self):
+        # An unversioned database that already has source_length, where an
+        # older engine inserted a row and the column default stored 0.
+        legacy = self.path.with_name("legacy.sqlite")
+        self.db.add_program(0, "longer", score=1)
+        self.db.backup(legacy)
+        with sqlite3.connect(legacy) as connection:
+            connection.execute("PRAGMA user_version=0")
+            connection.execute("INSERT INTO programs(island,parent_ids,source,norm_hash,status,score,"
+                               "sig,msg,idea,created_at,source_length) "
+                               "VALUES (0,'[]','much longer','b','OK',1,'[]','','',0,0)")
+        connection.close()
+        with Database(legacy, migrate=True) as migrated:
+            self.assertEqual([s.length for s in migrated.scored_summaries(0)], [6, 11])
+            self.assertEqual(migrated.best_program().source, "longer")
+
+    def test_newer_schema_is_refused(self):
+        self.db.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+        for options in ({}, {"migrate": True}, {"readonly": True}):
+            with self.subTest(options=options), \
+                    self.assertRaisesRegex(SchemaMismatch, f"schema version {SCHEMA_VERSION + 1}"):
+                Database(self.path, **options)

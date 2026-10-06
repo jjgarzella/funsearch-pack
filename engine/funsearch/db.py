@@ -117,21 +117,44 @@ CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 # Ranking and sampling read only these covering indexes, in rank order, so
 # they never sort or touch program source text: best first is higher score,
-# then shorter source, then older program.
+# then shorter source, then older program. programs_island_recent keeps each
+# island in id order: recent_children walks it newest first and stops after its
+# limit, and scored_summaries reads its fields from it without a sort.
 _INDEXES = """
-DROP INDEX IF EXISTS programs_island;
-DROP INDEX IF EXISTS programs_score;
 CREATE INDEX IF NOT EXISTS programs_hash ON programs(norm_hash);
 CREATE INDEX IF NOT EXISTS programs_rank
  ON programs(status,score DESC,source_length,id,active,norm_hash);
 CREATE INDEX IF NOT EXISTS programs_island_rank
  ON programs(island,active,status,score DESC,source_length,id,sig);
+CREATE INDEX IF NOT EXISTS programs_island_recent
+ ON programs(island,id,active,status,score,sig,source_length);
 """
 _RANK_ORDER = "ORDER BY score DESC, source_length, id"
 
+# PRAGMA user_version of the layout above. Version 0 is any database written
+# before the layout was versioned, with or without trial_n and source_length.
+SCHEMA_VERSION = 1
+
+
+def _statements(script):
+    return [statement for statement in script.split(";") if statement.strip()]
+
+
+class SchemaMismatch(RuntimeError):
+    """A run database's layout is not the one this code reads and writes."""
+
 
 class Database:
-    def __init__(self, path, *, busy_timeout_ms=5000, readonly=False):
+    def __init__(self, path, *, busy_timeout_ms=5000, readonly=False, migrate=False):
+        """Open a run database.
+
+        A writable open creates an empty database at SCHEMA_VERSION. Only the
+        engine passes migrate=True (the daemon, and recovery once the engine
+        has exited): clients never upgrade a run that an older engine may still
+        be writing, and refuse it with SchemaMismatch instead. A read-only open
+        of an unversioned run reads it through a temporary view that supplies
+        source_length; any other version mismatch is refused.
+        """
         self.path = Path(path)
         target = self.path.resolve().as_uri() + "?mode=ro" if readonly else str(path)
         self.connection = sqlite3.connect(target, uri=readonly,
@@ -140,28 +163,71 @@ class Database:
         self.connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self._depth = 0
-        if not readonly:
-            # Host-mounted run directories may not support WAL's shared -shm
-            # mmap reliably (live acceptance saw SIGBUS). Rollback journaling
-            # avoids that mapping and also migrates existing WAL databases.
-            self.connection.execute("PRAGMA journal_mode=DELETE")
-            self.connection.executescript(_SCHEMA)
-            if "trial_n" not in self._columns("evalq"):
-                self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
-            if "source_length" not in self._columns("programs"):
-                with self.transaction():
-                    self.connection.execute(
-                        "ALTER TABLE programs ADD COLUMN source_length INTEGER NOT NULL DEFAULT 0")
-                    self.connection.execute("UPDATE programs SET source_length=length(source)")
-            self.connection.executescript(_INDEXES)
-        elif "source_length" not in self._columns("programs"):
+        try:
+            if readonly:
+                self._check_readable()
+            else:
+                # Host-mounted run directories may not support WAL's shared
+                # -shm mmap reliably (live acceptance saw SIGBUS). Rollback
+                # journaling avoids that mapping and also migrates existing
+                # WAL databases.
+                self.connection.execute("PRAGMA journal_mode=DELETE")
+                if self._version() != SCHEMA_VERSION:
+                    with self.transaction():
+                        self._prepare(migrate)
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def _version(self):
+        return self.connection.execute("PRAGMA main.user_version").fetchone()[0]
+
+    def _columns(self, table):
+        return {row[1] for row in self.connection.execute(f"PRAGMA main.table_info({table})")}
+
+    def _mismatch(self, version):
+        return SchemaMismatch(f"{self.path} has schema version {version}; this funsearch uses "
+                              f"version {SCHEMA_VERSION}")
+
+    def _check_readable(self):
+        version = self._version()
+        if version == 0 and "source_length" not in self._columns("programs"):
             # A read-only client cannot migrate an older run; present the same
             # columns through a temporary view, which shadows the table.
             self.connection.execute("CREATE TEMP VIEW programs AS "
                                     "SELECT *, length(source) AS source_length FROM main.programs")
+        elif version not in (0, SCHEMA_VERSION):
+            raise self._mismatch(version)
 
-    def _columns(self, table):
-        return {row[1] for row in self.connection.execute(f"PRAGMA main.table_info({table})")}
+    def _prepare(self, migrate):
+        """Create or upgrade the layout, inside the caller's writer transaction.
+
+        The version is read again under the writer lock, so concurrent opens
+        create or migrate a database once.
+        """
+        version = self._version()
+        if version == SCHEMA_VERSION:
+            return
+        empty = self.connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+        if version > SCHEMA_VERSION or not (empty or migrate):
+            raise self._mismatch(version)
+        for statement in _statements(_SCHEMA):
+            self.connection.execute(statement)
+        # Migrations from version 0. Each one is a no-op on a new database.
+        if "trial_n" not in self._columns("evalq"):
+            self.connection.execute("ALTER TABLE evalq ADD COLUMN trial_n INTEGER")
+        if "source_length" not in self._columns("programs"):
+            self.connection.execute(
+                "ALTER TABLE programs ADD COLUMN source_length INTEGER NOT NULL DEFAULT 0")
+        # Also repairs rows that an older engine inserted into an unversioned
+        # database after a client added the column with its default of 0.
+        self.connection.execute(
+            "UPDATE programs SET source_length=length(source) WHERE source_length != length(source)")
+        for name in ("programs_island", "programs_score"):
+            self.connection.execute(f"DROP INDEX IF EXISTS {name}")
+        for statement in _statements(_INDEXES):
+            self.connection.execute(statement)
+        self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def __enter__(self):
         return self

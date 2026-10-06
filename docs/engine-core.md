@@ -30,6 +30,19 @@ supplied. Problem name and instance default to empty strings when omitted.
 `Database` opens SQLite with DELETE rollback journaling, foreign keys, and a
 5000 ms busy timeout. Writable opens migrate existing WAL databases. Read-only
 clients use `readonly=True` and a `mode=ro` URI without schema changes.
+
+The layout is versioned by `PRAGMA user_version` (`SCHEMA_VERSION`); version 0
+is any database from before versioning. A writable open creates an empty
+database at the current version. Only the engine passes `migrate=True` (the
+daemon, and recovery once the engine has exited), and it upgrades version 0
+in one writer transaction that rereads the version under the lock, so
+concurrent opens migrate once. Migration adds `trial_n` and `source_length`,
+backfills any length an older engine left at the column's default of 0, and
+rebuilds the indexes. Clients (`next-task`, `try`, `submit`, `stop`) never
+migrate a run that an older engine may still be writing: they refuse any
+other version with `SchemaMismatch`. A read-only open of a version-0 database
+without `source_length` reads it through a temporary view that supplies the
+column; a read-only open of any other version is refused.
 Program, Task, Trial, and Evaluation accessors return immutable dataclass records;
 JSON fields are decoded to Python values. Each process should open its own
 connection. `transaction()` supports composing accessor writes atomically through
@@ -45,8 +58,8 @@ The primary operations are:
   prefix without sorting or reading source text; `scored_summaries` and
   `count_programs` give sampling its fields from the same indexes;
   `has_scored_duplicate(score, sig)` is the submission duplicate check.
-  Writable opens add `source_length` to older databases; read-only opens of an
-  unmigrated database see it through a temporary view.
+  `recent_children` reads `programs_island_recent`, which keeps each island in
+  id order, so it stops after its limit.
 - Tasks: `add_task`, `get_task`, `list_tasks`, `close_task`;
   `open_tasks_for_slot(slot)` lists a slot's unfinished tasks (more than one
   means the slot is corrupt); `abandon_stale_tasks(cutoff)` abandons open tasks
@@ -72,8 +85,9 @@ Code outside the engine (the Gas City lifecycle script, the mutator guard)
 uses these methods rather than SQL, so the schema stays private to `db.py`.
 
 The core owns state keys `islands`, `next_island`, and `island_resets`. Later
-layers can add run status, started_at, best score, and counters with these state
-accessors. Task ids and program ids are integers. Task directories are
+layers add run status, `started_at`, best score, and counters with these state
+accessors; the daemon owns the client deadlines `claim_timeout_s` and `end_by`
+(see engine-pipeline.md). Task ids and program ids are integers. Task directories are
 `<run-dir>/tasks/<task-id>/`; `create_task` returns the id after writing TASK.md.
 It rolls back database changes and removes newly created task files on an error.
 Existing directories are preserved and cause an error rather than being reused.

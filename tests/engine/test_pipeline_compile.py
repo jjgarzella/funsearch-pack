@@ -252,6 +252,30 @@ class EvaluatorTests(PipelineTestCase):
                 with self.assertRaisesRegex(EvaluatorBuildError, "own subdirectory"):
                     self.evaluator()
 
+    def test_links_must_stay_inside_the_library_directory(self):
+        # No export check is reached: links are refused before the library is loaded.
+        library = self.problem / "evaluator" / "libevaluator.so"
+        library.parent.mkdir(exist_ok=True)
+        library.write_bytes(b"not loaded")
+        (self.problem / "shared.jl").write_text("score() = 1\n")
+        (library.parent / "data").mkdir()
+        self.cfg.evaluator.build = ""
+        for n, (name, target) in enumerate((("absolute.jl", str(library.parent / "data")),
+                                            ("escaping.jl", "../shared.jl"),
+                                            ("data/escaping.jl", "../../shared.jl"))):
+            link = library.parent / name
+            os.symlink(target, link)
+            with self.subTest(link=name):
+                with self.assertRaisesRegex(EvaluatorBuildError, "leaves"):
+                    self.evaluator()
+                with self.assertRaisesRegex(EvaluatorBuildError, "leaves"):
+                    snapshot_evaluator(library, self.root / f"snapshot-{n}")
+            link.unlink()
+        # A link within the directory is kept.
+        os.symlink("data", library.parent / "current")
+        snapshot = snapshot_evaluator(library, self.root / "snapshot-inside")
+        self.assertEqual(os.readlink(snapshot.parent / "current"), "data")
+
     def test_snapshot_copies_siblings_and_links_and_digests_them(self):
         library = self.evaluator()
         (library.parent / "scorer.jl").write_text("score() = 1\n")

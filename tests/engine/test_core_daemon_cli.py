@@ -88,6 +88,28 @@ class StoreResultTests(unittest.TestCase):
             self.assertEqual(self.db.get_task(task.id).trials_used, 0)
         self.assertEqual(self.db.get_state("children_scored"), 0)
 
+    def test_result_lines_print_a_numeric_score(self):
+        self.db.set_state("status", "running")
+        (self.root / "candidate.h").write_text("double f(void);\n")
+        cases = [("try", {"status": "INVALID", "score": None, "msg": "bad cap"}, "RESULT INVALID 0 bad cap"),
+                 ("try", {"status": "ERROR", "score": 2.5, "msg": "crash"}, "RESULT ERROR 2.5 crash"),
+                 ("submit", {"status": "ERROR", "score": None, "msg": "", "program_id": 7},
+                  "ACCEPTED 7 ERROR 0"),
+                 ("submit", {"status": "OK", "score": 3, "msg": "", "program_id": 8}, "ACCEPTED 8 OK 3")]
+        for n, (verb, result, line) in enumerate(cases):
+            task = self.db.add_task(0)
+            source = self.root / f"child-{n}.c"
+            source.write_text(f"double f(void) {{ return {n}; }}\n")
+            args = SimpleNamespace(command=verb, task=task.id, source=str(source))
+            stdout = io.StringIO()
+            compiled = lambda _cfg, _source, request, _mode: (True, request / "candidate.so", "")
+            with self.subTest(verb=verb, result=result), \
+                    patch.object(cli, "compile_candidate", side_effect=compiled), \
+                    patch.object(cli, "wait_result", return_value=result), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.evaluate(args, self.root, Config(), self.db), 0)
+                self.assertEqual(stdout.getvalue(), line + "\n")
+
 
 class RecoverTests(unittest.TestCase):
     def setUp(self):
@@ -185,6 +207,12 @@ class WaitResultTests(unittest.TestCase):
         with patch.object(cli, "pid_alive", return_value=False), \
                 self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
             cli.wait_result(self.db, self.evaluation)
+
+    def test_engine_without_published_deadlines_is_reported(self):
+        self.db.connection.execute("DELETE FROM state WHERE key IN ('claim_timeout_s','end_by')")
+        with self.assertRaisesRegex(RuntimeError, "published no client deadlines"):
+            self.wait()
+        self.assertEqual(self.now, 0)
 
 
 class ErrorReportingTests(unittest.TestCase):
