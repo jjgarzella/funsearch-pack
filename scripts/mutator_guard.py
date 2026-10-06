@@ -1,15 +1,19 @@
 """Fail-closed Claude PreToolUse policy for a mutator's claimed slot.
 
 The guard returns allow only for literal engine/lifecycle commands and files
-belonging to its current open task. This is a tool policy, not an OS sandbox.
+belonging to its current open task. This is a tool policy, not an OS sandbox,
+and not a boundary against the mutator itself: try/submit compile and run the
+mutator's C as the host user, and that code can do anything the user can.
 """
 
 import json
 import os
 from pathlib import Path
 import shlex
-import sqlite3
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
+from funsearch.db import Database  # noqa: E402
 
 
 def literal_command(command):
@@ -28,14 +32,11 @@ def context(home):
 
 
 def open_task(data):
-    root = Path(data["run_dir"]).resolve()
-    uri = (root / "db.sqlite").as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True) as db:
-        rows = db.execute("SELECT id FROM tasks WHERE slot=? AND status='open' ORDER BY id",
-                          (data["slot"],)).fetchall()
-    if len(rows) > 1:
+    with Database(Path(data["run_dir"]).resolve() / "db.sqlite", readonly=True) as db:
+        tasks = db.open_tasks_for_slot(data["slot"])
+    if len(tasks) > 1:
         raise ValueError("slot has multiple unfinished tasks")
-    return rows[0][0] if rows else None
+    return tasks[0].id if tasks else None
 
 
 def task_file(value, home, data, *, write=False):

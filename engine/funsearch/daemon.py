@@ -20,6 +20,9 @@ from .workers import WorkerPool
 
 SNAPSHOT_PERIOD_S = 600
 STOP_GRACE_S = 120
+# Abandonment only matters after ~2 trial budgets of inactivity (>= 20 min at
+# defaults), so a write transaction every loop tick would be wasted contention.
+ABANDON_PERIOD_S = 30
 
 
 def log_event(message):
@@ -59,15 +62,10 @@ def store_result(db, evaluation, result):
         else:
             task = db.get_task(evaluation.task_id)
             source = Path(evaluation.src_path).read_text()
+            # Every scored submission spends budget, stored or not.
             db.increment_state("children_scored")
             if result["status"] == "OK":
                 db.increment_state("children_ok")
-            before = db.get_state("best_score")
-            if result["status"] == "OK" and result["score"] > before:
-                db.set_state("best_score", result["score"])
-                db.set_state("plateau_count", 0)
-            else:
-                db.increment_state("plateau_count")
             from .normalize import normalized_hash
             duplicate = db.has_normalized_hash(normalized_hash(source))
             if result["status"] == "OK":
@@ -83,6 +81,13 @@ def store_result(db, evaluation, result):
                                          sig=result["sig"], msg=result["msg"])
                 db.close_task(task.id)
                 result["program_id"] = program.id
+            # Only a stored program can improve the best score; a rejected
+            # child must not leave later children chasing a phantom best.
+            if "program_id" in result and result["status"] == "OK" and result["score"] > db.get_state("best_score"):
+                db.set_state("best_score", result["score"])
+                db.set_state("plateau_count", 0)
+            else:
+                db.increment_state("plateau_count")
         db.finish_evaluation(evaluation.id, result)
 
 
@@ -128,6 +133,27 @@ def write_outputs(db, root, metadata, cfg, status, reason):
         (root / "top" / f"{rank}-{program.score:g}.c").write_text(program.source)
 
 
+def recover_outputs(root, metadata, cfg, reason="engine died"):
+    """Rewrite failed outputs after the engine died; return the database used.
+
+    Prefer the live database and fall back to the newest readable snapshot if
+    the engine died mid-write and left it unreadable.
+    """
+    backups = sorted((root / "snapshots").glob("db-*.sqlite"),
+                     key=lambda path: path.stat().st_mtime, reverse=True)
+    errors = []
+    for database in [root / "db.sqlite", *backups]:
+        if not database.exists():
+            continue
+        try:
+            with Database(database) as db:
+                write_outputs(db, root, metadata, cfg, "failed", reason)
+            return database
+        except Exception as exc:
+            errors.append(f"{database}: {exc}")
+    raise RuntimeError("no readable run database" + "".join(f"\n{e}" for e in errors))
+
+
 def serve(run_dir, ready_fd):
     root, metadata, cfg = read_run(run_dir)
     pools, executors, pending = {}, {}, {}
@@ -160,7 +186,7 @@ def serve(run_dir, ready_fd):
         os.close(ready_fd)
         notified = True
         log_event("worker pools ready")
-        last_reset = last_snapshot = time.monotonic()
+        last_reset = last_snapshot = last_abandon = time.monotonic()
         rng = random.Random()
         while True:
             if db.get_state("start_error"):
@@ -219,12 +245,10 @@ def serve(run_dir, ready_fd):
             if now - last_snapshot >= SNAPSHOT_PERIOD_S:
                 snapshot(db, root)
                 last_snapshot = now
-            age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
-            with db.transaction():
-                db.connection.execute(
-                    "UPDATE tasks SET status='abandoned',closed_at=? WHERE status='open' "
-                    "AND created_at<? AND id NOT IN "
-                    "(SELECT task_id FROM evalq WHERE state!='done' AND task_id IS NOT NULL)", (time.time(), time.time() - age))
+            if now - last_abandon >= ABANDON_PERIOD_S:
+                age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
+                db.abandon_stale_tasks(time.time() - age)
+                last_abandon = now
             time.sleep(0.02)
     except BaseException as exc:
         traceback.print_exc()
@@ -254,8 +278,7 @@ def serve(run_dir, ready_fd):
                 status, reason = "failed", f"worker cleanup: {exc}"
         try:
             cancel_queued(db)
-            for row in db.connection.execute("SELECT * FROM evalq WHERE state='running'").fetchall():
-                evaluation = db.get_evaluation(row["id"])
+            for evaluation in db.running_evaluations():
                 result = {"status": "ERROR", "score": 0, "sig": [], "msg": reason, "run_over": True}
                 with db.transaction():
                     if evaluation.kind == "try":
@@ -296,10 +319,10 @@ def serve(run_dir, ready_fd):
                         os.close(ready_fd)
 
 
-def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s):
+def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_period_s):
     """Wait for a detached engine with no launching-agent process identity."""
-    global SNAPSHOT_PERIOD_S, STOP_GRACE_S
-    SNAPSHOT_PERIOD_S, STOP_GRACE_S = snapshot_period_s, stop_grace_s
+    global SNAPSHOT_PERIOD_S, STOP_GRACE_S, ABANDON_PERIOD_S
+    SNAPSHOT_PERIOD_S, STOP_GRACE_S, ABANDON_PERIOD_S = snapshot_period_s, stop_grace_s, abandon_period_s
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
     engine = os.fork()
@@ -353,10 +376,10 @@ def daemonize(run_dir):
             bootstrap = ("import sys; sys.path.insert(0, sys.argv[1]); "
                          "from funsearch.daemon import observe_engine; "
                          "observe_engine(sys.argv[2], int(sys.argv[3]), "
-                         "float(sys.argv[4]), float(sys.argv[5]))")
+                         "float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]))")
             os.execve(sys.executable, [sys.executable, "-c", bootstrap,
                       str(Path(__file__).resolve().parents[1]), str(run_dir), str(writer),
-                      str(SNAPSHOT_PERIOD_S), str(STOP_GRACE_S)], env)
+                      str(SNAPSHOT_PERIOD_S), str(STOP_GRACE_S), str(ABANDON_PERIOD_S)], env)
         except BaseException:
             traceback.print_exc()
             try:

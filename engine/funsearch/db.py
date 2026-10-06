@@ -1,7 +1,9 @@
 """Typed SQLite access shared by the engine daemon and its CLI clients.
 
 Program history survives island resets; only active programs participate in
-sampling and duplicate checks. All writes use short transactions.
+sampling and duplicate checks. All writes use short transactions. This class
+owns the schema: the Gas City adapters and the mutator tool guard use these
+methods rather than their own SQL.
 """
 
 from contextlib import contextmanager
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS tasks (
  trials_used INTEGER NOT NULL DEFAULT 0 CHECK(trials_used >= 0),
  created_at REAL NOT NULL, closed_at REAL
 );
+CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status,created_at);
 CREATE TABLE IF NOT EXISTS trials (
  task_id INTEGER NOT NULL REFERENCES tasks(id), n INTEGER NOT NULL CHECK(n > 0),
  status TEXT NOT NULL, score REAL, msg TEXT NOT NULL,
@@ -257,6 +260,19 @@ class Database:
                 raise ValueError(f"task {task_id} does not exist or is already closed")
             return self.get_task(task_id)
 
+    def open_tasks_for_slot(self, slot) -> list[Task]:
+        """A slot's unfinished tasks; more than one means the slot is corrupt."""
+        return [self._task(row) for row in self.connection.execute(
+            "SELECT * FROM tasks WHERE slot=? AND status='open' ORDER BY id", (str(slot),))]
+
+    def abandon_stale_tasks(self, cutoff: float) -> int:
+        """Abandon open tasks created before cutoff with no queued/running evaluation."""
+        with self.transaction():
+            return self.connection.execute(
+                "UPDATE tasks SET status='abandoned',closed_at=? WHERE status='open' AND created_at<? "
+                "AND id NOT IN (SELECT task_id FROM evalq WHERE state IN ('queued','running') "
+                "AND task_id IS NOT NULL)", (time.time(), cutoff)).rowcount
+
     def reserve_trial(self, task_id: int, budget: int) -> int:
         """Atomically consume a try slot before queuing its evaluation."""
         with self.transaction():
@@ -291,6 +307,15 @@ class Database:
     def get_evaluation(self, evaluation_id: int) -> Evaluation | None:
         return self._evaluation(self.connection.execute("SELECT * FROM evalq WHERE id=?", (evaluation_id,)).fetchone())
 
+    def has_pending_submission(self, task_id: int) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM evalq WHERE task_id=? AND kind='submit' AND state IN ('queued','running') LIMIT 1",
+            (task_id,)).fetchone() is not None
+
+    def running_evaluations(self) -> list[Evaluation]:
+        return [self._evaluation(row) for row in self.connection.execute(
+            "SELECT * FROM evalq WHERE state='running' ORDER BY id")]
+
     def claim_evaluation(self, kind=None) -> Evaluation | None:
         with self.transaction():
             query = "SELECT id FROM evalq WHERE state='queued'"
@@ -322,6 +347,9 @@ class Database:
     def get_state(self, key: str, default=None):
         row = self.connection.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row is not None else default
+
+    def all_state(self) -> dict:
+        return {row["key"]: json.loads(row["value"]) for row in self.connection.execute("SELECT * FROM state")}
 
     def increment_state(self, key: str, amount=1) -> int:
         with self.transaction():

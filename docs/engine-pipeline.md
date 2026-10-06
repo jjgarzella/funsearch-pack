@@ -46,8 +46,12 @@ directory with a 15 minute timeout, verifies the library exists and defines
 An empty build command supports prebuilt evaluators. The toy fixture's build
 command references the evaluator and header shipped elsewhere in this repo.
 
-`worker_binary()` locates the pack relative to this module, and invokes
-`make -C <pack> worker` if `build/funsearch-worker` is missing. `Worker` and
+`worker_binary()` locates the pack relative to this module and invokes
+`make -C <pack> worker` if `build/funsearch-worker` is missing or older than
+the worker source or `funsearch.h`. The build holds an flock on
+`build/.build.lock` across processes, and the Makefile installs the binary by
+rename, so concurrent engines never execute a partial binary. A current binary
+needs neither the lock nor a writable pack. `Worker` and
 `WorkerPool` both support context managers and idempotent `close()`.
 
 A worker starts in a new process group with `FS_MEMORY_MB` from configuration.
@@ -57,7 +61,23 @@ A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup
 failures retry at most three times, with a 60 second limit per attempt. A failed
 replacement remains failed and raises on later calls instead of retrying forever.
 Worker stderr is written to a temporary file so noisy evaluator output cannot
-block the protocol.
+block the protocol. Nothing reads it, so the engine truncates it after a score
+once it exceeds 1 MiB. Workers start without Gas City identity, store or
+credential-like environment variables (`worker_environment()`).
+
+Each request is `SCORE #<token> <path>` with a fresh random token. A reply
+counts only if it echoes that token; anything else is a protocol error, scored
+ERROR, and the worker is replaced. This stops a candidate from trivially
+forging a reply on the inherited protocol fd. Replies must also carry a finite
+score (or null for non-OK statuses) and at most eight finite signature values;
+otherwise the result becomes ERROR.
+
+A warm worker accumulates whatever earlier candidates leaked. After each score,
+the engine compares the worker's memory with its post-startup baseline:
+virtual size against the `FS_MEMORY_MB` address-space limit for final workers,
+and resident size against `evaluator.memory_mb` for sanitizer workers. Past
+half of the remaining budget, it replaces the worker before the next request,
+so leaks do not fail a later, innocent candidate.
 
 `score(library, timeout_s)` returns `status`, `score`, `sig`, and `msg`. Scoring
 timeouts return ERROR with `timeout after Ns`; crashes return ERROR with

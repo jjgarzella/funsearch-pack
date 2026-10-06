@@ -21,6 +21,10 @@ fs_result fs_score(fs_resolve_fn resolve, const char *instance)
         result.score = NAN;
     } else if (strcmp(instance, "infinity") == 0) {
         result.score = INFINITY;
+    } else if (strcmp(instance, "nan-sig") == 0) {
+        result.nsig = 2;
+        result.sig[0] = 1;
+        result.sig[1] = NAN;
     } else if (strcmp(instance, "limit") == 0) {
         struct rlimit limit;
         if (getrlimit(RLIMIT_AS, &limit) != 0) {

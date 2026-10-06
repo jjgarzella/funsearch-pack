@@ -94,6 +94,24 @@ class MutatorGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.check("WebSearch", query="evaluator")
 
+    def test_denies_other_run_or_slot_even_when_otherwise_valid(self):
+        cli = str(PACK / "bin/funsearch")
+        other_run = str(self.home / "problem/runs/two")
+        child = str(self.directory / "child.c")
+        # The task is still open, so only the run mismatch can deny these.
+        for verb in ("try", "submit"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "wrong run"):
+                self.command(cli, verb, other_run, str(self.task.id), child)
+        # With the task closed, next-task is denied only for run/slot scope.
+        self.db.close_task(self.task.id)
+        for argv in ((cli, "next-task", other_run, "--slot", "1"),
+                     (cli, "next-task", str(self.run), "--slot", "2"),
+                     (cli, "next-task", str(self.run), "--slot", "1 "),
+                     (cli, "next-task", str(self.run), "--other", "1")):
+            with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, "this run and slot"):
+                self.command(*argv)
+        self.command(cli, "next-task", str(self.run), "--slot", "1")
+
     def test_symlinks_and_stale_session_are_denied(self):
         (self.directory / "child.c").symlink_to(self.home / "secret.c")
         with self.assertRaises(ValueError):

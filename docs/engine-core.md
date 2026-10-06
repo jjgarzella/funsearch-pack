@@ -1,8 +1,9 @@
 # Python engine core
 
-The core requires Python 3.12 and uses only the standard library. From the
-repository root, imports use `engine.funsearch`; the eventual entry point can
-add `engine/` to its module path and import `funsearch` directly.
+The core requires Python 3.11 or later (for `tomllib`) and uses only the
+standard library. From the repository root, imports use `engine.funsearch`;
+the `bin/funsearch` entry point adds `engine/` to its module path and imports
+`funsearch` directly.
 
 ```python
 import random

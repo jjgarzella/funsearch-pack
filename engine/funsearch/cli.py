@@ -10,11 +10,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 from .compile import compile_candidate
 from .config import ConfigError, load_config
-from .daemon import daemonize
+from .daemon import daemonize, recover_outputs
 from .db import Database
 from .evaluator import build_evaluator
 from .evolve import seed_islands
@@ -40,6 +41,7 @@ def parser():
     start.add_argument("--on-start")
     start.add_argument("--on-finish")
     runs.add_parser("status").add_argument("run_dir")
+    runs.add_parser("recover", help="write failed outputs for a run whose engine died").add_argument("run_dir")
     best = commands.add_parser("best", help="list highest scoring programs")
     best.add_argument("run_dir")
     best.add_argument("-k", type=int, default=10)
@@ -56,10 +58,6 @@ def parser():
     rescore.add_argument("run_dir")
     rescore.add_argument("program", metavar="id|best")
     rescore.add_argument("--instance", required=True)
-    slot = commands.add_parser("slot", help="Gas City mutator slot lifecycle")
-    slots = slot.add_subparsers(dest="slot_command", required=True)
-    for name in ("show", "release", "close"):
-        slots.add_parser(name).add_argument("bead")
     return cli
 
 
@@ -201,10 +199,7 @@ def evaluate(args, root, cfg, db):
             if kind == "submit":
                 if db.has_normalized_hash(normalized_hash(source)):
                     raise Rejected("duplicate candidate")
-                pending = db.connection.execute(
-                    "SELECT 1 FROM evalq WHERE task_id=? AND kind='submit' AND state!='done'",
-                    (task.id,)).fetchone()
-                if pending:
+                if db.has_pending_submission(task.id):
                     raise Rejected("task already has a pending submission")
             evaluation = db.enqueue(kind, source_path, candidate, task_id=task.id, trial_n=trial_n)
     except BaseException as exc:
@@ -221,10 +216,17 @@ def evaluate(args, root, cfg, db):
     return 0
 
 
+def recover_run(args):
+    root, metadata, cfg = read_run(args.run_dir, require_db=False)
+    pid_file = root / "engine.pid"
+    if pid_file.exists() and pid_alive(pid_file.read_text().strip()):
+        raise ConfigError(f"engine is still running: {root}")
+    database = recover_outputs(root, metadata, cfg)
+    print(json.dumps({"run_dir": str(root), "recovered_from": str(database)}))
+    return 0
+
+
 def dispatch(args):
-    if args.command == "slot":
-        from .slots import slot_command
-        return slot_command(args.slot_command, args.bead)
     if args.command == "check":
         problem = Path(args.problem).resolve()
         cfg = load_config(problem, instance=args.instance)
@@ -233,6 +235,8 @@ def dispatch(args):
         return 0 if result["status"] == "OK" else 1
     if args.command == "run" and args.run_command == "start":
         return start_run(args)
+    if args.command == "run" and args.run_command == "recover":
+        return recover_run(args)
     root, metadata, cfg = read_run(args.run_dir)
     readonly = args.command in ("run", "best", "rescore")
     with Database(root / "db.sqlite", readonly=readonly) as db:
@@ -247,8 +251,7 @@ def dispatch(args):
             db.set_state("stop_requested", True)
             print("STOP_REQUESTED")
         elif args.command == "run":
-            status = {row["key"]: json.loads(row["value"]) for row in
-                      db.connection.execute("SELECT * FROM state")}
+            status = db.all_state()
             status.update(run_id=metadata["run_id"], pid_alive=pid_alive(status.get("pid")))
             print(json.dumps(status))
         elif args.command == "best":
@@ -280,6 +283,14 @@ def dispatch(args):
     return 0
 
 
+def report_unexpected(exc):
+    """Name the exception: str() alone is empty or cryptic for many types."""
+    if os.environ.get("FUNSEARCH_DEBUG"):
+        traceback.print_exception(exc)
+    detail = str(exc)
+    print(type(exc).__name__ + (f": {detail}" if detail else ""), file=sys.stderr)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
@@ -294,5 +305,5 @@ def main(argv=None):
         print(str(exc), file=sys.stderr)
         return 2
     except (Exception, KeyboardInterrupt) as exc:
-        print(str(exc), file=sys.stderr)
+        report_unexpected(exc)
         return 1

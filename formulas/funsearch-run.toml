@@ -21,7 +21,7 @@ description = "Completion-mail recipient; required because no reliable slinger r
 required = true
 
 [vars.overrides]
-description = "Space-separated search.* / stop.* key=value overrides"
+description = "Space-separated key=value overrides of search.*, stop.*, mutator.model or instance; other keys are rejected"
 default = ""
 
 [[steps]]

@@ -232,6 +232,40 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.hook("sweep")
         self.assertFalse((self.registry / "run-one.json").exists())
 
+    def test_sweep_recovers_counters_from_newest_snapshot_when_live_db_is_corrupt(self):
+        from engine.funsearch.db import Database
+        root = self.run_dir("corrupt", 99999999)
+        self.hook("on-start", root)
+        (root / "snapshots").mkdir()
+        for name, scored, age in (("db-1.sqlite", 3, 100), ("db-2.sqlite", 5, 0)):
+            with Database(root / "snapshots" / name) as db:
+                db.add_program(0, f"double f(void) {{ return {scored}; }}\n", score=scored)
+                for key, value in {"started_at": time.time() - 60, "children_scored": scored,
+                                   "children_ok": scored, "seed_score": 0}.items():
+                    db.set_state(key, value)
+            os.utime(root / "snapshots" / name, (time.time() - age,) * 2)
+        (root / "db.sqlite").write_bytes(b"torn write " * 100)
+        self.hook("sweep")
+        summary = json.loads((root / "summary.json").read_text())
+        self.assertEqual((summary["status"], summary["reason"]), ("failed", "engine died"))
+        self.assertEqual((summary["children_scored"], summary["best_score"]), (5, 5))
+        self.assertIn("return 5", (root / "best.c").read_text())
+        self.assertEqual(self.beads()["test-1"]["metadata"]["fs.children_scored"], "5")
+        self.assertFalse((self.registry / "corrupt.json").exists())
+
+    def test_launch_rejects_command_bearing_overrides(self):
+        problem = self.root / "problem"
+        for override in ("evaluator.build=touch pwned", "candidate.compile=sh -c id",
+                         "candidate.compile_try=id", "evaluator.library=x.so", "problem.name=x"):
+            with self.subTest(override=override):
+                result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
+                                         str(problem), "--notify", "n", "--overrides", override],
+                                        env=self.env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("launch overrides may set only", result.stderr)
+        self.assertFalse((self.root / "pwned").exists())
+        self.assertFalse(problem.exists())
+
     def test_formula_and_order_contract(self):
         formula = tomllib.loads((ROOT / "formulas" / "funsearch-run.toml").read_text())
         self.assertEqual(len(formula["steps"]), 1)

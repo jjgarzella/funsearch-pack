@@ -14,6 +14,9 @@
 
 static void *candidate_handle;
 static FILE *proto;
+/* Engine-chosen token echoed in the reply. A candidate shares this process,
+ * so this only stops trivially forged replies on the inherited protocol fd. */
+static char nonce[65];
 
 static void *resolve(const char *sym)
 {
@@ -54,6 +57,7 @@ static void fatal(const char *msg)
 static void reply(fs_result result)
 {
     const char *status;
+    int sig_finite = 1;
     result.msg[sizeof(result.msg) - 1] = '\0';
     if (result.nsig < 0)
         result.nsig = 0;
@@ -69,12 +73,23 @@ static void reply(fs_result result)
         strcpy(result.msg, "unknown evaluator status");
         break;
     }
+    for (int32_t i = 0; i < result.nsig; ++i)
+        sig_finite = sig_finite && isfinite(result.sig[i]);
     if (!isfinite(result.score)) {
         status = "ERROR";
         strcpy(result.msg, "non-finite score");
+    } else if (!sig_finite) {
+        /* JSON has no NaN/Inf, and a null entry would poison clustering. */
+        status = "ERROR";
+        strcpy(result.msg, "non-finite signature");
     }
+    if (!sig_finite)
+        result.nsig = 0;
 
-    fprintf(proto, "{\"status\":\"%s\",\"score\":", status);
+    fputc('{', proto);
+    if (nonce[0])
+        fprintf(proto, "\"nonce\":\"%s\",", nonce);
+    fprintf(proto, "\"status\":\"%s\",\"score\":", status);
     if (isfinite(result.score))
         fprintf(proto, "%.17g", result.score);
     else
@@ -83,10 +98,7 @@ static void reply(fs_result result)
     for (int32_t i = 0; i < result.nsig; ++i) {
         if (i)
             fputc(',', proto);
-        if (isfinite(result.sig[i]))
-            fprintf(proto, "%.17g", result.sig[i]);
-        else
-            fputs("null", proto);
+        fprintf(proto, "%.17g", result.sig[i]);
     }
     fputs("],\"msg\":", proto);
     json_string(result.msg);
@@ -99,6 +111,28 @@ static void error_reply(const char *msg)
     fs_result result = { .status = FS_ERROR };
     snprintf(result.msg, sizeof(result.msg), "%s", msg);
     reply(result);
+}
+
+/* Parse "SCORE <path>" or "SCORE #<hex token> <path>"; set nonce. */
+static const char *score_path(char *line)
+{
+    char *path;
+    size_t length;
+    nonce[0] = '\0';
+    if (strncmp(line, "SCORE ", 6) != 0)
+        return NULL;
+    path = line + 6;
+    if (*path == '#') {
+        length = strspn(path + 1, "0123456789abcdef");
+        if (length == 0 || length >= sizeof(nonce) || path[length + 1] != ' ')
+            return NULL;
+        memcpy(nonce, path + 1, length);
+        nonce[length] = '\0';
+        /* Do not leave the token in the request buffer the candidate can scan. */
+        memset(path, ' ', length + 1);
+        path += length + 2;
+    }
+    return *path ? path : NULL;
 }
 
 static int memory_limit(void)
@@ -212,11 +246,12 @@ int main(int argc, char **argv)
             line[--length] = '\0';
         if (strcmp(line, "QUIT") == 0)
             break;
-        if (strncmp(line, "SCORE ", 6) != 0 || !line[6]) {
+        const char *path = score_path(line);
+        if (!path) {
             error_reply("bad request");
             continue;
         }
-        candidate_handle = dlopen(line + 6, RTLD_NOW | RTLD_LOCAL);
+        candidate_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!candidate_handle) {
             error_reply(dlerror());
             continue;

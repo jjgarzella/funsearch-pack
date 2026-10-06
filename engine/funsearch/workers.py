@@ -1,20 +1,28 @@
 """Persistent worker processes and a blocking, thread-safe scoring pool."""
 
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
+import secrets
 import select
+import shlex
 import subprocess
 import tempfile
 import threading
 import time
 
-from ._process import environment, kill_group, run_command
+from ._process import kill_group, run_command, worker_environment
 
 
 START_TIMEOUT_S = 60
 START_ATTEMPTS = 3
+# Candidate output is diagnostics only; keep at most this much per worker.
+STDERR_LIMIT_BYTES = 1 << 20
+# Replace a warm worker once candidates have consumed this fraction of its
+# memory budget, before leaks from earlier candidates fail an innocent one.
+RECYCLE_FRACTION = 0.5
 _build_lock = threading.Lock()
 
 
@@ -27,17 +35,67 @@ class EvaluatorInitError(WorkerError):
 
 
 def worker_binary():
-    """Locate this pack's worker and build it once if missing."""
+    """Locate this pack's worker, building it if it is missing or stale.
+
+    Several engines (and rigs sharing one pack) can race here, so the build
+    holds an flock and the Makefile installs the binary with an atomic rename.
+    An up-to-date binary needs neither the lock nor a writable pack.
+    """
     root = Path(__file__).resolve().parents[2]
     binary = root / "build" / "funsearch-worker"
+    sources = [path for path in (root / "worker" / "funsearch-worker.c", root / "include" / "funsearch.h")
+               if path.is_file()]
+
+    def fresh():
+        return binary.is_file() and all(binary.stat().st_mtime >= path.stat().st_mtime for path in sources)
+
     with _build_lock:
-        if not binary.is_file():
-            # Use argv, not a shell interpolation of the installation path.
-            import shlex
-            ok, log = run_command(f"make -C {shlex.quote(str(root))} worker", root, 60)
-            if not ok or not binary.is_file():
-                raise WorkerError(f"cannot build funsearch-worker: {log}")
+        if fresh():
+            return binary
+        try:
+            binary.parent.mkdir(exist_ok=True)
+            handle = (binary.parent / ".build.lock").open("a")
+        except OSError as exc:
+            raise WorkerError(f"cannot build funsearch-worker in {root}: {exc}") from exc
+        with handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            if not fresh():
+                ok, log = run_command(f"make -C {shlex.quote(str(root))} worker", root, 60)
+                if not ok or not binary.is_file():
+                    raise WorkerError(f"cannot build funsearch-worker: {log}")
     return binary
+
+
+def _memory_kb(pid, field):
+    """Return a /proc/<pid>/status size in KiB, or None where unavailable."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith(field + ":"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _checked_reply(reply, nonce):
+    """Validate one scoring reply; raise WorkerError for protocol violations."""
+    # Candidate code shares the worker process and can write to its protocol
+    # fd. A reply must echo this request's random token to count.
+    if not isinstance(reply, dict) or reply.pop("nonce", None) != nonce:
+        raise WorkerError("reply does not answer this request")
+    if (reply.get("status") not in {"OK", "INVALID", "ERROR"}
+            or not {"score", "sig", "msg"} <= reply.keys()
+            or not isinstance(reply["sig"], list) or len(reply["sig"]) > 8):
+        raise WorkerError("invalid worker response")
+    score = reply["score"]
+    if (not all(map(_finite_number, reply["sig"]))
+            or not (_finite_number(score) or (score is None and reply["status"] != "OK"))):
+        return _error("non-finite score or signature")
+    return reply
 
 
 def _error(message):
@@ -56,7 +114,7 @@ class Worker:
         self.cfg = cfg
         self.evaluator_so = Path(evaluator_so).resolve()
         self.instance = instance
-        self.env = environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})})
+        self.env = worker_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})})
         self.binary = worker_binary()
         self.process = None
         self._stderr = None
@@ -64,6 +122,7 @@ class Worker:
         self._lock = threading.Lock()
         self._closed = False
         self._failure = None
+        self._baseline_kb = None
         self._start()
 
     def _line(self, deadline):
@@ -144,6 +203,7 @@ class Worker:
                     raise EvaluatorInitError(str(reply["fatal"]))
                 if reply != _error("bad request"):
                     raise WorkerError(f"unexpected worker startup response: {reply!r}")
+                self._baseline_kb = _memory_kb(self.process.pid, self._memory_field())
                 return
             except EvaluatorInitError:
                 self._dispose()
@@ -162,6 +222,31 @@ class Worker:
                 self._dispose()
         raise WorkerError(f"worker failed to start after {START_ATTEMPTS} attempts: {last_error}")
 
+    def _memory_field(self):
+        # RLIMIT_AS bounds virtual size; sanitizer workers run without it,
+        # and their shadow mapping makes resident size the meaningful measure.
+        return "VmSize" if "FS_MEMORY_MB" in self.env else "VmRSS"
+
+    def _should_recycle(self):
+        if self._baseline_kb is None or self.process is None:
+            return False
+        current = _memory_kb(self.process.pid, self._memory_field())
+        if current is None:
+            return False
+        budget = self.cfg.evaluator.memory_mb * 1024
+        if "FS_MEMORY_MB" in self.env:
+            budget -= self._baseline_kb
+        return current - self._baseline_kb > RECYCLE_FRACTION * max(budget, 0)
+
+    def _trim_stderr(self):
+        # The worker shares this file's offset, so rewinding it here bounds
+        # the file without the worker reopening anything.
+        if self._stderr is not None:
+            descriptor = self._stderr.fileno()
+            if os.fstat(descriptor).st_size > STDERR_LIMIT_BYTES:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+
     def score(self, so_path, timeout_s):
         """Return a protocol result; replace a timed-out or crashed worker."""
         if not math.isfinite(timeout_s) or timeout_s <= 0:
@@ -175,17 +260,10 @@ class Worker:
             if self._failure is not None:
                 raise self._failure
             deadline = time.monotonic() + timeout_s
+            nonce = secrets.token_hex(16)
             try:
-                self._send("SCORE " + path)
-                reply = json.loads(self._line(deadline))
-                if not isinstance(reply, dict):
-                    raise WorkerError("invalid worker response")
-                if "fatal" in reply:
-                    raise EvaluatorInitError(str(reply["fatal"]))
-                if (reply.get("status") not in {"OK", "INVALID", "ERROR"}
-                        or not {"score", "sig", "msg"} <= reply.keys()):
-                    raise WorkerError("invalid worker response")
-                return reply
+                self._send(f"SCORE #{nonce} {path}")
+                reply = _checked_reply(json.loads(self._line(deadline)), nonce)
             except TimeoutError:
                 result = _error(f"timeout after {timeout_s:g}s")
             except (EOFError, BrokenPipeError):
@@ -195,12 +273,13 @@ class Worker:
                     self._failure = exc
                     self._dispose()
                     raise
-            except EvaluatorInitError as exc:
-                self._failure = exc
-                self._dispose()
-                raise
             except (OSError, ValueError, WorkerError) as exc:
                 result = _error(f"worker protocol error: {exc}")
+            else:
+                self._trim_stderr()
+                if self._should_recycle():
+                    self._recycle()
+                return reply
             self._dispose()
             if self._closed:
                 return _error("evaluation interrupted at shutdown")
@@ -212,6 +291,16 @@ class Worker:
                 self._failure = exc
                 raise
             return result
+
+    def _recycle(self):
+        """Replace a healthy worker whose candidates leaked too much memory."""
+        self._dispose(graceful=True)
+        try:
+            self._start()
+        except WorkerError as exc:
+            # The reply already in hand is valid; later calls report this.
+            if not self._closed:
+                self._failure = exc
 
     def abort(self):
         """Interrupt an active score without waiting for its scoring lock."""

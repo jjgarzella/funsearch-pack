@@ -17,9 +17,9 @@ class Rejected(RuntimeError):
     pass
 
 
-def read_run(run_dir):
+def read_run(run_dir, *, require_db=True):
     root = Path(run_dir).resolve()
-    if not (root / "db.sqlite").is_file():
+    if require_db and not (root / "db.sqlite").is_file():
         raise ConfigError(f"not a run directory: {root}")
     try:
         metadata = json.loads((root / "run.json").read_text())

@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Run the engine from any working directory."""
+"""Run the engine from any working directory.
+
+`funsearch slot ...` is the Gas City mutator slot lifecycle. It lives in the
+pack's integration layer (scripts/gc_lifecycle.py), not in the engine.
+"""
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
+PACK = Path(__file__).resolve().parents[1]
+if sys.argv[1:2] == ["slot"]:
+    sys.path.insert(0, str(PACK / "scripts"))
+    from gc_lifecycle import slot_main
+    sys.exit(slot_main(sys.argv[2:]))
+sys.path.insert(0, str(PACK / "engine"))
 from funsearch.cli import main
 sys.exit(main())

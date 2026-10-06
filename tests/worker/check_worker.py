@@ -152,6 +152,28 @@ class WorkerTests(unittest.TestCase):
                 self.assertIsNone(result["score"])
                 self.assertEqual(result["msg"], "non-finite score")
 
+    def test_non_finite_signature_is_an_error(self):
+        process = self.start("nan-sig", "edge_eval")
+        self.assertEqual(self.score(process, "good"), {
+            "status": "ERROR", "score": 2, "sig": [], "msg": "non-finite signature",
+        })
+
+    def test_nonce_is_echoed_and_removed_from_later_replies(self):
+        process = self.start()
+        good = BUILD / "libgood.so"
+        tagged = self.receive(process, f"SCORE #0123abcd {good}")
+        self.assertEqual(tagged.pop("nonce"), "0123abcd")
+        self.assertEqual(tagged, self.score(process, "good"))
+        missing = self.receive(process, f"SCORE #ff {BUILD / 'missing.so'}")
+        self.assertEqual((missing["nonce"], missing["status"]), ("ff", "ERROR"))
+        self.assertNotIn("nonce", self.score(process, "good"))
+        for request in (f"SCORE # {good}", f"SCORE #XYZ {good}", f"SCORE #{'a' * 65} {good}",
+                        "SCORE #abc", f"SCORE #abc{good}"):
+            with self.subTest(request=request):
+                self.assertEqual(self.receive(process, request), {
+                    "status": "ERROR", "score": 0, "sig": [], "msg": "bad request",
+                })
+
     def test_memory_limit(self):
         process = self.start("limit", "edge_eval", {"FS_MEMORY_MB": "128"})
         result = self.score(process, "good")

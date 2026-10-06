@@ -10,9 +10,9 @@
 # The pack is project-agnostic and can be imported into any rig.
 # Gas City formulas and hooks connect runs to mutator slot beads.
 # Run state belongs to the problem directory and is never committed.
-# The bundled cap-set example will demonstrate a Julia-backed evaluator.
+# The bundled cap-set example demonstrates a Julia-backed evaluator.
 # The mutator role uses Claude Haiku with a per-session tool guard.
-# Implementation is tracked by epic mc-h4zx; see README.md for the layout.
+# Implemented under epic mc-h4zx; see README.md for the layout and status.
 
 [pack]
 name = "funsearch"

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Gas City integration; the standalone engine has no dependency on this module."""
+"""Gas City integration: run hooks, crash sweep, launch and mutator slots.
+
+The standalone engine has no dependency on this module. This layer uses only
+the engine's public surface: bin/funsearch verbs, and the Database class that
+owns the run schema. bin/funsearch hands its `slot` verb to slot_main here.
+"""
 
 import argparse
 from contextlib import contextmanager
@@ -7,6 +12,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -14,7 +20,19 @@ import time
 
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK / "engine"))
+from funsearch.db import Database  # noqa: E402
 from funsearch.runtime import pid_alive  # noqa: E402
+
+SLOT_CONTEXT_FILE = ".funsearch-slot.json"
+SLOT_RETIRED_FILE = ".funsearch-retired.json"
+# Formula/launch overrides tune the search only. Command-bearing keys
+# (candidate.compile*, evaluator.build) stay in the problem's own problem.toml.
+LAUNCH_OVERRIDE_SECTIONS = ("search.", "stop.")
+LAUNCH_OVERRIDE_KEYS = ("mutator.model", "instance", "problem.instance")
+
+
+class UsageError(ValueError):
+    """Bad input or ownership: exit 2, and never mutate city state."""
 
 
 def read_json(path):
@@ -60,21 +78,33 @@ def context(metadata):
     return city, rig, notify
 
 
-def gc(city, rig, *args):
+def gc(*args, city=None, rig=None):
+    """Run gc and return stripped stdout; raise RuntimeError on failure.
+
+    With city and rig, pin the store explicitly: hooks and the sweep can run
+    from a different rig or worktree than the run, so inherited store context
+    could select the wrong one. Without them, use the calling session's own
+    scope: a mutator acting on the slot bead its session claimed.
+    """
     env = os.environ.copy()
-    # The sweep can run in a different rig from the run. Explicit bd scope and
-    # a city cwd prevent inherited worktree/store context from selecting it.
-    env.update(GC_CITY_PATH=str(city), GC_CITY=str(city), GC_RIG=rig)
-    for key in ("BEADS_DIR", "GC_RIG_ROOT", "GC_BEADS_SCOPE_ROOT"):
-        env.pop(key, None)
+    cwd = None
     command = [os.environ.get("FS_GC", "gc"), *args]
-    if args[0] == "bd":
-        command += ["--rig", rig]
-    result = subprocess.run(command, cwd=city, env=env, capture_output=True,
+    if city is not None:
+        env.update(GC_CITY_PATH=str(city), GC_CITY=str(city), GC_RIG=rig)
+        for key in ("BEADS_DIR", "GC_RIG_ROOT", "GC_BEADS_SCOPE_ROOT"):
+            env.pop(key, None)
+        cwd = city
+        if args[0] == "bd":
+            command += ["--rig", rig]
+    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True,
                             text=True, timeout=30)
     if result.returncode:
         raise RuntimeError(f"gc {' '.join(args[:3])}: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout.strip()
+
+
+def scoped_gc(city, rig, *args):
+    return gc(*args, city=city, rig=rig)
 
 
 def registry_path(city, run_id):
@@ -119,7 +149,7 @@ def start_locked(root):
         fields = {"fs.problem": metadata["problem_dir"], "fs.run_dir": str(root),
                   "fs.instance": metadata["instance"], "fs.pid": str(pid),
                   "fs.status": "running", "fs.notify": notify}
-        fs["run_bead"] = gc(city, rig, "bd", "create",
+        fs["run_bead"] = scoped_gc(city, rig, "bd", "create",
             f"funsearch run {metadata['run_id']}: {cfg['problem']['name']} {metadata['instance']}",
             "--labels", "funsearch-run", "--metadata", json.dumps(fields),
             "--description", f"FunSearch results: {root}", "--silent")
@@ -136,13 +166,13 @@ def start_locked(root):
             fields = {"fs.run_dir": str(root), "fs.slot": slot,
                       "fs.tasks_per_session": str(cfg["search"]["tasks_per_session"]),
                       "fs.run_bead": fs["run_bead"], "opt_model": cfg["mutator"]["model"]}
-            slots[slot] = gc(city, rig, "bd", "create",
+            slots[slot] = scoped_gc(city, rig, "bd", "create",
                 f"funsearch slot {metadata['run_id']}/{slot}", "--labels", "funsearch-slot",
                 "--parent", fs["run_bead"], "--metadata", json.dumps(fields),
                 "--description", "Follow the FunSearch mutator slot loop.", "--silent")
             write_json(root / "run.json", metadata)
         if slot not in routed:
-            gc(city, rig, "sling", f"{rig}/funsearch.mutator", slots[slot], "--no-formula")
+            scoped_gc(city, rig, "sling", f"{rig}/funsearch.mutator", slots[slot], "--no-formula")
             routed.append(slot)
             write_json(root / "run.json", metadata)
 
@@ -174,24 +204,24 @@ def finish_locked(root, metadata):
         args = ["bd", "update", fs["run_bead"], "--append-notes", note]
         for key in ("status", "best_score", "children_scored", "ok_rate"):
             args += ["--set-metadata", f"fs.{key}={summary.get(key)}"]
-        gc(city, rig, *args)
+        scoped_gc(city, rig, *args)
         fs["summary_recorded"] = summary
         write_json(root / "run.json", metadata)
     # Include blocked/deferred/in-progress slots, and avoid the default 50-row
     # limit. Slot children must close before the parent (bd enforces this).
-    rows = json.loads(gc(city, rig, "bd", "list", "--parent", fs["run_bead"],
+    rows = json.loads(scoped_gc(city, rig, "bd", "list", "--parent", fs["run_bead"],
                          "--label", "funsearch-slot", "--all", "--limit", "0", "--json"))
     for row in rows:
         if row["status"] != "closed":
             # The engine/sweep owns run shutdown while an active mutator owns
             # each claimed slot. Terminal cleanup must override that claim.
-            gc(city, rig, "bd", "close", row["id"], "--force", "--reason", summary["status"])
+            scoped_gc(city, rig, "bd", "close", row["id"], "--force", "--reason", summary["status"])
     if fs.get("run_closed") != summary["status"]:
-        gc(city, rig, "bd", "close", fs["run_bead"], "--reason", summary["status"])
+        scoped_gc(city, rig, "bd", "close", fs["run_bead"], "--reason", summary["status"])
         fs["run_closed"] = summary["status"]
         write_json(root / "run.json", metadata)
     if not fs.get("mail_sent"):
-        gc(city, rig, "mail", "send", notify, "-s",
+        scoped_gc(city, rig, "mail", "send", notify, "-s",
            f"funsearch run {metadata['run_id']} {summary['status']}: best {summary.get('best_score')}",
            "-m", note)
         fs["mail_sent"] = True
@@ -216,24 +246,15 @@ def sweep_check():
 
 
 def failed_summary(root, metadata):
-    # Recover authoritative counters and best.c from the live database, falling
-    # back to the latest readable backup if the daemon died during a write.
-    from funsearch.daemon import write_outputs
-    from funsearch.db import Database
-    from funsearch.runtime import read_run
+    # The engine recovers authoritative counters and best.c from the live
+    # database or its newest readable snapshot. Without either, keep what
+    # the previous summary knew and mark the run failed.
+    result = subprocess.run([str(PACK / "bin" / "funsearch"), "run", "recover", str(root)],
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode == 0:
+        return
+    print(f"cannot recover {root}: {result.stderr.strip()}", file=sys.stderr)
     previous = read_json(root / "summary.json") if (root / "summary.json").exists() else {}
-    backups = sorted((root / "snapshots").glob("db-*.sqlite"),
-                     key=lambda path: path.stat().st_mtime, reverse=True)
-    for database in [root / "db.sqlite", *backups]:
-        if not database.exists():
-            continue
-        try:
-            _, _, cfg = read_run(root)
-            with Database(database) as db:
-                write_outputs(db, root, metadata, cfg, "failed", "engine died")
-            return
-        except Exception as exc:
-            print(f"cannot recover {database}: {exc}", file=sys.stderr)
     previous.update(run_id=metadata["run_id"], instance=metadata["instance"],
                     status="failed", reason="engine died", ended_at=time.time())
     previous.setdefault("children_scored", 0)
@@ -284,10 +305,110 @@ def launch(args):
     if args.instance:
         command += ["--instance", args.instance]
     for override in shlex.split(args.overrides):
+        key = override.partition("=")[0]
+        if not (key.startswith(LAUNCH_OVERRIDE_SECTIONS) or key in LAUNCH_OVERRIDE_KEYS):
+            raise ValueError(f"launch overrides may set only search.*, stop.*, mutator.model "
+                             f"or instance, not {key!r}; edit problem.toml instead")
         command += ["--set", override]
     command += ["--on-start", shlex.quote(str(PACK / "scripts" / "on-start.sh")),
                 "--on-finish", shlex.quote(str(PACK / "scripts" / "on-finish.sh"))]
     return subprocess.run(command, env=env).returncode
+
+
+def owned_slot(bead, *, allow_closed=False):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", bead):
+        raise UsageError("invalid slot bead id")
+    session = os.environ.get("GC_SESSION_ID")
+    if not session:
+        raise UsageError("slot helpers require GC_SESSION_ID")
+    rows = json.loads(gc("bd", "show", bead, "--json"))
+    row = rows[0] if isinstance(rows, list) and len(rows) == 1 else rows
+    metadata = row.get("metadata", {})
+    closed = allow_closed and row.get("status") == "closed"
+    if row.get("id") != bead:
+        raise UsageError("gc returned the wrong slot")
+    if not closed and (row.get("status") != "in_progress"
+            or metadata.get("gc.session_id") != session
+            or row.get("assignee") not in {value for value in
+                (session, os.environ.get("GC_SESSION_NAME"), os.environ.get("GC_ALIAS")) if value}):
+        raise UsageError("slot is not claimed by this session")
+    if not metadata.get("gc.routed_to"):
+        raise UsageError("slot has no routing metadata")
+    root = Path(metadata.get("fs.run_dir", ""))
+    if not root.is_absolute() or not str(metadata.get("fs.slot", "")):
+        raise UsageError("slot requires absolute fs.run_dir and fs.slot")
+    try:
+        count = int(metadata["fs.tasks_per_session"])
+        if count < 1:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise UsageError("fs.tasks_per_session must be a positive integer") from None
+    context = {"bead": bead, "session": session, "run_dir": str(root.resolve()),
+               "slot": str(metadata["fs.slot"]), "tasks_per_session": count}
+    return row, context
+
+
+def slot_command(command, bead):
+    # Slot calls run in the mutator session that claimed the bead, so they use
+    # that session's own store scope (gc() without city/rig).
+    row, context = owned_slot(bead, allow_closed=command == "close")
+    path = Path.cwd() / SLOT_CONTEXT_FILE
+    if command == "show":
+        database = Path(context["run_dir"]) / "db.sqlite"
+        if database.exists():
+            with Database(database, readonly=True) as db:
+                tasks = db.open_tasks_for_slot(context["slot"])
+            if len(tasks) > 1:
+                raise UsageError("slot has multiple unfinished tasks")
+            if tasks:
+                context["pending_task"] = {
+                    "id": tasks[0].id, "dir": str(database.parent / "tasks" / str(tasks[0].id)),
+                    "trials_used": tasks[0].trials_used}
+        # The agent's file tools cannot access this control file. A fresh
+        # work_dir per session also prevents concurrent sessions sharing it.
+        path.write_text(json.dumps(context) + "\n")
+        path.chmod(0o600)
+        print(json.dumps(context))
+        return 0
+    if command == "release":
+        gc("bd", "update", bead, "--status=open", "--assignee=",
+           f"--if-assignee={row['assignee']}", "--if-status=in_progress",
+           "--unset-metadata=gc.session_id", "--unset-metadata=gc.session_name",
+           "--unset-metadata=gc.claimed_at", "--unset-metadata=gc.work_dir",
+           "--unset-metadata=gc.work_branch")
+    elif command == "close":
+        # Guard the ownership check and close in one update. As with bd close,
+        # ordinary dependency/child checks still apply; never use --force.
+        if row["status"] != "closed":
+            gc("bd", "update", bead, "--status=closed",
+               f"--if-assignee={row['assignee']}", "--if-status=in_progress")
+    else:
+        raise UsageError("unknown slot command")
+    # Deferred nudges can reach a provider before the controller finishes its
+    # drain. Leave a receipt so the tool guard cannot let that context reclaim
+    # another task; a different pool session ignores this old session receipt.
+    retired = Path.cwd() / SLOT_RETIRED_FILE
+    retired.write_text(json.dumps({"session": context["session"], "bead": bead}) + "\n")
+    retired.chmod(0o600)
+    path.unlink(missing_ok=True)
+    print(f"SLOT_{command.upper()} {bead}")
+    return 0
+
+
+def slot_main(argv):
+    """`funsearch slot show|release|close <bead>`, dispatched by bin/funsearch."""
+    parser = argparse.ArgumentParser(prog="funsearch slot")
+    parser.add_argument("command", choices=("show", "release", "close"))
+    parser.add_argument("bead")
+    args = parser.parse_args(argv)
+    try:
+        return slot_command(args.command, args.bead)
+    except UsageError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 def main():

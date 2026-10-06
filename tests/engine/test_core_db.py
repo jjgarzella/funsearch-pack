@@ -122,3 +122,30 @@ class DatabaseTests(unittest.TestCase):
                 self.db.add_program(0, "x", **values)
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.enqueue("unknown", "a", "b")
+
+    def test_slot_pending_and_stale_task_queries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with Database(Path(directory) / "db.sqlite") as db:
+                stale = db.add_task(0, [], slot="1")
+                busy = db.add_task(0, [], slot="2")
+                fresh = db.add_task(0, [], slot="1")
+                db.connection.execute("UPDATE tasks SET created_at=0 WHERE id IN (?,?)", (stale.id, busy.id))
+                self.assertEqual([t.id for t in db.open_tasks_for_slot(1)], [stale.id, fresh.id])
+                db.enqueue("submit", "a.c", "a.so", task_id=busy.id)
+                self.assertTrue(db.has_pending_submission(busy.id))
+                self.assertFalse(db.has_pending_submission(stale.id))
+                running = db.claim_evaluation()
+                self.assertEqual([e.id for e in db.running_evaluations()], [running.id])
+                # A queued or running evaluation keeps an old task alive.
+                self.assertEqual(db.abandon_stale_tasks(100), 1)
+                self.assertEqual(db.get_task(stale.id).status, "abandoned")
+                self.assertEqual(db.get_task(busy.id).status, "open")
+                self.assertEqual(db.get_task(fresh.id).status, "open")
+                db.finish_evaluation(running.id, {"status": "OK"})
+                self.assertFalse(db.has_pending_submission(busy.id))
+                self.assertEqual(db.abandon_stale_tasks(100), 1)
+                db.set_state("status", "running")
+                self.assertEqual(db.all_state(), {"status": "running"})
+                plan = " ".join(row[3] for row in db.connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT id FROM tasks WHERE status='open' AND created_at<1"))
+                self.assertIn("tasks_status", plan)

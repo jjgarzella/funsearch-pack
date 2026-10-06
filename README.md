@@ -2,7 +2,8 @@
 
 FunSearch is a project-agnostic Gas City pack for evolutionary program search. Coding agents act as mutators, writing candidate programs that a user-supplied evaluator scores through a C interface. A C worker hosts the evaluator, while a Python engine manages the program database, search islands, tasks, and run lifecycle.
 
-Status: under construction (epic mc-h4zx)
+Status: implemented under epic mc-h4zx; the live cap-set acceptance passed
+(see [docs/acceptance-capset.md](docs/acceptance-capset.md)).
 
 ```text
 pack.toml                 Pack metadata
@@ -21,7 +22,7 @@ docs/                     Design documentation
 tests/                    Python suites and shell test runners
 ```
 
-Run `make` to build the worker when its source is available, `make test` to run available test suites, and `make clean` to remove build output. Build artifacts go in `build/`; run artifacts belong in `runs/`. Missing components are added by later implementation beads.
+Run `make` to build the worker, `make test` to build it and run the engine, Gas City, worker, skill and example suites, and `make clean` to remove build output. Build artifacts go in `build/`; run artifacts belong in `runs/`. The engine also builds a missing or stale worker on first use, under a file lock with an atomic install, so a read-only pack needs a prebuilt, current `build/funsearch-worker`.
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE).
 
@@ -46,7 +47,10 @@ gc sling <rig>/<pool> funsearch-run --formula \
   --var 'overrides=search.mutators=3 stop.duration_s=3600 stop.max_children=100'
 ```
 
-Omit `instance` and `overrides` to use the problem defaults. The seed must score
+Omit `instance` and `overrides` to use the problem defaults. Overrides may set
+only `search.*`, `stop.*`, `mutator.model` and `instance`; keys that hold shell
+commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
+`problem.toml`. The seed must score
 `FS_OK`. For the copied evaluator template, set `evaluator.build` to
 `make -C evaluator FS_PACK=/absolute/path/to/funsearch-pack` so an agent can
 build it without inheriting your shell environment. Results appear in
@@ -69,7 +73,9 @@ sends `gc mail` to `notify`, then removes the registry entry.
 The `funsearch-sweep` exec order is dormant when the registry is empty. With
 active runs it checks every controller tick but sweeps at most every 30
 minutes. A dead engine without a terminal summary is marked failed with
-reason `engine died`, using database/backup results where available. A dead
+reason `engine died`; `bin/funsearch run recover <run-dir>` rewrites its
+outputs from the live database, or the newest readable snapshot if the engine
+died mid-write. A dead
 engine with a terminal summary has its interrupted finish hook retried with
 that outcome preserved. Live engines are left alone. Sweep errors retain the
 entry for a later retry and appear in order output. The sweep always updates
@@ -103,12 +109,16 @@ bin/funsearch run status /path/to/problem/runs/experiment
 bin/funsearch best /path/to/problem/runs/experiment -k 5
 bin/funsearch rescore /path/to/problem/runs/experiment best --instance n=7
 bin/funsearch stop /path/to/problem/runs/experiment
+# after an engine crash (refused while the engine is alive):
+bin/funsearch run recover /path/to/problem/runs/experiment
 ```
 
 `run start` checks the seed and returns after the daemon's worker pools are
 ready. Configuration, the seed, the problem statement, and the candidate
 header are saved in the run directory. Each try or submission compiles a
 private source copy; includes of `candidate.h` work there and during rescore.
+Candidate source may not include absolute or `..` paths, use computed
+includes, `#embed` or `.incbin` (see Security notes).
 Try results print `RESULT <status> <score> <message>`; accepted submissions
 print `ACCEPTED <program-id> <status> <score>`. A rejected submission leaves
 its task open. A compile failure during try consumes a trial and records an
@@ -192,7 +202,8 @@ unassign the bead, clear stale session/claim/work-directory metadata, and preser
 ownership and the terminal update happen atomically. An already closed slot
 (for example, by the finish hook) is a read-only success. Neither helper drains;
 the agent calls `gc runtime drain-ack` only after a successful transition.
-These adapters are the only engine CLI subcommands that call Gas City.
+`bin/funsearch` hands its `slot` verb to the Gas City layer
+(`scripts/gc_lifecycle.py`); the engine package itself never calls Gas City.
 After a successful release or close, a session receipt makes the tool guard
 permit only `gc runtime drain-ack` for that retiring session. This prevents
 late nudges from reusing its context before the controller completes the drain;
@@ -200,17 +211,38 @@ a new pool session can claim normally.
 
 ## Security notes
 
-The mutator guard enforces a Claude tool policy, not process isolation.
-Gas City's agent schema has no OS filesystem or network sandbox setting.
-Candidate compilation and scoring execute native code with the host user's
-access: C includes, compiler options, and candidate code can access files
-or the network independently of the agent's file tools. Symlink swaps by
-another process remain a race. Do not use this setup as an adversarial
-evaluator-hiding boundary; OS/container isolation is separate work.
+The mutator guard enforces a Claude tool policy, not process isolation, and
+it is **not a boundary against the mutator itself**. Gas City's agent schema has
+no OS filesystem or network sandbox setting. The guard must allow `try` and
+`submit`, and those compile the mutator's C and run it inside an evaluator
+worker with the host user's access. Such code (for example a constructor) can
+read or write anything that user can, including the session's generated
+`.claude/settings.json`, its slot context, run state and the city. TASK.md
+embeds other candidates' source, so a prompt injected there can steer a mutator
+into writing such code. Symlink swaps by another process remain a race. Do not
+use this setup as an adversarial evaluator-hiding boundary.
+
+Mitigations that do not depend on an OS sandbox:
+
+- Compiler diagnostics are shown to the mutator, so candidate source may not
+  read files through the preprocessor or assembler. Absolute or `..` includes,
+  computed includes, `#embed` and `.incbin` are rejected before compiling.
+- Evaluator workers start without Gas City identity and store variables
+  (`GC_*`, `BEADS_*`), Anthropic/Claude variables, the SSH/GPG agent sockets, or
+  variables whose names look like tokens, secrets, passwords or API keys.
+- Each scoring request carries a random token that a reply must echo, so a
+  candidate cannot trivially forge its own score on the worker's protocol fd.
+  Candidates share the worker's address space, so this only raises the bar.
+
+These shrink the easy paths; they do not contain native code. For unattended or
+untrusted runs, run the city or at least the mutator pool and engine as a
+dedicated user, or in a container, with no access to credentials or other
+projects. OS/container isolation of the worker is separate work.
 
 The pack and generated settings must remain trusted, and a launch override
 must not disable project settings/hooks, enable permission bypass, or add
 tools/MCP servers. Gas City also supplies its city-managed Claude hooks;
 their trusted lifecycle commands are outside the model's tool allowlist.
-The later live acceptance bead verifies the actual Claude launch and hook
-loading. Policy/helper tests here exercise both allowed and denied calls.
+The live cap-set acceptance ([docs/acceptance-capset.md](docs/acceptance-capset.md))
+verified the actual Claude launch and hook loading. Policy/helper tests here
+exercise both allowed and denied calls.

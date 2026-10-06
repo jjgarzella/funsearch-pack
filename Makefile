@@ -10,9 +10,11 @@ all: worker
 
 worker: build/funsearch-worker
 
+# Install with a rename so a concurrent engine never executes a partial binary.
 build/funsearch-worker: worker/funsearch-worker.c include/funsearch.h
 	mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ worker/funsearch-worker.c $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@.tmp worker/funsearch-worker.c $(LDLIBS)
+	mv -f $@.tmp $@
 
 test: worker
 	@if test -n "$$(find tests -type f -name 'test_*.py' -print)"; then \

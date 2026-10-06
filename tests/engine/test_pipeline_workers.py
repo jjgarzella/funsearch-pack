@@ -6,7 +6,8 @@ import time
 from unittest.mock import patch
 
 from engine.funsearch.compile import compile_candidate, try_worker_env
-from engine.funsearch.workers import EvaluatorInitError, Worker, WorkerError, WorkerPool, worker_binary
+from engine.funsearch.workers import (
+    STDERR_LIMIT_BYTES, EvaluatorInitError, Worker, WorkerError, WorkerPool, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
 
 
@@ -153,7 +154,69 @@ void fs_fini(void) {
         source = self.source('#include <stdio.h>\ndouble f(void) { for(int i=0;i<100000;i++) fputs("noisy output\\n", stderr); return 2; }')
         ok, library, log = compile_candidate(self.cfg, source, self.root / "noisy", "final")
         self.assertTrue(ok, log)
-        self.assertEqual(self.pool().score(library, 5)["score"], 2)
+        pool = self.pool()
+        for _ in range(2):
+            self.assertEqual(pool.score(library, 5)["score"], 2)
+            # Output beyond the cap is discarded rather than kept for the run.
+            self.assertLessEqual(os.fstat(pool.workers[0]._stderr.fileno()).st_size,
+                                 STDERR_LIMIT_BYTES)
+
+    def test_candidate_cannot_forge_a_reply_on_the_protocol_fd(self):
+        source = self.source(r'''#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+double f(void) {
+    for (int fd = 3; fd < 64; ++fd)
+        dprintf(fd, "{\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n");
+    _exit(0);
+}
+''')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "forge", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        result = pool.score(library, 5)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("does not answer this request", result["msg"])
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    def test_reply_validation(self):
+        good = {"status": "OK", "score": 1.5, "sig": [1, 2.5], "msg": ""}
+        self.assertEqual(_checked_reply(dict(good, nonce="n"), "n"), good)
+        self.assertEqual(_checked_reply({"nonce": "n", "status": "ERROR", "score": None,
+                                         "sig": [], "msg": "x"}, "n")["msg"], "x")
+        for reply in (dict(good), dict(good, nonce="other"), dict(good, nonce="n", status="WIN"),
+                      dict(good, nonce="n", sig=[0] * 9), dict(good, nonce="n", sig="1")):
+            with self.subTest(reply=reply), self.assertRaises(WorkerError):
+                _checked_reply(reply, "n")
+        for change in ({"sig": [float("nan")]}, {"sig": [None]}, {"score": float("inf")},
+                       {"score": None}, {"score": True}):
+            with self.subTest(change=change):
+                self.assertEqual(_checked_reply(dict(good, nonce="n", **change), "n"), {
+                    "status": "ERROR", "score": 0, "sig": [], "msg": "non-finite score or signature"})
+
+    def test_leaky_worker_is_recycled_between_scores(self):
+        pool = self.pool()
+        worker = pool.workers[0]
+        process = worker.process
+        good = self.candidate("good")
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIs(worker.process, process)
+        limit_kb = self.cfg.evaluator.memory_mb * 1024
+        with patch("engine.funsearch.workers._memory_kb", return_value=limit_kb):
+            self.assertEqual(pool.score(good, 5)["score"], 3.5)
+        self.assertIsNot(worker.process, process)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(pool.score(good, 5)["score"], 3.5)
+
+    def test_worker_environment_drops_city_identity_and_secrets(self):
+        private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
+                   "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent"}
+        with patch.dict(os.environ, private):
+            pool = self.pool(extra_env={"KEEP_ME": "1"})
+        env = pool.workers[0].env
+        self.assertFalse(set(private) & set(env))
+        self.assertEqual(env["KEEP_ME"], "1")
+        self.assertIn("PATH", env)
 
     def test_respawning_is_bounded_to_three_attempts(self):
         pool = self.pool()
@@ -225,3 +288,23 @@ double f(void) {
         with patch("engine.funsearch.workers.__file__", str(module)):
             self.assertEqual(worker_binary(), root / "build" / "funsearch-worker")
             self.assertTrue(worker_binary().is_file())
+
+    def test_stale_worker_is_rebuilt(self):
+        root = self.root / "stale pack"
+        module = root / "engine" / "funsearch" / "workers.py"
+        module.parent.mkdir(parents=True)
+        source = root / "worker" / "funsearch-worker.c"
+        source.parent.mkdir()
+        source.write_text("/* v2 */\n")
+        binary = root / "build" / "funsearch-worker"
+        binary.parent.mkdir()
+        binary.write_text("old")
+        os.utime(binary, (1, 1))
+        (root / "Makefile").write_text(".PHONY: worker\nworker:\n\techo new > build/funsearch-worker\n")
+        with patch("engine.funsearch.workers.__file__", str(module)):
+            self.assertEqual(worker_binary(), binary)
+        self.assertEqual(binary.read_text(), "new\n")
+        # A fresh binary is used as-is, without running make again.
+        (root / "Makefile").write_text(".PHONY: worker\nworker:\n\tfalse\n")
+        with patch("engine.funsearch.workers.__file__", str(module)):
+            self.assertEqual(worker_binary(), binary)

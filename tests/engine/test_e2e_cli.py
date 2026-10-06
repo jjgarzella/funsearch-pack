@@ -208,6 +208,46 @@ class EndToEndTests(PipelineTestCase):
         self.assertEqual(self.finished(root, "stopped")["children_scored"], 0)
         self.assertTrue((root / "finished.marker").exists())
 
+    def test_run_id_validation_and_existing_run(self):
+        for run_id in ("..", ".", "a/b", "../escape", "line\nbreak"):
+            with self.subTest(run_id=run_id):
+                self.cli("run", "start", self.problem, "--run-id", run_id, code=2)
+        self.assertFalse((self.problem / "runs").exists())
+        self.assertFalse((self.problem / "escape").exists())
+        root = self.start()
+        before = (root / "run.json").read_text()
+        self.cli("run", "start", self.problem, "--run-id", root.name, code=2)
+        self.assertEqual((root / "run.json").read_text(), before)
+
+    def test_same_task_concurrent_submissions_score_once(self):
+        root = self.start()
+        task_id, directory = self.task(root)
+        slow = self.child(directory, source="#include <unistd.h>\ndouble f(void) { sleep(2); return 1; }\n")
+        second = directory / "second.c"
+        second.write_text("double f(void) { return 2; }\n")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(self.cli, "submit", root, task_id, slow)
+            self.wait_queue(root, 1)
+            self.assertEqual(self.cli("submit", root, task_id, second, code=4),
+                             "REJECTED task already has a pending submission")
+            self.assertIn("ACCEPTED", first.result())
+        with Database(root / "db.sqlite") as db:
+            self.assertEqual(db.get_state("children_scored"), 1)
+            self.assertEqual(db.get_task(task_id).status, "done")
+
+    def test_closed_task_rejects_try_and_submit(self):
+        root = self.start()
+        task_id, directory = self.task(root)
+        self.assertIn("ACCEPTED", self.cli("submit", root, task_id, self.child(directory, 1)))
+        other = self.child(directory, 2)
+        for verb in ("try", "submit"):
+            with self.subTest(verb=verb):
+                self.assertEqual(self.cli(verb, root, task_id, other, code=4),
+                                 f"REJECTED task {task_id} is not open")
+        with Database(root / "db.sqlite") as db:
+            self.assertEqual(db.get_state("children_scored"), 1)
+            self.assertEqual(db.list_trials(task_id), [])
+
     def test_atomic_trial_reservations_and_parallel_submissions(self):
         root = self.start("search.workers=2", "stop.max_children=2")
         task_id, directory = self.task(root)
@@ -304,8 +344,8 @@ class EndToEndTests(PipelineTestCase):
         self.assertEqual(summary["children_ok"], 0)
 
     def test_maintenance_abandonment_reset_and_snapshot_retention(self):
-        root = self.tuned_start("maintenance", "daemon.SNAPSHOT_PERIOD_S = 0.1",
-                                "search.reset_period_s=0.15")
+        root = self.tuned_start("maintenance", "daemon.SNAPSHOT_PERIOD_S = 0.1; "
+                                "daemon.ABANDON_PERIOD_S = 0.1", "search.reset_period_s=0.15")
         task_id, _ = self.task(root)
         with Database(root / "db.sqlite") as db:
             db.connection.execute("UPDATE tasks SET created_at=? WHERE id=?", (time.time() - 2000, task_id))

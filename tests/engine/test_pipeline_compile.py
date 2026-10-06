@@ -26,6 +26,38 @@ class CompileTests(PipelineTestCase):
         self.assertIn("error", log)
         self.assertLessEqual(len(log), 4096)
 
+    def test_source_policy_blocks_file_reads_into_compiler_log(self):
+        secret = self.root / "secret.txt"
+        secret.write_text("TOP-SECRET-CONTENT\n")
+        (self.root / "sub").mkdir()
+        blocked = (f'#include "{secret}"\n',
+                   f"#include <{secret}>\n",
+                   '#include "../secret.txt"\n',
+                   f'#  /* split\n */ include "{secret}"\n',
+                   f'#\\\ninclude "{secret}"\n',
+                   f'%:include "{secret}"\n',
+                   f'#include_next "{secret}"\n',
+                   f'#define P "{secret}"\n#include P\n',
+                   f'#embed "{secret}"\n',
+                   f'__asm__(".incbin \\"{secret}\\"");\n')
+        for text in blocked:
+            with self.subTest(text=text):
+                source = self.root / "sub" / "candidate.c"
+                source.write_text(text + "double f(void) { return 1; }\n")
+                for mode in ("try", "final"):
+                    ok, library, log = compile_candidate(self.cfg, source, self.root / "policy", mode)
+                    self.assertFalse(ok)
+                    self.assertIn("source policy", log)
+                    self.assertNotIn("TOP-SECRET", log)
+                    self.assertFalse(library.exists())
+        allowed = self.source('#include <math.h>\n#include "candidate.h"\n'
+                              '// #include "/etc/passwd" in a comment is inert\n'
+                              'const char *s = "#include </etc/passwd>";\n'
+                              'double f(void) { return sqrt(4.0); }\n')
+        (allowed.parent / "candidate.h").write_text("double f(void);\n")
+        ok, _, log = compile_candidate(self.cfg, allowed, self.root / "allowed", "final")
+        self.assertTrue(ok, log)
+
     def test_missing_export_and_undefined_export(self):
         for source in ("double other(void) { return 1; }",
                        "extern double f(void); double other(void) { return f(); }"):

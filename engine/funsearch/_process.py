@@ -20,6 +20,30 @@ def environment(extra_env=None):
     return result
 
 
+# Candidate code runs inside evaluator workers as the host user. Do not hand it
+# Gas City identity, store scope or credentials it never needs to score.
+_PRIVATE_PREFIXES = ("GC_", "BEADS_", "ANTHROPIC_", "CLAUDE_", "FS_GC", "FS_CITY_PATH",
+                     "FS_RIG", "FS_NOTIFY")
+_PRIVATE_NAMES = ("SSH_AUTH_SOCK", "GPG_AGENT_INFO")
+_PRIVATE_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "CREDENTIAL")
+
+
+def worker_environment(extra_env=None):
+    """Like environment(), minus city identity and credential-like variables."""
+    result = environment()
+    for key in list(result):
+        upper = key.upper()
+        if (upper.startswith(_PRIVATE_PREFIXES) or upper in _PRIVATE_NAMES
+                or any(word in upper for word in _PRIVATE_WORDS)):
+            del result[key]
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            result.pop(key, None)
+        else:
+            result[key] = str(value)
+    return result
+
+
 def kill_group(process):
     """Kill descendants too, including when the group leader already exited."""
     try:
