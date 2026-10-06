@@ -10,6 +10,7 @@ import subprocess
 from .config import ConfigError
 
 CONTEXT_FILE = ".funsearch-slot.json"
+RETIRED_FILE = ".funsearch-retired.json"
 
 
 def gc(*args):
@@ -88,6 +89,12 @@ def slot_command(command, bead):
                f"--if-assignee={row['assignee']}", "--if-status=in_progress")
     else:
         raise ConfigError("unknown slot command")
+    # Deferred nudges can reach a provider before the controller finishes its
+    # drain. Leave a receipt so the tool guard cannot let that context reclaim
+    # another task; a different pool session ignores this old session receipt.
+    retired = Path.cwd() / RETIRED_FILE
+    retired.write_text(json.dumps({"session": context["session"], "bead": bead}) + "\n")
+    retired.chmod(0o600)
     path.unlink(missing_ok=True)
     print(f"SLOT_{command.upper()} {bead}")
     return 0

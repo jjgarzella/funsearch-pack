@@ -11,6 +11,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unittest
+from unittest.mock import patch
 
 from engine.funsearch.db import Database
 from engine.funsearch.runtime import pid_alive
@@ -68,6 +70,8 @@ class EndToEndTests(PipelineTestCase):
                     time.sleep(0.03)
                 if (root / "engine.pid").exists():
                     os.kill(int((root / "engine.pid").read_text()), signal.SIGTERM)
+            if (root / "engine.log").exists():
+                self.exit_evidence(root)
 
     def task(self, root):
         output = self.cli("next-task", root, "--slot", "scripted")
@@ -373,6 +377,26 @@ class EndToEndTests(PipelineTestCase):
                 self.assertIsNone(evidence["signal"])
                 self.assertIn(f"received {signal.Signals(signum).name}",
                               (root / "engine.log").read_text())
+
+    @unittest.skipUnless(Path("/proc/self/environ").exists(), "Linux process environment check")
+    def test_detached_processes_do_not_inherit_launcher_identity(self):
+        identity = {"GC_SESSION_ID": "fs-test-launcher", "GC_SESSION_NAME": "fs-launcher",
+                    "GC_AGENT": "fs-launcher", "GC_AGENT_NAME": "fs-launcher", "GC_ALIAS": "fs-launcher"}
+        with patch.dict(os.environ, {**identity, "FS_NOTIFY": "test-notify", "GC_RIG": "test-rig"}):
+            root = self.start("stop.max_children=1")
+        pid = int((root / "engine.pid").read_text())
+        observer = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        for target in (pid, observer):
+            entries = Path(f"/proc/{target}/environ").read_bytes().split(b"\0")
+            env = dict(entry.split(b"=", 1) for entry in entries if b"=" in entry)
+            for key in identity:
+                self.assertNotIn(key.encode(), env)
+            self.assertEqual(env[b"FS_NOTIFY"], b"test-notify")
+            self.assertEqual(env[b"GC_RIG"], b"test-rig")
+        task, directory = self.task(root)
+        self.cli("submit", root, task, self.child(directory))
+        self.finished(root)
+        self.assertEqual(self.exit_evidence(root)["exitcode"], 0)
 
     def test_uncatchable_death_and_fatal_trace_are_recorded(self):
         for signum in (signal.SIGKILL, signal.SIGABRT):

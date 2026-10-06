@@ -296,6 +296,36 @@ def serve(run_dir, ready_fd):
                         os.close(ready_fd)
 
 
+def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s):
+    """Wait for a detached engine with no launching-agent process identity."""
+    global SNAPSHOT_PERIOD_S, STOP_GRACE_S
+    SNAPSHOT_PERIOD_S, STOP_GRACE_S = snapshot_period_s, stop_grace_s
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    engine = os.fork()
+    if engine != 0:
+        os.close(writer)
+        _, wait_status = os.waitpid(engine, 0)
+        exitcode = os.waitstatus_to_exitcode(wait_status)
+        evidence = {"pid": engine, "ended_at": time.time(),
+                    "exitcode": exitcode,
+                    "signal": -exitcode if exitcode < 0 else None}
+        Path("engine-exit.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        log_event(f"engine pid={engine} exited exitcode={exitcode} signal={evidence['signal']}")
+        os._exit(0)
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        serve(run_dir, writer)
+    except BaseException:
+        traceback.print_exc()
+        try:
+            os.write(writer, b"FAILED daemon startup\n")
+        except OSError:
+            pass
+    finally:
+        os._exit(0)
+
+
 def daemonize(run_dir):
     """Detach an engine and a small exit observer; wait only for readiness."""
     import select
@@ -312,23 +342,21 @@ def daemonize(run_dir):
                 os.dup2(null.fileno(), 0)
                 os.dup2(log.fileno(), 1)
                 os.dup2(log.fileno(), 2)
-            sys.stdout.reconfigure(line_buffering=True, write_through=True)
-            sys.stderr.reconfigure(line_buffering=True, write_through=True)
-            engine = os.fork()
-            if engine != 0:
-                # A detached parent can record even SIGKILL, which the engine
-                # cannot catch. It holds no DB connection or evaluator workers.
-                os.close(writer)
-                _, wait_status = os.waitpid(engine, 0)
-                exitcode = os.waitstatus_to_exitcode(wait_status)
-                evidence = {"pid": engine, "ended_at": time.time(),
-                            "exitcode": exitcode,
-                            "signal": -exitcode if exitcode < 0 else None}
-                Path("engine-exit.json").write_text(json.dumps(evidence, indent=2) + "\n")
-                log_event(f"engine pid={engine} exited exitcode={exitcode} signal={evidence['signal']}")
-                os._exit(0)
-            faulthandler.enable(file=sys.stderr, all_threads=True)
-            serve(run_dir, writer)
+            # A double fork/setsid detaches process groups, but Gas City's
+            # orphan sweep also finds processes by inherited GC_SESSION_ID.
+            # Exec with a clean identity: unsetting os.environ after fork alone
+            # leaves the initial /proc/<pid>/environ bytes on Linux unchanged.
+            env = os.environ.copy()
+            for key in ("GC_SESSION_ID", "GC_SESSION_NAME", "GC_AGENT", "GC_AGENT_NAME", "GC_ALIAS"):
+                env.pop(key, None)
+            os.set_inheritable(writer, True)
+            bootstrap = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                         "from funsearch.daemon import observe_engine; "
+                         "observe_engine(sys.argv[2], int(sys.argv[3]), "
+                         "float(sys.argv[4]), float(sys.argv[5]))")
+            os.execve(sys.executable, [sys.executable, "-c", bootstrap,
+                      str(Path(__file__).resolve().parents[1]), str(run_dir), str(writer),
+                      str(SNAPSHOT_PERIOD_S), str(STOP_GRACE_S)], env)
         except BaseException:
             traceback.print_exc()
             try:

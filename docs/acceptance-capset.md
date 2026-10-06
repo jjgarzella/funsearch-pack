@@ -386,3 +386,122 @@ and no fresh replacement measurement. Kurt was mailed the SIGBUS evidence
 and OOM-counter delta. Keep the acceptance bead open and do not dispatch
 successors. Only local pack commits were made; the city import remains in
 place and nothing was pushed or committed in math-city/math-experiments.
+
+
+## Host-mount WAL reproduction and rollback-journal fix
+
+Coordinator direction on 2026-10-05 23:50/23:53 UTC requested a two-process
+stdlib probe and replacement of WAL before another original-parameter run.
+`/tmp/fs-mc-h4zx.11-wal-probe.py` initialized the same one-row WAL database
+on each filesystem and ran a writer (UPDATE/commit loop) and a reader
+(close/open/SELECT loop) concurrently for 90 seconds. The two filesystem
+probes ran in parallel and ended at 23:53:06 UTC.
+
+| Database location | Writer exit | Reader exit | Writer iterations | Reader iterations |
+| --- | ---: | ---: | ---: | ---: |
+| Pack run directory, `fakeowner` host mount | **-7 (SIGBUS)** | 0 | died before counter output | 24,842 |
+| `/tmp`, overlay filesystem | 0 | 0 | 338,759 | 1,370,238 |
+
+The mounted writer's faulthandler trace points to its SQLite UPDATE/commit
+line. This reproduces a mount-specific WAL SIGBUS without Julia or the
+FunSearch engine; `/tmp/fs-mc-h4zx.11-wal-probe.log` retains the full trace
+and process exit records. Together with the earlier engine SQLite trace,
+it supports the coordinator's WAL shared-memory-mapping diagnosis. The
+probe does not locate the failing mmap address or retrospectively prove
+the original uninstrumented engine's cause.
+
+Local pack commit `d3794d0` changes the shared writable Database wrapper to
+`PRAGMA journal_mode=DELETE`, retaining the 5000 ms busy timeout and foreign
+keys. A writable open migrates an existing WAL database. SQLite backup
+destinations also use DELETE. Status, best, and rescore use read-only
+`file:...?mode=ro` connections without schema writes; the mutator guard
+and slot inspection already used read-only connections. The engine, start,
+next-task, try, submit, stop, and crash recovery all use the shared writable
+wrapper. No sweep script logic changed; the previously passed kill/sweep
+gate is retained per coordinator direction.
+
+Regression checks cover legacy WAL migration with committed data,
+read-only write refusal and missing-file handling, snapshot journal mode,
+and absence of `db.sqlite-shm`/`db.sqlite-wal` throughout a real ten-child
+toy run. README and the DB code comment explain host-mounted run dirs.
+
+The prescribed `make worker && make -C examples/cap-set/evaluator && make test`
+passed: 104 Python tests, 21 Julia assertions, nine cap-set checks, the
+skill-template check, and 13 worker checks. Final strengthened read-only
+snapshot and toy assertions also passed in focused seven-DB and ten-child
+integration checks. `gc lint` and `git diff --check` passed. Logs:
+`/tmp/fs-mc-h4zx.11-delete-make-test.log`,
+`/tmp/fs-mc-h4zx.11-delete-db-test.log`, and
+`/tmp/fs-mc-h4zx.11-delete-toy-test.log`. Direct embedded Julia remains the
+justified fallback because Kaimon excludes this exact project/worktree.
+
+
+## DELETE rerun: improvement, then inherited-identity orphan cleanup
+
+Formula `mx-88l`, start step `mx-y2c`, launched
+`20261005-235719-ce28` from `d3794d0` with the original 3600-second /
+100-child / three-mutator parameters (N=1, two workers per pool, memory4096).
+Run bead `mx-6n8w`, slots `.1`–`.3`, engine23779, observer23774.
+The memory baseline was oom_kill3 at23:55:58Z; sampling began at23:58:46Z
+(the first background sampler did not survive the tool process group;
+replacement used start_new_session). The run began23:57:20.996Z.
+
+At00:03:42Z, the engine logged `received SIGTERM; requesting shutdown`.
+The supervisor log directly records:
+
+```text
+session reconciler: reaped process-table orphan pid=23774 session=mc-wisp-88c3a5
+session reconciler: reaped process-table orphan pid=23779 session=mc-wisp-88c3a5
+```
+
+`/tmp/fs-mc-h4zx.11-delete-supervisor.log` retains the evidence.
+Core `cmd/gc/session_beads.go:sweepProcessTableOrphans` selects untracked
+processes with the launching session's GC_SESSION_ID after its bead closes.
+The detached engine and observer inherited that identity. Double fork and
+setsid detached process groups but did not remove the process-table identity.
+This is a confirmed second lifecycle bug, separate from the reproduced WAL
+SIGBUS. The observer was reaped before it could write engine-exit.json.
+
+Normal signal shutdown wrote a stopped/stop requested summary, ran the finish
+hook without a forced sweep, closed run and slots, sent kurt completion mail,
+and removed the registry. All memory samples kept oom_kill3 (delta0).
+The stopped outcome occurred after381.402s,
+not at the configured duration/child limit, so it does not pass unattended
+configured-stop acceptance.
+
+| Metric | Value |
+| --- | ---: |
+| Best / seed |79 /64 |
+| Scored / OK submissions |27 /27 |
+| OK rate |1.0 |
+| Throughput/hour |254.849 |
+| Stored evolved programs |2 |
+| Tasks / completed |4 /2 |
+| Reserved / recorded tries |12 /12 |
+| Mean tries per task |3.0 |
+| Initial startup, slots1/2/3 |39.478 /40.394 /41.805 seconds |
+| Mean initial startup |40.559 seconds |
+| Slot1 release to next-task |68.252 seconds, **same session/context** |
+
+39 completed evaluation results (27 submissions, including duplicate rejects,
+and12 trials) and all six stored programs were independently recompiled and
+rescored; status, score, signature matched. Best plus all three available
+distinct top candidates matched the CLI rescore; a top ten did not yet exist.
+All147 generated exact cap dumps passed `tools/check_cap.py`.
+`acceptance-rescore.json`, `acceptance-metrics.json`, and
+`acceptance-slot{1,2,3}-history.json` preserve the verification.
+
+The slot1 reclaim reused both its session ID and Claude session key after
+N=1 completed task; a late nudge arrived before controller drain completed.
+This is a confirmed fresh-context boundary bug. The next fix uses a successful
+release/close receipt in the guard to permit only drain for that retiring
+session; another pool session can claim normally. The next engine fix execs
+the observer with launcher identity removed (preserving city/rig/notify),
+and verifies /proc environments for observer and engine. Linux environment
+scrubbing requires exec: changing os.environ after fork alone leaves the
+initial process environment visible in /proc.
+
+Original crash/sweep gate remains passed; no sweep logic changed. Neither
+this improving run nor the offline gates waive the unattended-stop and
+fresh-session measurement requirements. Another original-parameter run is
+required after these fixes.

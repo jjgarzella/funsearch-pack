@@ -64,6 +64,19 @@ class MutatorGuardTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 self.check("Bash", command=command)
 
+    def test_released_session_can_only_drain_and_fresh_session_can_claim(self):
+        retired = self.home / ".funsearch-retired.json"
+        retired.write_text(json.dumps({"session": "session-1", "bead": "fs-slot.1"}))
+        self.command("gc", "runtime", "drain-ack")
+        for argv in (("gc", "hook", "--claim", "--drain-ack", "--json"),
+                     (str(PACK / "bin/funsearch"), "slot", "show", "fs-slot.1")):
+            with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, "released/closed"):
+                self.command(*argv)
+        with self.assertRaisesRegex(ValueError, "released/closed"):
+            self.check("Read", file_path=str(self.directory / "TASK.md"))
+        with patch.dict(os.environ, GC_SESSION_ID="fresh-session"):
+            self.command("gc", "hook", "--claim", "--drain-ack", "--json")
+
     def test_denies_evaluator_settings_cross_slot_and_wrong_task(self):
         for tool, path in (("Read", self.run / "../../evaluator/source.c"),
                            ("Write", self.home / ".claude/settings.json"),

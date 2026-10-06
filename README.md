@@ -141,6 +141,9 @@ faulthandler writes fatal-signal stack traces there. A small detached parent
 waits for the engine and writes `engine-exit.json` with its PID, end time,
 exit code, and signal (including SIGKILL). This evidence requires that the
 parent survives; a SIGKILL record alone does not establish an OOM cause.
+The detached observer execs without the launching agent's session identity,
+so Gas City orphan cleanup cannot mistake the search for a retired agent.
+City, rig, and notification context remain available to lifecycle hooks.
 
 Optional `--on-start 'command'` and `--on-finish 'command'` hooks receive the
 absolute run directory as an argument and in `FS_RUN_DIR`. The finish hook
@@ -190,6 +193,10 @@ ownership and the terminal update happen atomically. An already closed slot
 (for example, by the finish hook) is a read-only success. Neither helper drains;
 the agent calls `gc runtime drain-ack` only after a successful transition.
 These adapters are the only engine CLI subcommands that call Gas City.
+After a successful release or close, a session receipt makes the tool guard
+permit only `gc runtime drain-ack` for that retiring session. This prevents
+late nudges from reusing its context before the controller completes the drain;
+a new pool session can claim normally.
 
 ## Security notes
 

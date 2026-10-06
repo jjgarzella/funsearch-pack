@@ -57,14 +57,17 @@ def task_file(value, home, data, *, write=False):
 
 def authorize(event, home, pack):
     tool, inputs = event["tool_name"], event["tool_input"]
+    argv = literal_command(inputs["command"]) if tool == "Bash" else None
+    if argv == ["gc", "runtime", "drain-ack"]:
+        return
+    retired = home / ".funsearch-retired.json"
+    if retired.exists() and json.loads(retired.read_text())["session"] == os.environ.get("GC_SESSION_ID"):
+        raise ValueError("this session released/closed its slot; run gc runtime drain-ack and stop")
     if tool in ("Read", "Write", "Edit"):
         task_file(inputs["file_path"], home, context(home), write=tool != "Read")
         return
     if tool != "Bash":
         raise ValueError("mutator only has Bash, Read, Write, Edit")
-    argv = literal_command(inputs["command"])
-    if argv == ["gc", "runtime", "drain-ack"]:
-        return
     if (argv[:2] == ["gc", "hook"] and "--claim" in argv[2:]
             and "--json" in argv[2:] and len(argv[2:]) == len(set(argv[2:]))
             and set(argv[2:]) <= {"--claim", "--json", "--drain-ack"}):

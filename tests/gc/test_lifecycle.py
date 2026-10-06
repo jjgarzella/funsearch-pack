@@ -267,6 +267,11 @@ class ToyHookTests(HookFixture, PipelineTestCase):
                 time.sleep(0.03)
             if (self.run / "engine.pid").exists():
                 os.kill(int((self.run / "engine.pid").read_text()), signal.SIGKILL)
+        if self.run and (self.run / "engine.log").exists():
+            deadline = time.monotonic() + 10
+            while not (self.run / "engine-exit.json").exists() and time.monotonic() < deadline:
+                time.sleep(0.03)
+            self.assertTrue((self.run / "engine-exit.json").exists(), "exit observer still running")
 
     def start(self):
         self.run = self.problem / "runs" / "gc-toy"

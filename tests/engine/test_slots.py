@@ -80,6 +80,8 @@ else:
         self.assertNotIn("gc.work_dir", row["metadata"])
         self.assertNotIn("gc.work_branch", row["metadata"])
         self.assertFalse(context.exists())
+        self.assertEqual(json.loads((self.home / ".funsearch-retired.json").read_text()),
+                         {"session": "session-1", "bead": "fs-slot.1"})
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertIn("--if-assignee=session-1", calls[-1])
         self.assertIn("--if-status=in_progress", calls[-1])
@@ -135,6 +137,7 @@ else:
         self.assertIn("guard lost ownership", result.stderr)
         self.assertEqual(json.loads(self.store.read_text())["status"], "in_progress")
         self.assertTrue((self.home / ".funsearch-slot.json").exists())
+        self.assertFalse((self.home / ".funsearch-retired.json").exists())
 
     def test_missing_session_does_not_call_gc(self):
         self.assertEqual(self.call("show", GC_SESSION_ID="").returncode, 2)
