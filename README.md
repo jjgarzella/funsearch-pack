@@ -195,6 +195,11 @@ faulthandler writes fatal-signal stack traces there. A small detached parent
 waits for the engine and writes `engine-exit.json` with its PID, end time,
 exit code, and signal (including SIGKILL). This evidence requires that the
 parent survives; a SIGKILL record alone does not establish an OOM cause.
+A record naming the engine's PID is definitive: waiting clients, `run
+status`, `run recover` and the Gas City sweep treat that engine as dead even
+if the PID has since been reused, and only fall back to probing the PID
+when no record exists. The PID copies (database `pid` state, `engine.pid`,
+run-bead `fs.pid`, registry `pid`) only name the engine.
 The detached observer execs without the launching agent's session identity,
 so Gas City orphan cleanup cannot mistake the search for a retired agent.
 City, rig, and notification context remain available to lifecycle hooks.

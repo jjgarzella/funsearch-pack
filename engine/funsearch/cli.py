@@ -21,7 +21,7 @@ from .db import Database
 from .evaluator import build_evaluator, evaluator_digest, snapshot_evaluator
 from .evolve import seed_islands
 from .normalize import normalized_hash
-from .runtime import (STARTING, Rejected, RunOver, is_terminal, pid_alive, read_run,
+from .runtime import (STARTING, Rejected, RunOver, engine_alive, is_terminal, read_run,
                       require_running, top_programs)
 from .tasks import create_task
 from .workers import WorkerPool, worker_binary
@@ -178,7 +178,7 @@ def wait_result(db, evaluation):
             return current.result
         if is_terminal(db.get_state("status")):
             raise RunOver("RUN_OVER")
-        if not pid_alive(db.get_state("pid")):
+        if not engine_alive(db.path.parent, db.get_state("pid")):
             raise RuntimeError("engine process is not alive")
         now = time.time()
         if (current.state == "running" and now - current.started_at > claim_timeout_s) or now > end_by:
@@ -251,7 +251,7 @@ def evaluate(args, root, cfg, db):
 def recover_run(args):
     root, metadata, cfg = read_run(args.run_dir, require_db=False)
     pid_file = root / "engine.pid"
-    if pid_file.exists() and pid_alive(pid_file.read_text().strip()):
+    if pid_file.exists() and engine_alive(root, pid_file.read_text().strip()):
         raise ConfigError(f"engine is still running: {root}")
     # A cleanly finished run removes engine.pid too; never relabel its outcome.
     try:
@@ -291,7 +291,7 @@ def dispatch(args):
             print("STOP_REQUESTED")
         elif args.command == "run":
             status = db.all_state()
-            status.update(run_id=metadata["run_id"], pid_alive=pid_alive(status.get("pid")))
+            status.update(run_id=metadata["run_id"], pid_alive=engine_alive(root, status.get("pid")))
             print(json.dumps(status))
         elif args.command == "best":
             if args.k <= 0:

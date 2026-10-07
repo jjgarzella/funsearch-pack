@@ -22,7 +22,7 @@ import tomllib
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK / "engine"))
 from funsearch.db import Database  # noqa: E402
-from funsearch.runtime import FAILED, RUNNING, is_terminal, pid_alive  # noqa: E402
+from funsearch.runtime import FAILED, RUNNING, engine_alive, is_terminal  # noqa: E402
 
 # run.json is the engine's write-once manifest. This layer keeps its own
 # bead/slot/delivery bookkeeping beside it, under the run's lifecycle lock.
@@ -305,9 +305,10 @@ def sweep():
             for registry in sorted((state / "active").glob("*.json")):
                 try:
                     entry = read_json(registry)
-                    if pid_alive(entry["pid"]):
-                        continue
                     root = Path(entry["run_dir"]).resolve()
+                    # The engine's exit record beats a PID a new process may reuse.
+                    if engine_alive(root, entry["pid"]):
+                        continue
                     with lock(root / ".gc-lifecycle.lock"):
                         metadata = read_json(root / "run.json")
                         summary = read_json(root / "summary.json") if (root / "summary.json").exists() else {}

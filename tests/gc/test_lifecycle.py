@@ -246,6 +246,17 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.hook("sweep")
         self.assertEqual(len(self.mails()), 2)
 
+    def test_sweep_trusts_the_exit_record_over_a_reused_pid(self):
+        root = self.run_dir("reused")  # engine.pid names this live test process
+        self.hook("on-start", root)
+        self.hook("sweep")
+        self.assertFalse((root / "summary.json").exists())
+        (root / "engine-exit.json").write_text(json.dumps({"pid": os.getpid(), "exitcode": -9}))
+        self.hook("sweep")
+        failed = json.loads((root / "summary.json").read_text())
+        self.assertEqual((failed["status"], failed["reason"]), ("failed", "engine died"))
+        self.assertFalse((self.registry / "reused.json").exists())
+
     def test_sweep_keeps_failed_delivery_entry_and_touches_timestamp(self):
         root = self.run_dir(pid=99999999)
         self.hook("on-start", root)

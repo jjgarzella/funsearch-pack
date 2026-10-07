@@ -63,6 +63,22 @@ def pid_alive(pid):
         return False
 
 
+def engine_alive(run_dir, pid):
+    """Whether the run's engine process pid is still running.
+
+    The detached observer writes engine-exit.json when its engine exits. A
+    record naming this pid is definitive even if the PID has since been reused
+    by an unrelated process; without one, fall back to a liveness probe.
+    """
+    try:
+        record = json.loads((Path(run_dir) / "engine-exit.json").read_text())
+        if pid and str(record.get("pid")) == str(pid).strip():
+            return False
+    except (OSError, ValueError, AttributeError):
+        pass
+    return pid_alive(pid)
+
+
 def run_hook(command, run_dir):
     if not command:
         return

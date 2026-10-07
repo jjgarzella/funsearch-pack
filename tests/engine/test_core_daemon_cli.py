@@ -149,6 +149,10 @@ class RecoverTests(unittest.TestCase):
         (self.run / "engine.pid").write_text(str(os.getpid()))
         self.assertIn("still running", self.recover(code=2).stderr)
         self.assertFalse((self.run / "summary.json").exists())
+        # The exit record shows the PID now belongs to some other process.
+        (self.run / "engine-exit.json").write_text(json.dumps({"pid": os.getpid(), "exitcode": -9}))
+        self.recover()
+        self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
 
     def test_finished_run_keeps_its_outcome(self):
         seed_database(self.run / "db.sqlite", 2)
@@ -186,7 +190,7 @@ class WaitResultTests(unittest.TestCase):
             self.now += 10
             engine(self.now)
         clock = SimpleNamespace(time=lambda: self.now, sleep=sleep)
-        with patch.object(cli, "time", clock), patch.object(cli, "pid_alive", return_value=True):
+        with patch.object(cli, "time", clock), patch.object(cli, "engine_alive", return_value=True):
             return cli.wait_result(self.db, self.evaluation)
 
     def test_queue_time_is_not_charged(self):
@@ -215,8 +219,14 @@ class WaitResultTests(unittest.TestCase):
         with self.assertRaises(cli.RunOver):
             self.wait()
         self.db.set_state("status", "running")
-        with patch.object(cli, "pid_alive", return_value=False), \
+        with patch.object(cli, "engine_alive", return_value=False), \
                 self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
+            cli.wait_result(self.db, self.evaluation)
+        # A live process under the recorded PID is not the engine once the
+        # exit observer has recorded that PID's exit.
+        self.db.set_state("pid", os.getpid())
+        (self.db.path.parent / "engine-exit.json").write_text(json.dumps({"pid": os.getpid()}))
+        with self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
             cli.wait_result(self.db, self.evaluation)
 
     def test_engine_without_published_deadlines_is_reported(self):
