@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from engine.funsearch.db import SCHEMA_VERSION, Database, SchemaMismatch
+from engine.funsearch.db import BACKUP_RESTARTS, SCHEMA_VERSION, Database, SchemaMismatch
 from engine.funsearch.runtime import top_programs
 
 
@@ -98,6 +98,29 @@ class DatabaseTests(unittest.TestCase):
         with Database(backup, readonly=True) as saved:
             self.assertEqual(saved.get_state("children"), 3)
         self.assertEqual(self.db.get_state("absent", "fallback"), "fallback")
+
+    def test_backup_restarted_by_client_writes_finishes_in_one_pass(self):
+        for n in range(50):
+            self.db.set_state(f"filler-{n}", "x" * 2000)
+        writes = 0
+        with Database(self.path) as client:
+            def client_write(_seconds):
+                # Every pause between steps admits a client write, which
+                # restarts the stepped copy from its first page.
+                nonlocal writes
+                writes += 1
+                self.assertLess(writes, 50, "backup never finished")
+                client.set_state("writes", writes)
+
+            backup = Path(self.temp.name) / "busy.sqlite"
+            with patch("engine.funsearch.db.BACKUP_PAGES", 1), \
+                    patch("engine.funsearch.db.time.sleep", client_write):
+                self.db.backup(backup)
+        self.assertEqual(writes, BACKUP_RESTARTS + 1)
+        with Database(backup, readonly=True) as saved:
+            self.assertEqual(saved.get_state("writes"), writes)
+            self.assertEqual(saved.get_state("filler-49"), "x" * 2000)
+        self.assertEqual(sorted(p.name for p in backup.parent.glob("busy.sqlite*")), ["busy.sqlite"])
 
     def test_readonly_client_and_missing_file(self):
         self.db.set_state("status", "running")

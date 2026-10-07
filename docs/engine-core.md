@@ -31,7 +31,9 @@ supplied. Problem name and instance default to empty strings when omitted.
 5000 ms busy timeout. Writable opens migrate existing WAL databases. Read-only
 clients use `readonly=True` and a `mode=ro` URI without schema changes.
 `Database.backup` copies `BACKUP_PAGES` (1024) pages per step with a short
-pause, into a temporary file renamed into place. The daemon retries a tick that
+pause, into a temporary file renamed into place. A client write restarts the
+stepped copy; after `BACKUP_RESTARTS` (3) restarts it finishes in one pass that
+blocks writers, so a snapshot in the engine's tick stays bounded. The daemon retries a tick that
 raises `database is locked`/`busy` and fails the run only after `BUSY_RETRY_S`
 (60 s) without a successful tick; each tick step commits atomically, and a
 result whose store failed stays pending for the retry.

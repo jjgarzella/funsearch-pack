@@ -134,9 +134,15 @@ _RANK_ORDER = "ORDER BY score DESC, source_length, id"
 # PRAGMA user_version of the layout above. Version 0 is any database written
 # before the layout was versioned, with or without trial_n and source_length.
 SCHEMA_VERSION = 1
-# Snapshot copy step (pages per step, pause between steps); see Database.backup.
+# Snapshot copy step (pages per step, pause between steps, and restarts by
+# client writes before finishing in one pass); see Database.backup.
 BACKUP_PAGES = 1024
 BACKUP_SLEEP_S = 0.005
+BACKUP_RESTARTS = 3
+
+
+class _BackupRestarted(Exception):
+    """Client writes restarted a stepped copy more than BACKUP_RESTARTS times."""
 
 
 def _statements(script):
@@ -528,19 +534,42 @@ class Database:
     def backup(self, path) -> None:
         """Copy the database to path in steps, then rename it into place.
 
-        Each step holds the source read lock for BACKUP_PAGES pages only, so
-        client writers wait for a step rather than a whole-database copy. A
-        client write between steps restarts the copy, which stays cheap at the
-        write rates mutators produce. A failed copy never leaves a partial
-        snapshot under path.
+        Each step copies BACKUP_PAGES pages under the source read lock and then
+        pauses BACKUP_SLEEP_S, so client writers wait for a step rather than a
+        whole-database copy. A write by another connection restarts the copy
+        from its first page; after BACKUP_RESTARTS restarts the copy finishes
+        in one pass that blocks writers, so steady client writes cannot keep
+        the engine's tick in an unbounded copy. A failed copy never leaves a
+        partial snapshot under path.
         """
         path = Path(path)
         temporary = path.with_name(path.name + ".tmp")
         try:
-            with closing(sqlite3.connect(str(temporary))) as destination:
-                destination.execute("PRAGMA journal_mode=DELETE")
-                self.connection.backup(destination, pages=BACKUP_PAGES, sleep=BACKUP_SLEEP_S)
-                destination.execute("PRAGMA journal_mode=DELETE")
+            try:
+                self._copy(temporary, BACKUP_PAGES)
+            except _BackupRestarted:
+                self._copy(temporary, -1)
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _copy(self, destination_path, pages):
+        last, restarts = None, 0
+
+        def progress(status, remaining, _total):
+            nonlocal last, restarts
+            # A completed step that made no progress started over.
+            if status == sqlite3.SQLITE_OK and last is not None and remaining >= last:
+                restarts += 1
+                if restarts > BACKUP_RESTARTS:
+                    raise _BackupRestarted
+            last = remaining
+            if remaining:
+                time.sleep(BACKUP_SLEEP_S)
+
+        destination_path.unlink(missing_ok=True)
+        with closing(sqlite3.connect(str(destination_path))) as destination:
+            destination.execute("PRAGMA journal_mode=DELETE")
+            self.connection.backup(destination, pages=pages, sleep=BACKUP_SLEEP_S,
+                                   progress=progress if pages > 0 else None)
+            destination.execute("PRAGMA journal_mode=DELETE")
