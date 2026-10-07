@@ -150,6 +150,17 @@ class RecoverTests(unittest.TestCase):
         self.assertIn("still running", self.recover(code=2).stderr)
         self.assertFalse((self.run / "summary.json").exists())
 
+    def test_finished_run_keeps_its_outcome(self):
+        seed_database(self.run / "db.sqlite", 2)
+        summary = json.dumps({"status": "completed", "reason": "children budget reached"})
+        (self.run / "summary.json").write_text(summary)
+        self.assertIn("already finished with status completed", self.recover(code=2).stderr)
+        self.assertEqual((self.run / "summary.json").read_text(), summary)
+        # A summary that is not terminal (e.g. torn or never finished) still recovers.
+        (self.run / "summary.json").write_text("{")
+        self.recover()
+        self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
+
 
 class WaitResultTests(unittest.TestCase):
     """The client waits within the deadlines the engine published, on a fake clock."""

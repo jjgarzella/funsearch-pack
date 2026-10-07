@@ -253,6 +253,13 @@ def recover_run(args):
     pid_file = root / "engine.pid"
     if pid_file.exists() and pid_alive(pid_file.read_text().strip()):
         raise ConfigError(f"engine is still running: {root}")
+    # A cleanly finished run removes engine.pid too; never relabel its outcome.
+    try:
+        status = json.loads((root / "summary.json").read_text()).get("status")
+    except (OSError, ValueError, AttributeError):
+        status = None
+    if is_terminal(status):
+        raise ConfigError(f"run already finished with status {status}; nothing to recover: {root}")
     database = recover_outputs(root, metadata, cfg)
     print(json.dumps({"run_dir": str(root), "recovered_from": str(database)}))
     return 0

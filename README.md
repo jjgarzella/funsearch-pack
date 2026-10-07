@@ -80,7 +80,8 @@ active runs it checks every controller tick but sweeps at most every 30
 minutes. A dead engine without a terminal summary is marked failed with
 reason `engine died`; `bin/funsearch run recover <run-dir>` rewrites its
 outputs from the live database, or the newest readable snapshot if the engine
-died mid-write. A dead
+died mid-write. It refuses a live engine and a run whose summary is already
+terminal, so it never relabels a finished run. A dead
 engine with a terminal summary has its interrupted finish hook retried with
 that outcome preserved. Live engines are left alone. Sweep errors retain the
 entry for a later retry and appear in order output. The sweep always updates

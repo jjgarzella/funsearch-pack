@@ -77,7 +77,8 @@ The primary operations are:
   (`daemon.recover_outputs`, which the Gas City sweep calls) finishes
   any request the dead engine still held as an error and writes failed outputs
   from the live database, or from the newest readable snapshot when the live
-  one is unreadable.
+  one is unreadable. The CLI verb refuses a run whose `summary.json` status is
+  already terminal, so it never relabels a finished run.
 - State: `set_state`, `get_state`, `increment_state`, `all_state` (every key);
   values are JSON.
 
