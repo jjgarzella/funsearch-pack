@@ -159,6 +159,14 @@ continuously drained, bounded 1 MiB tail; daemon tracebacks appear in
 the next request, to bound retained candidate state without memory-noise
 restarts.
 
+`search.workers` sizes each of the two pools, submit (final) and try
+(sanitizer), and both start eagerly and stay resident for the whole run, so a
+run holds `2 × search.workers` evaluator processes. Capacity does not move
+between pools: idle try workers cannot score a burst of submissions. For a
+heavy evaluator (cap-set embeds Julia with `memory_mb = 4096`), budget about
+`2 × workers × evaluator RSS` per run, times the number of concurrent runs on
+the host.
+
 Run databases and snapshots use SQLite DELETE rollback journaling and a
 5000 ms busy timeout. WAL is avoided because its shared-memory mmap can
 SIGBUS on host-mounted run directories (observed on a Docker Desktop host

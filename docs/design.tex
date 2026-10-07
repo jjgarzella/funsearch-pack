@@ -220,7 +220,7 @@ mutators = 3                     # K = number of slot beads
 tasks_per_session = 1            # N: tasks a mutator session handles before recycling
 trial_budget = 3                 # max `try` calls per task
 parents_per_task = 2
-workers = 2                      # worker processes
+workers = 2                      # worker processes PER POOL (submit + try)
 reset_period_s = 1800            # weakest-half island reset period
 
 [stop]
@@ -327,7 +327,9 @@ records \code{ERROR} with ``timeout'' or ``worker crashed: signal N'', and
 starts a replacement worker. If \code{FS\_MEMORY\_MB} is set, the worker uses its value to apply the
 \code{RLIMIT\_AS} memory limit through \code{setrlimit}. It must not install SIGSEGV handlers:
 embedded Julia uses its own. The daemon creates separate final and sanitizer
-pools, each with \code{search.workers} processes. Sanitizer workers preload
+pools, each with \code{search.workers} processes started eagerly and kept for
+the whole run, so a run holds twice that many resident evaluators and an idle
+pool cannot lend capacity to the other. Sanitizer workers preload
 libasan and remove \code{FS\_MEMORY\_MB}: ASan's virtual shadow mapping otherwise
 fails under \code{RLIMIT\_AS}. Final workers keep the configured address-space
 limit. Trials keep scoring timeouts and bound memory in ASan's terms instead:
