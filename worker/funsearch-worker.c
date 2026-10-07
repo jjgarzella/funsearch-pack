@@ -19,9 +19,10 @@ static FILE *proto;
  * so this only stops trivially forged replies on the inherited protocol fd;
  * the engine's SYNC barrier detects a forged extra line (see main). */
 static char nonce[65];
-/* Requests are read with read(2) into this buffer, never through stdio, and
- * wiped before candidate code runs, so no copy of the token is left behind in
- * a stdin FILE buffer the candidate could scan. */
+/* Requests are read with read(2) into this buffer, never through stdio. The
+ * token is wiped before the candidate library is loaded (so before its
+ * constructors run), so no request copy of it is left for the candidate to
+ * scan; the path is wiped once dlopen is done with it. */
 static char request[PATH_MAX + 128];
 
 static void *resolve(const char *sym)
@@ -339,8 +340,12 @@ int main(int argc, char **argv)
             error_reply("bad request");
             continue;
         }
-        candidate_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        /* Do not leave the token in a request buffer the candidate can scan. */
+        /* dlopen runs candidate constructors: move the path over the token
+         * and wipe everything after it first. */
+        size_t path_length = strlen(path) + 1;
+        memmove(request, path, path_length);
+        wipe(request + path_length, sizeof(request) - path_length);
+        candidate_handle = dlopen(request, RTLD_NOW | RTLD_LOCAL);
         wipe(request, sizeof(request));
         if (!candidate_handle) {
             error_reply(dlerror());

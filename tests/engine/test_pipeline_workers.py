@@ -287,6 +287,88 @@ double f(void) {
         self.assertIsNot(pool.workers[0].process, process)
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
+    def test_request_token_is_wiped_before_candidate_constructors_run(self):
+        # dlopen runs constructors, so the request buffer must no longer hold
+        # "SCORE #<token>" by then. The needle is built at run time so the
+        # candidate's own read-only literal cannot match.
+        source = self.source(r"""#define _GNU_SOURCE
+#include <link.h>
+#include <string.h>
+static int found = -1;
+static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+    char needle[8] = "SCORE ";
+    (void)size; (void)data;
+    needle[6] = '#';
+    if (info->dlpi_name[0]) return 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
+        if (memmem((const char *)(info->dlpi_addr + ph->p_vaddr), ph->p_memsz, needle, 7))
+            return 1;
+    }
+    return 0;
+}
+__attribute__((constructor)) static void probe(void) { found = dl_iterate_phdr(scan, NULL); }
+double f(void) { return found == 0 ? 2 : found; }
+""")
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "ctor-scan", "final")
+        self.assertTrue(ok, log)
+        self.assertEqual(self.pool().score(library, 5)["score"], 2)
+
+    # Known limitation, documented in the README trust model: a candidate
+    # thread can read stdin itself and answer the SYNC barrier while the
+    # worker's main loop stays blocked in f(). Closing it needs the OS-level
+    # isolation tracked as mc-v8f3.5; drop expectedFailure when that lands.
+    @unittest.expectedFailure
+    def test_candidate_reading_stdin_cannot_answer_the_barrier(self):
+        source = self.source(r"""#define _GNU_SOURCE
+#include <link.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static char token[33];
+static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    if (info->dlpi_name[0]) return 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
+        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
+        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
+            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
+                memcpy(token, p + j, 32);
+                return 1;
+            }
+    }
+    return 0;
+}
+static void *steal(void *unused) {
+    char line[128];
+    size_t n = 0;
+    (void)unused;
+    if (!dl_iterate_phdr(scan, NULL)) return NULL;
+    for (int fd = 3; fd < 64; ++fd)
+        dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
+    while (n + 1 < sizeof(line) && read(0, line + n, 1) == 1 && line[n] != '\n')
+        ++n;
+    line[n] = '\0';
+    if (strncmp(line, "SYNC #", 6) == 0)
+        for (int fd = 3; fd < 64; ++fd)
+            dprintf(fd, "{\"sync\":\"%s\"}\n", line + 6);
+    return NULL;
+}
+double f(void) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, steal, NULL);
+    for (;;) pause();
+}
+""")
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "steal-stdin", "final")
+        self.assertTrue(ok, log)
+        result = self.pool().score(library, 5)
+        self.assertNotEqual(result["status"], "OK", result)
+
     def test_late_protocol_output_is_not_charged_to_the_next_request(self):
         source = self.source(r"""#define _DEFAULT_SOURCE
 #include <stdio.h>

@@ -85,7 +85,8 @@ constructors see what the worker will.
 Each request is `SCORE #<token> <path>` with a fresh random token. A reply
 counts only if it echoes that token; anything else is a protocol error, scored
 ERROR, and the worker is replaced. The worker reads requests with `read(2)`
-into a private buffer and wipes it before candidate code runs. After accepting
+into a private buffer and wipes the token before loading the candidate (so
+before its constructors run) and the path right after. After accepting
 a reply, the engine sends `SYNC #<token2>` and requires the next line to be
 `{"sync":"<token2>"}`; a second reply first (candidate code wrote one carrying
 the token) is a protocol error, scored ERROR, and the worker is replaced. The
@@ -93,7 +94,10 @@ barrier waits until the scoring deadline, or at least `SYNC_TIMEOUT_S` (5 s)
 after the reply. Before each request, any protocol output that arrived after
 the last barrier, or a dead worker's EOF, replaces the worker outside the
 deadline instead of being read as the next candidate's reply. Candidates share
-the worker's address space, so this raises the bar without being a boundary.
+the worker's address space, so this raises the bar without being a boundary: a
+candidate thread can, for instance, read stdin and answer the barrier itself
+while `f` never returns (pinned by an expected-failure test until OS-level
+isolation, `mc-v8f3.5`).
 Replies must also carry a finite score (or null for non-OK statuses) and at
 most eight finite signature values; otherwise the result becomes ERROR.
 
