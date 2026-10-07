@@ -18,6 +18,10 @@ _TOKEN = re.compile(
 # instructions) and this parser cannot silently drift.
 _IDEA = re.compile(re.escape(IDEA_PREFIX) + r"\s*(.*)")
 
+# Translation phases vary with compiler modes/extensions. Do not discard
+# comments or spacing when those phases can change the token stream.
+_AMBIGUOUS_PHASES = re.compile(r"\\[ \t\f\v]+(?:\r\n|\r|\n)|\?\?[=/'()!<>-]|\r(?!\n)")
+
 
 def normalize_source(source: str) -> str:
     """Canonical tokens unless preprocessing can observe whitespace or lines.
@@ -26,8 +30,11 @@ def normalize_source(source: str) -> str:
     builtins observe physical lines. Headers can define either kind of macro,
     and token pasting can construct them. Preserve the original source in
     those cases rather than declaring different compiled behaviors duplicates.
+    Compiler-dependent line splicing and trigraphs also preserve raw source.
     """
     original = source
+    if _AMBIGUOUS_PHASES.search(source):
+        return "source\0" + original
     source = source.replace("\\\r\n", "").replace("\\\n", "")
     tokens = []
     directive = False

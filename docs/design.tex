@@ -438,10 +438,11 @@ but not on the overlay filesystem. Snapshots also use DELETE.
 Under rollback journaling readers and the writer exclude each other. The
 engine retries a tick whose database access stays locked past the busy timeout
 and fails the run only after 60 seconds without a successful tick, and
-snapshots copy the database in 1024-page steps so client writers wait for one
-step rather than the whole copy. This is sized for one host and a handful of
-mutators per run; much larger mutator counts or source histories would need
-measuring first.
+snapshots normally copy the database in 1024-page steps so client writers wait
+for one step. After three restarts caused by client writes, the backup finishes
+in one pass that blocks writers for the whole copy. This is sized for one host
+and a handful of mutators per run; much larger mutator counts or source histories
+would need measuring first.
 
 The database stores programs (ID, parent IDs, island, source, normalized hash,
 status, score, signature, message, timestamps), tasks, trials, an evaluation

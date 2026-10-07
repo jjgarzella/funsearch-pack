@@ -5,15 +5,18 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 
-from ._process import LOG_BYTES, run_command, worker_environment
+from ._process import LOG_BYTES, _StderrPrefix, kill_group, run_command, worker_environment
 
 
 COMPILE_TIMEOUT_S = 60
+EXPORT_TIMEOUT_S = 60
 _DIRECTIVE_NAME = re.compile(r"(include_next|include|import|embed)\b")
 _HEADER = re.compile(r'"([^"\n]*)"|<([^>\n]*)>')
 _TRIGRAPH = re.compile(r"\?\?([=/'()!<>-])")
@@ -212,21 +215,57 @@ def check_exports(so_path, exports, env):
                     defined.add(symbol.split("@@", 1)[0])
         missing = [name for name in exports if name not in defined]
     else:
-        script = ("import ctypes,json,sys; lib=ctypes.CDLL(sys.argv[1]); "
-                  "print(json.dumps([n for n in json.loads(sys.argv[2]) "
-                  "if not hasattr(lib,n)]))")
         try:
-            result = subprocess.run([sys.executable, "-c", script, path, json.dumps(exports)],
-                                    capture_output=True, text=True, timeout=60,
-                                    env=env)
-            if result.returncode:
-                return False, f"cannot load library for export check: {result.stderr[:LOG_BYTES]}"
-            missing = json.loads(result.stdout)
+            missing = _ctypes_exports(path, exports, env)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             return False, f"cannot inspect exports: {exc}"
     if missing:
         return False, "missing required exports: " + ", ".join(missing)
     return True, ""
+
+
+def _ctypes_exports(path, exports, env):
+    """Load in a child with bounded diagnostics and a bounded JSON channel."""
+    # Reserve the protocol channel before loading native code. Constructors'
+    # stdout joins stderr, so even large output cannot corrupt the JSON result.
+    script = ("import ctypes,json,os,sys; output=os.dup(1); os.dup2(2,1); "
+              "lib=ctypes.CDLL(sys.argv[1]); "
+              "missing=[n for n in json.loads(sys.argv[2]) if not hasattr(lib,n)]; "
+              "stream=os.fdopen(output,'w'); stream.write(json.dumps(missing)); stream.close()")
+    encoded_exports = json.dumps(exports)
+    limit = len(encoded_exports.encode("utf-8"))
+    process = subprocess.Popen([sys.executable, "-c", script, path, encoded_exports],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, env=env)
+    stderr = _StderrPrefix(process.stderr)
+    output = bytearray()
+    deadline = time.monotonic() + EXPORT_TIMEOUT_S
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, EXPORT_TIMEOUT_S)
+            readable, _, _ = select.select([process.stdout], [], [], remaining)
+            if not readable:
+                raise subprocess.TimeoutExpired(process.args, EXPORT_TIMEOUT_S)
+            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > limit:
+                raise ValueError("export check protocol exceeds expected size")
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+    finally:
+        kill_group(process)
+        process.stdout.close()
+        log = stderr.close()
+    if process.returncode:
+        raise ValueError(f"cannot load library for export check: {log or process.returncode}")
+    missing = json.loads(output)
+    if (not isinstance(missing, list) or
+            any(not isinstance(name, str) or name not in exports for name in missing)):
+        raise ValueError("invalid export check protocol")
+    return missing
 
 
 def compile_candidate(cfg, src_path, out_dir, mode):

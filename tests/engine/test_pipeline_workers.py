@@ -79,7 +79,9 @@ class WorkerPoolTests(PipelineTestCase):
         self.assertEqual(pool.score(self.candidate("good"), 5)["status"], "OK")
 
     def test_init_failure_is_reported_at_pool_construction(self):
-        with self.assertRaisesRegex(EvaluatorInitError, "fs_init returned 1"):
+        # A fast initialization failure may close stdin before the parent's
+        # readiness write; that path reports the fatal startup exit code.
+        with self.assertRaisesRegex(EvaluatorInitError, "fs_init returned 1|worker exited with code 3"):
             self.pool(instance="n=1,fail=1")
 
     def test_exit_three_is_init_error(self):
@@ -138,7 +140,9 @@ void fs_fini(void) {
         ok, evaluator, log = compile_candidate(self.cfg, source, self.root / "partial-evaluator", "final")
         self.cfg.candidate.exports = saved
         self.assertTrue(ok, log)
-        with self.assertRaisesRegex(EvaluatorInitError, "fs_init returned 1"):
+        # Either startup diagnostic is valid; both must tear down the worker
+        # that initialized successfully before the second worker failed.
+        with self.assertRaisesRegex(EvaluatorInitError, "fs_init returned 1|worker exited with code 3"):
             WorkerPool(self.cfg, evaluator, "", 2,
                        {"INIT_COUNTER": str(counter), "FINI_MARK": str(mark)})
         self.assertEqual(counter.read_text(), "2")

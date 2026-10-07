@@ -37,6 +37,17 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(normalized_hash("#define A /* multiline\ncomment */ 1\n"), normalized_hash("#define A 1\n"))
         self.assertNotEqual(normalized_hash("double x=1e+3;"), normalized_hash("double x=1e + 3;"))
 
+    def test_ambiguous_translation_phases_preserve_source(self):
+        tail = '#define X 1\n#ifndef X\n#define X 2\n#endif\ndouble f(void) { return X; }\n'
+        ordinary = '// ordinary comment\n' + tail
+        for blanks in (' ', '\t', '\f', '\v', ' \t'):
+            for newline in ('\n', '\r\n', '\r'):
+                with self.subTest(blanks=blanks, newline=newline):
+                    continued = '// continued comment\\' + blanks + newline + tail
+                    self.assertNotEqual(normalized_hash(ordinary), normalized_hash(continued))
+        for source in ('// continued??/\n' + tail, '// comment\r' + tail):
+            self.assertNotEqual(normalized_hash(source), normalized_hash(ordinary))
+
     def test_stringification_and_source_positions_preserve_observable_spacing(self):
         prefix = "#define STR(x) #x\n"
         self.assertNotEqual(normalized_hash(prefix + "sizeof(STR(a+b))"),

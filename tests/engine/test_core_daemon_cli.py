@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from engine.funsearch import cli
+from engine.funsearch import daemon
 from engine.funsearch.config import Config
 from engine.funsearch.daemon import store_result, write_outputs
 from engine.funsearch.db import Database
@@ -193,6 +195,117 @@ class RecoverTests(unittest.TestCase):
                 self.assertEqual((self.run / "best.c").read_text(),
                                  (self.run / "top/1-2.c").read_text())
                 self.assertIn("return 2", (self.run / "best.c").read_text())
+
+    def test_interrupted_write_preserves_previous_complete_best(self):
+        seed_database(self.run / 'db.sqlite', 2)
+        best = self.run / 'best.c'
+        previous = 'double f(void) { return 1; }\n'
+        best.write_text(previous)
+        real_open = Path.open
+
+        @contextlib.contextmanager
+        def interrupted_open(path, *args, **kwargs):
+            with real_open(path, *args, **kwargs) as file:
+                if path == best or path == best.with_name('best.c.tmp'):
+                    def partial_write(text):
+                        file.write(text[:10])
+                        raise OSError('interrupted write')
+                    yield SimpleNamespace(write=partial_write)
+                else:
+                    yield file
+
+        metadata = json.loads((self.run / 'run.json').read_text())
+        with Database(self.run / 'db.sqlite') as db, \
+                patch.object(Path, 'open', interrupted_open), \
+                self.assertRaisesRegex(OSError, 'interrupted write'):
+            write_outputs(db, self.run, metadata, Config(), 'completed', 'max_children')
+        self.assertEqual(best.read_text(), previous)
+        self.assertFalse((self.run / 'summary.json').exists())
+        self.recover()
+        self.assertIn('return 2', best.read_text())
+
+    def test_export_flush_failures_leave_completion_unpublished(self):
+        parent = self.run
+        for stage in ('best-file', 'top-file', 'best-directory', 'top-directory'):
+            with self.subTest(stage=stage):
+                self.run = parent / stage
+                self.run.mkdir()
+                seed_database(self.run / 'db.sqlite', 2)
+                best = self.run / 'best.c'
+                best.write_text('previous complete candidate\n')
+                metadata = {'run_id': 'run'}
+                real_fsync = os.fsync
+                files = 0
+                directories = 0
+
+                def fail_flush(descriptor):
+                    nonlocal files, directories
+                    directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    if directory:
+                        directories += 1
+                    else:
+                        files += 1
+                    # Directory flushes: best.c's parent, new top/ entry's
+                    # parent, then the top candidate's parent.
+                    target = {'best-file': (False, 1), 'top-file': (False, 2),
+                              'best-directory': (True, 1), 'top-directory': (True, 3)}[stage]
+                    if (directory, directories if directory else files) == target:
+                        raise OSError('injected flush failure')
+                    real_fsync(descriptor)
+
+                with Database(self.run / 'db.sqlite') as db, \
+                        patch.object(daemon.os, 'fsync', side_effect=fail_flush), \
+                        self.assertRaisesRegex(OSError, 'injected flush failure'):
+                    write_outputs(db, self.run, metadata, Config(), 'completed', 'max_children')
+                self.assertFalse((self.run / 'summary.json').exists())
+                if stage == 'best-file':
+                    self.assertEqual(best.read_text(), 'previous complete candidate\n')
+
+    def test_exports_flush_and_replace_before_summary_installation(self):
+        seed_database(self.run / 'db.sqlite', 2)
+        events = []
+        descriptors = {}
+        real_open, real_os_open = Path.open, os.open
+        real_fsync, real_replace = os.fsync, Path.replace
+
+        @contextlib.contextmanager
+        def track_file(path, *args, **kwargs):
+            with real_open(path, *args, **kwargs) as file:
+                descriptors[file.fileno()] = path
+                yield file
+
+        def track_directory(path, flags, *args, **kwargs):
+            descriptor = real_os_open(path, flags, *args, **kwargs)
+            descriptors[descriptor] = Path(path)
+            return descriptor
+
+        def track_flush(descriptor):
+            path = descriptors[descriptor]
+            real_fsync(descriptor)
+            events.append(('flush', path))
+
+        def track_replace(path, target):
+            events.append(('replace', Path(target)))
+            return real_replace(path, target)
+
+        with Database(self.run / 'db.sqlite') as db, \
+                patch.object(Path, 'open', track_file), \
+                patch.object(daemon.os, 'open', side_effect=track_directory), \
+                patch.object(daemon.os, 'fsync', side_effect=track_flush), \
+                patch.object(Path, 'replace', track_replace):
+            write_outputs(db, self.run, {'run_id': 'run'}, Config(), 'completed', 'max_children')
+        summary_replace = events.index(('replace', self.run / 'summary.json'))
+        for candidate in (self.run / 'best.c', self.run / 'top' / '1-2.c'):
+            replace = events.index(('replace', candidate))
+            flush = events.index(('flush', candidate.with_name(candidate.name + '.tmp')))
+            directory_flush = events.index(('flush', candidate.parent), replace + 1)
+            self.assertLess(flush, replace)
+            self.assertLess(replace, directory_flush)
+            self.assertLess(directory_flush, summary_replace)
+        summary_flush = events.index(('flush', self.run / 'summary.json.tmp'))
+        self.assertLess(summary_flush, summary_replace)
+        self.assertEqual(events[-1], ('flush', self.run))
+        self.assertEqual(json.loads((self.run / 'summary.json').read_text())['status'], 'completed')
 
 
 class EngineAliveTests(unittest.TestCase):

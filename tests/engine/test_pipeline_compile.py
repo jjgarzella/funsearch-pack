@@ -6,13 +6,28 @@ import sys
 import time
 from unittest.mock import patch
 
+from engine.funsearch._process import LOG_BYTES, _StderrPrefix
 from engine.funsearch.compile import check_exports, compile_candidate, source_policy_error, try_worker_env
+from engine.funsearch.normalize import normalized_hash
 from engine.funsearch.evaluator import (EvaluatorBuildError, build_evaluator, evaluator_digest,
                                        snapshot_evaluator)
 from tests.engine.pipeline_support import PipelineTestCase
 
 
 class CompileTests(PipelineTestCase):
+    def test_spaced_comment_continuation_has_distinct_behavior_and_hash(self):
+        import ctypes
+        tail = '#define X 1\n#ifndef X\n#define X 2\n#endif\ndouble f(void) { return X; }\n'
+        sources = ('// ordinary comment\n' + tail, '// continued comment\\ \n' + tail)
+        self.assertNotEqual(*(normalized_hash(source) for source in sources))
+        for index, source in enumerate(sources):
+            ok, library, log = compile_candidate(self.cfg, self.source(source),
+                                                 self.root / f'splice-{index}', 'final')
+            self.assertTrue(ok, log)
+            function = ctypes.CDLL(str(library)).f
+            function.restype = ctypes.c_double
+            self.assertEqual(function(), index + 1)
+
     def test_success_and_shell_quoted_paths(self):
         source = self.source("double f(void) { return 7; }", "source '$({out}).c")
         directory = self.root / "output ' $(touch injected)"
@@ -170,6 +185,56 @@ class CompileTests(PipelineTestCase):
             ok, log = check_exports(library, ["f", "g"], {})
         self.assertFalse(ok)
         self.assertIn("missing required exports: g", log)
+
+    def test_ctypes_fallback_bounds_constructor_stdout_and_stderr(self):
+        source = self.source('#include <unistd.h>\n'
+                             '__attribute__((constructor)) static void noise(void) {\n'
+                             '    char block[4096] = {0};\n'
+                             '    for (int i=0; i<4096; ++i) {\n'
+                             '        write(1, block, sizeof block); write(2, block, sizeof block);\n'
+                             '    }\n}\ndouble f(void) { return 1; }\n')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / 'noisy', 'final')
+        self.assertTrue(ok, log)
+        readers = []
+
+        def reader(pipe):
+            result = _StderrPrefix(pipe)
+            readers.append(result)
+            return result
+
+        with patch('engine.funsearch.compile.shutil.which', return_value=None), \
+                patch('engine.funsearch.compile._StderrPrefix', side_effect=reader):
+            self.assertEqual(check_exports(library, ['f'], {}), (True, ''))
+        self.assertEqual(len(readers), 1)
+        self.assertEqual(len(readers[0].buffer), LOG_BYTES)
+
+    def test_ctypes_fallback_rejects_oversized_protocol(self):
+        # The child reserves fd 3 for JSON before loading the constructor.
+        source = self.source('#include <unistd.h>\n'
+                             '__attribute__((constructor)) static void noise(void) {\n'
+                             '    char block[4096] = {0}; write(3, block, sizeof block);\n'
+                             '}\ndouble f(void) { return 1; }\n')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / 'protocol', 'final')
+        self.assertTrue(ok, log)
+        with patch('engine.funsearch.compile.shutil.which', return_value=None):
+            ok, log = check_exports(library, ['f'], {})
+        self.assertFalse(ok)
+        self.assertIn('protocol exceeds expected size', log)
+
+    def test_ctypes_fallback_times_out_noisy_constructor(self):
+        source = self.source('#include <unistd.h>\n'
+                             '__attribute__((constructor)) static void noise(void) {\n'
+                             '    char block[4096] = {0}; for (;;) write(2, block, sizeof block);\n'
+                             '}\ndouble f(void) { return 1; }\n')
+        ok, library, log = compile_candidate(self.cfg, source, self.root / 'loop', 'final')
+        self.assertTrue(ok, log)
+        started = time.monotonic()
+        with patch('engine.funsearch.compile.shutil.which', return_value=None), \
+                patch('engine.funsearch.compile.EXPORT_TIMEOUT_S', 0.2):
+            ok, log = check_exports(library, ['f'], {})
+        self.assertFalse(ok)
+        self.assertIn('timed out', log)
+        self.assertLess(time.monotonic() - started, 3)
 
     def test_nm_failure_does_not_fall_back(self):
         with patch("engine.funsearch.compile.subprocess.run") as run:

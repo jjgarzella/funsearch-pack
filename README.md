@@ -193,11 +193,12 @@ SQLite is the only channel between clients and the engine (clients poll
 results every 0.1 s; the mutator tool guard opens the database on each tool
 call). The engine retries a tick whose database access stays locked past the
 busy timeout and fails the run only after 60 s without a successful tick.
-Snapshots copy 1024 pages per step and pause between steps, so writers wait
-for a step rather than the whole copy, and a failed copy leaves no partial
-snapshot. This is sized for one host and a handful of mutators per run (the
-default is three); much larger mutator counts or very large source histories
-would need measuring first.
+Snapshots normally copy 1024 pages per step and pause between steps, so writers
+wait for a step. After three restarts caused by client writes, the backup
+finishes in one pass that blocks writers for the whole copy. A failed copy
+leaves no partial snapshot. This is sized for one host and a handful of mutators
+per run (the default is three); much larger mutator counts or very large source
+histories would need measuring first.
 
 The engine flushes timestamped startup, shutdown, and SIGTERM/SIGHUP/SIGINT
 events to `engine.log`; those signals request normal shutdown. Python's
