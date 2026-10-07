@@ -1,6 +1,7 @@
 """Daemon result storage, crash recovery and CLI error reporting without a live engine."""
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -22,6 +23,7 @@ from engine.funsearch.config import Config
 from engine.funsearch.daemon import store_result, write_outputs
 from engine.funsearch.db import Database
 from engine.funsearch.runtime import engine_alive, hold_engine_lock
+from tests.engine.recovery_support import recovery_process, wait_for_path
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -213,6 +215,55 @@ class RecoverTests(unittest.TestCase):
         # A summary that is not terminal (e.g. torn or never finished) still recovers.
         (self.run / "summary.json").write_text("{")
         self.recover()
+        self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
+
+    def test_competing_recoveries_wait_and_preserve_first_publication(self):
+        parent = self.run
+        metadata = (parent / "run.json").read_text()
+        for entry in ("cli", "direct"):
+            with self.subTest(entry=entry):
+                self.run = parent / entry
+                self.run.mkdir()
+                (self.run / "run.json").write_text(metadata)
+                seed_database(self.run / "db.sqlite", 2)
+                # Adapter ownership does not prevent or deadlock standalone recovery.
+                with (self.run / ".gc-lifecycle.lock").open("a") as adapter:
+                    fcntl.flock(adapter, fcntl.LOCK_EX)
+                    first = recovery_process(self, self.run, "first")
+                    wait_for_path(self, self.run / "first-publishing")
+                    self.assertFalse(engine_alive(self.run))
+                    with self.assertRaisesRegex(RuntimeError, "another engine holds"):
+                        hold_engine_lock(self.run, timeout_s=0.05)
+                    second = recovery_process(self, self.run, "second", entry)
+                    wait_for_path(self, self.run / "second-attempt")
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        second.communicate(timeout=0.2)
+                    self.assertFalse((self.run / "second-acquired").exists())
+                    self.assertFalse((self.run / "second-publishing").exists())
+                    (self.run / "release").touch()
+                    output, errors = first.communicate(timeout=10)
+                    self.assertEqual(first.returncode, 0, output + errors)
+                    output, errors = second.communicate(timeout=10)
+                    self.assertEqual(second.returncode, 2, output + errors)
+                    self.assertIn("already finished with status failed", errors)
+                self.assertTrue((self.run / "second-acquired").exists())
+                self.assertFalse((self.run / "second-publishing").exists())
+                self.assertEqual((self.run / "summary.json").read_bytes(),
+                                 (self.run / "first-summary").read_bytes())
+                with Database(self.run / "db.sqlite") as db:
+                    self.assertEqual(db.get_state("ended_at"),
+                                     json.loads((self.run / "first-summary").read_text())["ended_at"])
+
+    def test_killed_recovery_releases_ownership_and_allows_retry(self):
+        seed_database(self.run / "db.sqlite", 2)
+        first = recovery_process(self, self.run, "first")
+        wait_for_path(self, self.run / "first-publishing")
+        first.kill()
+        first.communicate(timeout=10)
+        self.assertFalse((self.run / "summary.json").exists())
+        self.recover()
+        self.assertEqual((self.run / "best.c").read_text(),
+                         (self.run / "top/1-2.c").read_text())
         self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
 
     def test_failed_candidate_exports_do_not_publish_completion_and_can_recover(self):

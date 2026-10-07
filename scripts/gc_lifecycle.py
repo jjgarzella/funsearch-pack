@@ -286,6 +286,13 @@ def failed_summary(root, metadata):
                             capture_output=True, text=True, timeout=300)
     if result.returncode == 0:
         return
+    # A concurrent standalone recovery can publish while our subprocess waits
+    # for engine-owned recovery ownership, then refuse to republish. Deliver
+    # that terminal result rather than treating the refusal as an export error.
+    if (root / "summary.json").exists():
+        summary = read_json(root / "summary.json")
+        if is_terminal(summary.get("status")):
+            return
     # Recovery may have readable data but be unable to publish its exports
     # (for example, a full disk or an obstructed output path). Preserve the
     # registry for another sweep rather than inventing a terminal summary.

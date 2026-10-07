@@ -87,8 +87,13 @@ The primary operations are:
   (`daemon.recover_outputs`, which the Gas City sweep calls) finishes
   any request the dead engine still held as an error and writes failed outputs
   from the live database, or from the newest readable snapshot when the live
-  one is unreadable. The CLI verb refuses a run whose `summary.json` status is
-  already terminal, so it never relabels a finished run. The writer atomically
+  one is unreadable. Recovery holds an exclusive per-run `recovery.lock` across
+  the liveness/terminal checks, queue repair and export publication. It also
+  holds a shared `engine.lock` to exclude an engine starting during recovery.
+  After acquiring ownership, it refuses a run whose `summary.json` status is
+  already terminal, so concurrent CLI recoveries and the sweep preserve the
+  first publisher's result. The adapter's separate `.gc-lifecycle.lock` owns
+  only its bead/delivery bookkeeping. The writer atomically
   installs and flushes `best.c` and the `top/` candidates before publishing
   that terminal summary, which recovery and the sweep use as the completion
   marker. An interrupted candidate export therefore remains recoverable.

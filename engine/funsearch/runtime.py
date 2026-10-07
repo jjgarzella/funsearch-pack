@@ -1,6 +1,6 @@
 """Run metadata and hook utilities shared by the CLI and daemon."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import fcntl
 import json
 import os
@@ -21,6 +21,7 @@ TERMINAL_STATUSES = frozenset({COMPLETED, STOPPED, FAILED})
 HOOK_TIMEOUT_S = 120
 # The engine holds an exclusive flock on this run-directory file for its life.
 ENGINE_LOCK = "engine.lock"
+RECOVERY_LOCK = "recovery.lock"
 
 
 def is_terminal(status):
@@ -108,6 +109,26 @@ def hold_engine_lock(root, timeout_s=5):
                 handle.close()
                 raise RuntimeError(f"another engine holds {Path(root) / ENGINE_LOCK}") from None
             time.sleep(0.01)
+
+
+@contextmanager
+def hold_recovery_lock(root):
+    """Serialize recovery publishers and exclude a live or starting engine.
+
+    The separate exclusive recovery lock makes competing recoveries wait.
+    Holding a shared engine lock keeps an engine from starting during recovery
+    while allowing liveness probes to distinguish recovery from a live engine.
+    Keep both files in place: unlinking a lock file splits its ownership.
+    """
+    root = Path(root)
+    with (root / RECOVERY_LOCK).open("ab") as recovery:
+        fcntl.flock(recovery, fcntl.LOCK_EX)
+        with (root / ENGINE_LOCK).open("ab") as engine:
+            try:
+                fcntl.flock(engine, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConfigError(f"engine is still running: {root}") from None
+            yield
 
 
 def run_hook(command, run_dir):

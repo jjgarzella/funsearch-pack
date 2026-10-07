@@ -161,8 +161,11 @@ ten distinct OK candidates in `top/`. Candidate exports are installed atomically
 and flushed before the terminal summary is published; an interrupted export
 leaves the run eligible for recovery and the crash sweep. If publication still
 fails while run data is readable, the sweep retains its registry entry for a
-later retry before sending completion mail. The final and periodic SQLite backups
-live in `snapshots/`, with the latest five retained. Worker failure results
+later retry before sending completion mail. Recovery holds the engine's per-run
+`recovery.lock` through queue repair and export publication and rechecks the
+terminal summary after acquiring it. Concurrent manual recoveries and the sweep
+wait for that owner and preserve its completed output. The final and periodic
+SQLite backups live in `snapshots/`, with the latest five retained. Worker failure results
 include the last 2 KiB of native stderr from a
 continuously drained, bounded 1 MiB tail; daemon tracebacks appear in
 `engine.log`. Both pools recycle workers after 100 scoring replies, before

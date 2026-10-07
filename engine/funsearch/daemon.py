@@ -13,13 +13,15 @@ import time
 import traceback
 
 from .compile import try_worker_env
+from .config import ConfigError
 from .db import (BEST_SCORE, CHILDREN_OK, CHILDREN_SCORED, CLAIM_TIMEOUT_S, Database,
                  END_BY, ENDED_AT, PID, PLATEAU_COUNT, REASON, SEED_SCORE, SNAPSHOTS,
                  STARTED_AT, STATUS, STOP_REQUESTED)
 from .evolve import reset_weakest
 from .normalize import normalized_hash
 from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
-                      hold_engine_lock, read_run, run_hook, top_programs)
+                      hold_engine_lock, hold_recovery_lock, is_terminal, read_run,
+                      run_hook, top_programs)
 from .workers import WorkerPool, score_budget_s, start_budget_s
 
 
@@ -200,8 +202,22 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
     """Rewrite failed outputs after the engine died; return the database used.
 
     Prefer the live database and fall back to the newest readable snapshot if
-    the engine died mid-write and left it unreadable.
+    the engine died mid-write and left it unreadable. Own recovery across the
+    liveness/terminal checks, queue repair and complete export publication.
     """
+    with hold_recovery_lock(root):
+        # Recheck after waiting: a peer may have published the completion marker.
+        try:
+            status = json.loads((root / "summary.json").read_text()).get("status")
+        except (OSError, ValueError, AttributeError):
+            status = None
+        if is_terminal(status):
+            raise ConfigError(f"run already finished with status {status}; nothing to recover: {root}")
+        return _recover_outputs(root, metadata, cfg, reason)
+
+
+def _recover_outputs(root, metadata, cfg, reason):
+    """Repair and export with recovery ownership already held."""
     backups = sorted((root / "snapshots").glob("db-*.sqlite"),
                      key=lambda path: path.stat().st_mtime, reverse=True)
     errors = []

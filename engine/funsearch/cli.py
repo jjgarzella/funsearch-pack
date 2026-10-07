@@ -251,15 +251,6 @@ def evaluate(args, root, cfg, db):
 
 def recover_run(args):
     root, metadata, cfg = read_run(args.run_dir, require_db=False)
-    if engine_alive(root):
-        raise ConfigError(f"engine is still running: {root}")
-    # A cleanly finished run's engine is gone too; never relabel its outcome.
-    try:
-        status = json.loads((root / "summary.json").read_text()).get("status")
-    except (OSError, ValueError, AttributeError):
-        status = None
-    if is_terminal(status):
-        raise ConfigError(f"run already finished with status {status}; nothing to recover: {root}")
     database = recover_outputs(root, metadata, cfg)
     print(json.dumps({"run_dir": str(root), "recovered_from": str(database)}))
     return 0

@@ -22,6 +22,7 @@ from engine.funsearch.daemon import write_outputs
 from engine.funsearch.db import Database
 from engine.funsearch.runtime import hold_engine_lock
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
+from tests.engine.recovery_support import BOOTSTRAP, recovery_process, wait_for_path
 
 SCRIPTS = ROOT / "scripts"
 SHIM = ROOT / "tests" / "gc" / "fake_gc.py"
@@ -457,6 +458,55 @@ sys.exit(lifecycle.main())
         self.assertTrue(all(row["status"] == "closed" for row in self.beads().values()))
         self.assertEqual(len(self.mails()), 1)
         self.assertFalse((self.registry / "interrupted.json").exists())
+
+    def test_sweep_delivers_concurrent_manual_recovery_without_republishing(self):
+        root = self.run_dir("competing-recovery", 99999999)
+        self.hook("on-start", root)
+        with Database(root / "db.sqlite") as db:
+            db.add_program(0, "double f(void) { return 2; }\n", score=2)
+            for key, value in {"started_at": time.time() - 10, "seed_score": 0,
+                               "children_scored": 1, "children_ok": 1}.items():
+                db.set_state(key, value)
+        manual = recovery_process(self, root, "first")
+        wait_for_path(self, root / "first-publishing")
+        # Observe the sweep's recovery subprocess at the engine lock, so it
+        # definitely passed the adapter's terminal gate before manual completion.
+        bootstrap = """import sys
+from scripts import gc_lifecycle as lifecycle
+original_run = lifecycle.subprocess.run
+recovery_bootstrap, engine_path = sys.argv[1:3]
+def observed_run(command, **kwargs):
+    if command[1:3] == ['run', 'recover']:
+        command = [sys.executable, '-c', recovery_bootstrap, engine_path, command[3], 'second', 'cli']
+    return original_run(command, **kwargs)
+lifecycle.subprocess.run = observed_run
+sys.argv = ['gc_lifecycle.py', 'sweep']
+sys.exit(lifecycle.main())
+"""
+        sweep = subprocess.Popen([sys.executable, "-c", bootstrap, BOOTSTRAP,
+                                  str(ROOT / "engine")], env=self.env, cwd=ROOT,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def cleanup():
+            if sweep.poll() is None:
+                sweep.kill()
+            sweep.communicate(timeout=5)
+
+        self.addCleanup(cleanup)
+        wait_for_path(self, root / "second-attempt")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            sweep.communicate(timeout=0.2)
+        self.assertEqual(self.mails(), [])
+        self.assertFalse((root / "second-acquired").exists())
+        (root / "release").touch()
+        self.finish_process(manual)
+        self.finish_process(sweep)
+        self.assertFalse((root / "second-publishing").exists())
+        self.assertEqual((root / "summary.json").read_bytes(), (root / "first-summary").read_bytes())
+        self.assertEqual((root / "best.c").read_text(), (root / "top/1-2.c").read_text())
+        self.assertEqual(len(self.mails()), 1)
+        self.assertFalse((self.registry / "competing-recovery.json").exists())
+        self.assertTrue(all(row["status"] == "closed" for row in self.beads().values()))
 
     def test_sweep_keeps_failed_delivery_entry_and_touches_timestamp(self):
         root = self.run_dir(pid=99999999)
