@@ -28,13 +28,13 @@ STOP_GRACE_S = 120
 # Abandonment only matters after ~2 trial budgets of inactivity (>= 20 min at
 # defaults), so a write transaction every loop tick would be wasted contention.
 ABANDON_PERIOD_S = 30
+# A database lock held this long without one successful tick fails the run.
+BUSY_RETRY_S = 60
 # Upper bound on one loop tick's wait. A finished evaluation wakes the loop at
 # once; new queue entries and state changes are noticed within this period.
 POLL_S = 0.1
 # Scheduling slack on top of the scoring budget before a waiting client gives up.
 CLAIM_SLACK_S = 60
-# A database lock held this long without one successful tick fails the run.
-BUSY_RETRY_S = 60
 
 
 def log_event(message):
@@ -199,7 +199,7 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
     raise RuntimeError("no readable run database" + "".join(f"\n{e}" for e in errors))
 
 
-def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s):
+def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s, busy_retry_s):
     root, metadata, cfg = read_run(run_dir)
     pools, executors, pending = {}, {}, {}
     db = Database(root / "db.sqlite", migrate=True)
@@ -319,8 +319,8 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
                 if not _busy(exc):
                     raise
                 busy_since = busy_since or time.monotonic()
-                if time.monotonic() - busy_since >= BUSY_RETRY_S:
-                    raise RuntimeError(f"database busy for {BUSY_RETRY_S}s: {exc}") from None
+                if time.monotonic() - busy_since >= busy_retry_s:
+                    raise RuntimeError(f"database busy for {busy_retry_s:g}s: {exc}") from None
                 log_event(f"database busy, retrying: {exc}")
                 time.sleep(POLL_S)
             else:
@@ -390,7 +390,8 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
                         os.close(ready_fd)
 
 
-def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_period_s):
+def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_period_s,
+                   busy_retry_s):
     """Wait for a detached engine with no launching-agent process identity."""
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
@@ -410,7 +411,8 @@ def observe_engine(run_dir, writer, snapshot_period_s, stop_grace_s, abandon_per
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
         serve(run_dir, writer, snapshot_period_s=snapshot_period_s,
-              stop_grace_s=stop_grace_s, abandon_period_s=abandon_period_s)
+              stop_grace_s=stop_grace_s, abandon_period_s=abandon_period_s,
+              busy_retry_s=busy_retry_s)
     except BaseException:
         traceback.print_exc()
         try:
@@ -448,10 +450,12 @@ def daemonize(run_dir):
             bootstrap = ("import sys; sys.path.insert(0, sys.argv[1]); "
                          "from funsearch.daemon import observe_engine; "
                          "observe_engine(sys.argv[2], int(sys.argv[3]), "
-                         "float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]))")
+                         "float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]), "
+                         "float(sys.argv[7]))")
             os.execve(sys.executable, [sys.executable, "-c", bootstrap,
                       str(Path(__file__).resolve().parents[1]), str(run_dir), str(writer),
-                      str(SNAPSHOT_PERIOD_S), str(STOP_GRACE_S), str(ABANDON_PERIOD_S)], env)
+                      str(SNAPSHOT_PERIOD_S), str(STOP_GRACE_S), str(ABANDON_PERIOD_S),
+                      str(BUSY_RETRY_S)], env)
         except BaseException:
             traceback.print_exc()
             try:

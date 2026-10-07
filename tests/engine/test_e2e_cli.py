@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from engine.funsearch import daemon
+from engine.funsearch.compile import compile_candidate
 from engine.funsearch.db import Database
 from engine.funsearch.evaluator import evaluator_digest
 from engine.funsearch.runtime import pid_alive
@@ -438,18 +439,55 @@ class EndToEndTests(PipelineTestCase):
         self.assertTrue((root / "best.c").exists())
         self.assertTrue((root / "finished.marker").exists())
 
-    def test_transient_database_lock_does_not_fail_the_run(self):
+    def test_transient_database_lock_keeps_a_scored_result_pending(self):
         root = self.start()
-        # Longer than the engine's 5 s busy timeout, shorter than its retry budget.
+        task_id, _ = self.task(root)
+        # Enqueue directly: a waiting CLI client would itself fail on the lock.
+        request = root / "requests" / "locked"
+        request.mkdir(parents=True)
+        source = request / "candidate.c"
+        source.write_text("#include <unistd.h>\ndouble f(void) { sleep(1); return 2; }\n")
+        ok, library, log = compile_candidate(self.cfg, source, request, "final")
+        self.assertTrue(ok, log)
+        with Database(root / "db.sqlite") as db:
+            (programs,) = db.connection.execute("SELECT COUNT(*) FROM programs").fetchone()
+            with db.transaction():
+                evaluation = db.enqueue("submit", source, library, task_id=task_id)
+        self.wait_queue(root, 1)
+        # Held past two 5 s busy timeouts: the tick at ~5 s finds the score
+        # done and its store_result fails at ~10 s, so the unstored result
+        # must survive in pending until the lock is released.
+        with closing(sqlite3.connect(root / "db.sqlite", isolation_level=None)) as connection:
+            connection.execute("BEGIN EXCLUSIVE")
+            time.sleep(11.5)
+            connection.execute("COMMIT")
+        deadline = time.monotonic() + 10
+        with Database(root / "db.sqlite") as db:
+            while (done := db.get_evaluation(evaluation.id)).state != "done":
+                self.assertLess(time.monotonic(), deadline, "result was never stored")
+                time.sleep(0.05)
+            self.assertEqual(done.result["status"], "OK")
+            self.assertEqual(done.result["score"], 2)
+            self.assertIn("program_id", done.result)
+            self.assertEqual(db.get_state("children_scored"), 1)
+            self.assertEqual(db.get_task(task_id).status, "done")
+            # Stored exactly once: neither dropped nor double-counted.
+            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM programs").fetchone()[0],
+                             programs + 1)
+        self.assertGreaterEqual((root / "engine.log").read_text().count("database busy, retrying"), 2)
+        self.assertFalse(library.exists())
+        self.cli("stop", root)
+        self.finished(root, "stopped")
+
+    def test_database_lock_beyond_the_retry_budget_fails_the_run(self):
+        # A zero budget fails on the first tick that outlasts the 5 s busy timeout.
+        root = self.tuned_start("busy", "daemon.BUSY_RETRY_S = 0")
         with closing(sqlite3.connect(root / "db.sqlite", isolation_level=None)) as connection:
             connection.execute("BEGIN EXCLUSIVE")
             time.sleep(6)
             connection.execute("COMMIT")
-        task_id, directory = self.task(root)
-        self.assertIn("ACCEPTED", self.cli("submit", root, task_id, self.child(directory, 2)))
-        self.assertIn("database busy, retrying", (root / "engine.log").read_text())
-        self.cli("stop", root)
-        self.finished(root, "stopped")
+        summary = self.finished(root, "failed")
+        self.assertRegex(summary["reason"], r"^database busy for 0s: database is locked")
 
     def test_maintenance_abandonment_reset_and_snapshot_retention(self):
         root = self.tuned_start("maintenance", "daemon.SNAPSHOT_PERIOD_S = 0.1; "
