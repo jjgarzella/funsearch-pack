@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import signal
+import sqlite3
 import sys
 import time
 import traceback
@@ -32,11 +33,18 @@ ABANDON_PERIOD_S = 30
 POLL_S = 0.1
 # Scheduling slack on top of the scoring budget before a waiting client gives up.
 CLAIM_SLACK_S = 60
+# A database lock held this long without one successful tick fails the run.
+BUSY_RETRY_S = 60
 
 
 def log_event(message):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
           f"pid={os.getpid()} {message}", file=sys.stderr, flush=True)
+
+
+def _busy(exc):
+    message = str(exc)
+    return "database is locked" in message or "database is busy" in message
 
 
 def snapshot(db, root):
@@ -242,70 +250,81 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
         os.close(ready_fd)
         last_reset = last_snapshot = last_abandon = time.monotonic()
         rng = random.Random()
+        busy_since = None
         while True:
-            if signal_stop:
-                db.set_state("stop_requested", True)
-            for future, evaluation in list(pending.items()):
-                if future.done():
-                    try:
-                        result = future.result()
-                    except Exception:
-                        if stop_deadline is None:
-                            raise
-                        result = {"status": "ERROR", "score": 0, "sig": [],
-                                  "msg": "evaluation interrupted at shutdown"}
-                    store_result(db, evaluation, result)
-                    discard_candidate(evaluation)
-                    del pending[future]
+            try:
+                if signal_stop:
+                    db.set_state("stop_requested", True)
+                for future, evaluation in list(pending.items()):
+                    if future.done():
+                        try:
+                            result = future.result()
+                        except Exception:
+                            if stop_deadline is None:
+                                raise
+                            result = {"status": "ERROR", "score": 0, "sig": [],
+                                      "msg": "evaluation interrupted at shutdown"}
+                        store_result(db, evaluation, result)
+                        discard_candidate(evaluation)
+                        del pending[future]
+                # Checked once per tick, after every finished result is stored.
+                if stop_deadline is None:
                     found = stop_reason(db, cfg)
-                    if found and stop_deadline is None:
+                    if found:
                         reason = found
                         status = STOPPED if found == "stop requested" else COMPLETED
                         db.set_state("status", STOPPING)
                         stop_deadline = time.monotonic() + stop_grace_s
-            if stop_deadline is None:
-                found = stop_reason(db, cfg)
-                if found:
-                    reason = found
-                    status = STOPPED if found == "stop requested" else COMPLETED
-                    db.set_state("status", STOPPING)
-                    stop_deadline = time.monotonic() + stop_grace_s
-            if stop_deadline is not None:
-                cancel_queued(db)
-                if not pending:
-                    break
-                if time.monotonic() >= stop_deadline:
-                    for pool in pools.values():
-                        pool.abort()
-            else:
-                for kind in ("submit", "try"):
-                    occupied = sum(e.kind == kind for e in pending.values())
-                    capacity = cfg.search.workers - occupied
-                    if kind == "submit":
-                        capacity = min(capacity, cfg.stop.max_children -
-                                       db.get_state("children_scored", 0) - occupied)
-                    for _ in range(capacity):
-                        evaluation = db.claim_evaluation(kind)
-                        if evaluation is None:
-                            break
-                        future = executors[kind].submit(pools[kind].score, evaluation.so_path,
-                                                         cfg.evaluator.timeout_s)
-                        pending[future] = evaluation
-            now = time.monotonic()
-            if stop_deadline is None and now - last_reset >= cfg.search.reset_period_s:
-                reset_weakest(db, rng)
-                last_reset = now
-            if now - last_snapshot >= snapshot_period_s:
-                snapshot(db, root)
-                last_snapshot = now
-            if now - last_abandon >= abandon_period_s:
-                age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
-                db.abandon_stale_tasks(time.time() - age)
-                last_abandon = now
-            if pending:
-                wait(pending, timeout=POLL_S, return_when=FIRST_COMPLETED)
-            else:
+                if stop_deadline is not None:
+                    cancel_queued(db)
+                    if not pending:
+                        break
+                    if time.monotonic() >= stop_deadline:
+                        for pool in pools.values():
+                            pool.abort()
+                else:
+                    for kind in ("submit", "try"):
+                        occupied = sum(e.kind == kind for e in pending.values())
+                        capacity = cfg.search.workers - occupied
+                        if kind == "submit":
+                            capacity = min(capacity, cfg.stop.max_children -
+                                           db.get_state("children_scored", 0) - occupied)
+                        for _ in range(capacity):
+                            evaluation = db.claim_evaluation(kind)
+                            if evaluation is None:
+                                break
+                            future = executors[kind].submit(pools[kind].score, evaluation.so_path,
+                                                             cfg.evaluator.timeout_s)
+                            pending[future] = evaluation
+                now = time.monotonic()
+                if stop_deadline is None and now - last_reset >= cfg.search.reset_period_s:
+                    reset_weakest(db, rng)
+                    last_reset = now
+                if now - last_snapshot >= snapshot_period_s:
+                    snapshot(db, root)
+                    last_snapshot = now
+                if now - last_abandon >= abandon_period_s:
+                    age = 2 * (cfg.search.trial_budget * cfg.evaluator.timeout_s + 600)
+                    db.abandon_stale_tasks(time.time() - age)
+                    last_abandon = now
+                if pending:
+                    wait(pending, timeout=POLL_S, return_when=FIRST_COMPLETED)
+                else:
+                    time.sleep(POLL_S)
+            except sqlite3.OperationalError as exc:
+                # Rollback journaling makes clients and the engine exclude
+                # each other; a lock held past busy_timeout is transient, so
+                # retry the tick. Every tick step commits atomically or not at
+                # all, and an unstored result stays pending for the retry.
+                if not _busy(exc):
+                    raise
+                busy_since = busy_since or time.monotonic()
+                if time.monotonic() - busy_since >= BUSY_RETRY_S:
+                    raise RuntimeError(f"database busy for {BUSY_RETRY_S}s: {exc}") from None
+                log_event(f"database busy, retrying: {exc}")
                 time.sleep(POLL_S)
+            else:
+                busy_since = None
     except BaseException as exc:
         traceback.print_exc()
         sys.stderr.flush()

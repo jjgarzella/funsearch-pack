@@ -1,6 +1,7 @@
 """Real CLI/daemon/worker integration, with a scripted C mutator."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -401,6 +402,54 @@ class EndToEndTests(PipelineTestCase):
         summary = self.finished(root, "stopped")
         self.assertEqual(summary["children_scored"], 1)
         self.assertEqual(summary["children_ok"], 0)
+
+    def test_permanent_worker_failure_mid_run_fails_the_run(self):
+        hook = self.root / "finish.py"
+        hook.write_text("import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'finished.marker').touch()\n")
+        mark = self.root / "init-fails"
+        root = self.problem / "runs" / "worker-fails"
+        self.runs.append(root)
+        with patch.dict(os.environ, {"TOY_INIT_FAIL_MARK": str(mark)}):
+            self.cli("run", "start", self.problem, "--run-id", root.name,
+                     "--set", "search.workers=1", "--set", "stop.duration_s=60",
+                     "--set", 'evaluator.env=["TOY_INIT_FAIL_MARK"]',
+                     "--on-finish", f"{sys.executable} {shlex.quote(str(hook))}")
+        first, first_dir = self.task(root)
+        second, second_dir = self.task(root)
+        crash = self.child(first_dir, source="#include <signal.h>\n#include <unistd.h>\n"
+                           "double f(void) { sleep(1); raise(SIGSEGV); return 1; }\n")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            inflight = executor.submit(self.cli, "submit", root, first, crash, code=3)
+            self.wait_queue(root, 1)
+            queued = executor.submit(self.cli, "submit", root, second, self.child(second_dir, 2), code=3)
+            self.wait_queue(root, 1, "queued")
+            # The crashed worker's replacement exits 3 in fs_init: the
+            # submit pool is permanently broken while the run is live.
+            mark.touch()
+            started = time.monotonic()
+            # Neither client waits for end_by: both learn the run is over.
+            self.assertEqual(inflight.result(), "RUN_OVER")
+            self.assertEqual(queued.result(), "RUN_OVER")
+        self.assertLess(time.monotonic() - started, 10)
+        summary = self.finished(root, "failed")
+        # Whichever the engine sees first: the fatal line or exit code 3.
+        self.assertRegex(summary["reason"], "fs_init returned 1|worker exited with code 3")
+        self.assertEqual(summary["children_scored"], 0)
+        self.assertTrue((root / "best.c").exists())
+        self.assertTrue((root / "finished.marker").exists())
+
+    def test_transient_database_lock_does_not_fail_the_run(self):
+        root = self.start()
+        # Longer than the engine's 5 s busy timeout, shorter than its retry budget.
+        with closing(sqlite3.connect(root / "db.sqlite", isolation_level=None)) as connection:
+            connection.execute("BEGIN EXCLUSIVE")
+            time.sleep(6)
+            connection.execute("COMMIT")
+        task_id, directory = self.task(root)
+        self.assertIn("ACCEPTED", self.cli("submit", root, task_id, self.child(directory, 2)))
+        self.assertIn("database busy, retrying", (root / "engine.log").read_text())
+        self.cli("stop", root)
+        self.finished(root, "stopped")
 
     def test_maintenance_abandonment_reset_and_snapshot_retention(self):
         root = self.tuned_start("maintenance", "daemon.SNAPSHOT_PERIOD_S = 0.1; "

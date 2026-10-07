@@ -5,7 +5,14 @@
 
 int fs_init(const char *instance)
 {
+    const char *mark = getenv("TOY_INIT_FAIL_MARK");
+    FILE *file = mark ? fopen(mark, "r") : NULL;
     puts("toy evaluator init on stdout");
+    /* Lets a test break worker replacement after the run has started. */
+    if (file) {
+        fclose(file);
+        return 1;
+    }
     return strstr(instance, "fail=1") ? 1 : 0;
 }
 

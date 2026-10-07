@@ -30,6 +30,11 @@ supplied. Problem name and instance default to empty strings when omitted.
 `Database` opens SQLite with DELETE rollback journaling, foreign keys, and a
 5000 ms busy timeout. Writable opens migrate existing WAL databases. Read-only
 clients use `readonly=True` and a `mode=ro` URI without schema changes.
+`Database.backup` copies `BACKUP_PAGES` (1024) pages per step with a short
+pause, into a temporary file renamed into place. The daemon retries a tick that
+raises `database is locked`/`busy` and fails the run only after `BUSY_RETRY_S`
+(60 s) without a successful tick; each tick step commits atomically, and a
+result whose store failed stays pending for the retry.
 
 The layout is versioned by `PRAGMA user_version` (`SCHEMA_VERSION`); version 0
 is any database from before versioning. A writable open creates an empty

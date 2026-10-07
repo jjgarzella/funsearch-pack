@@ -2,6 +2,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from engine.funsearch.db import SCHEMA_VERSION, Database, SchemaMismatch
 from engine.funsearch.runtime import top_programs
@@ -90,6 +91,12 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(saved.connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(saved.get_state("children"), 3)
             self.assertEqual(saved.get_state("stats"), {"children": 1})
+        self.assertEqual(sorted(p.name for p in backup.parent.glob("backup.sqlite*")), ["backup.sqlite"])
+        # A copy taken in many small steps is still complete.
+        with patch("engine.funsearch.db.BACKUP_PAGES", 1):
+            self.db.backup(backup)
+        with Database(backup, readonly=True) as saved:
+            self.assertEqual(saved.get_state("children"), 3)
         self.assertEqual(self.db.get_state("absent", "fallback"), "fallback")
 
     def test_readonly_client_and_missing_file(self):

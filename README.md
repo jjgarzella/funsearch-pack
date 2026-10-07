@@ -163,7 +163,18 @@ Run databases and snapshots use SQLite DELETE rollback journaling and a
 5000 ms busy timeout. WAL is avoided because its shared-memory mmap can
 SIGBUS on host-mounted run directories (observed on a Docker Desktop host
 mount). Writable opens convert existing WAL databases to DELETE; stop old
-engines/clients before migrating a legacy run. Status, best, rescore, and
+engines/clients before migrating a legacy run.
+Rollback journaling makes readers and the writer exclude each other, and
+SQLite is the only channel between clients and the engine (clients poll
+results every 0.1 s; the mutator tool guard opens the database on each tool
+call). The engine retries a tick whose database access stays locked past the
+busy timeout and fails the run only after 60 s without a successful tick.
+Snapshots copy 1024 pages per step and pause between steps, so writers wait
+for a step rather than the whole copy, and a failed copy leaves no partial
+snapshot. This is sized for one host and a handful of mutators per run (the
+default is three); much larger mutator counts or very large source histories
+would need measuring first.
+ Status, best, rescore, and
 mutator inspection open read-only connections without schema writes. The
 database layout is versioned (`PRAGMA user_version`); only the engine
 upgrades an older run, when it starts or when `run recover` runs after it

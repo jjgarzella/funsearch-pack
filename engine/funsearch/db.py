@@ -134,6 +134,9 @@ _RANK_ORDER = "ORDER BY score DESC, source_length, id"
 # PRAGMA user_version of the layout above. Version 0 is any database written
 # before the layout was versioned, with or without trial_n and source_length.
 SCHEMA_VERSION = 1
+# Snapshot copy step (pages per step, pause between steps); see Database.backup.
+BACKUP_PAGES = 1024
+BACKUP_SLEEP_S = 0.005
 
 
 def _statements(script):
@@ -523,7 +526,21 @@ class Database:
             return value
 
     def backup(self, path) -> None:
-        with sqlite3.connect(str(path)) as destination:
-            destination.execute("PRAGMA journal_mode=DELETE")
-            self.connection.backup(destination)
-            destination.execute("PRAGMA journal_mode=DELETE")
+        """Copy the database to path in steps, then rename it into place.
+
+        Each step holds the source read lock for BACKUP_PAGES pages only, so
+        client writers wait for a step rather than a whole-database copy. A
+        client write between steps restarts the copy, which stays cheap at the
+        write rates mutators produce. A failed copy never leaves a partial
+        snapshot under path.
+        """
+        path = Path(path)
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            with closing(sqlite3.connect(str(temporary))) as destination:
+                destination.execute("PRAGMA journal_mode=DELETE")
+                self.connection.backup(destination, pages=BACKUP_PAGES, sleep=BACKUP_SLEEP_S)
+                destination.execute("PRAGMA journal_mode=DELETE")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
