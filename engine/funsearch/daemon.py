@@ -17,7 +17,7 @@ from .db import Database
 from .evolve import reset_weakest
 from .normalize import normalized_hash
 from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
-                      read_run, run_hook, top_programs)
+                      hold_engine_lock, read_run, run_hook, top_programs)
 from .workers import WorkerPool, score_budget_s, start_budget_s
 
 
@@ -201,6 +201,8 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
 
 def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s, busy_retry_s):
     root, metadata, cfg = read_run(run_dir)
+    # Held until this process exits: engine_alive's restart-proof identity.
+    engine_lock = hold_engine_lock(root)  # noqa: F841
     pools, executors, pending = {}, {}, {}
     db = Database(root / "db.sqlite", migrate=True)
     status, reason = FAILED, "daemon startup failed"

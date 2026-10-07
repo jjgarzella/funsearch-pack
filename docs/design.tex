@@ -487,6 +487,11 @@ observer execs with the launching agent's identity removed, including
 City's process-table orphan reaper cannot retire it with the launcher.
 City, rig and notification context remain available to hooks. The exit record
 requires the observer to survive; SIGKILL alone does not establish an OOM cause.
+Liveness instead rests on an exclusive \code{flock} the engine holds on
+\code{engine.lock} in the run directory for its whole life. The kernel drops it
+however the process tree is lost, so clients, \code{run status}, \code{run
+recover} and the Gas City sweep never mistake a process reusing the engine's PID
+for the engine; runs from an engine without the lock fall back to the PID.
 
 \section{Mutator role}
 \path{agents/mutator/agent.toml} defines the rig-scoped

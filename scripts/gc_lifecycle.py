@@ -167,6 +167,7 @@ def start_locked(root):
         return
     fs.update(city=str(city), rig=rig, notify=notify)
     cfg = metadata["config"]
+    # Informational only: liveness is the run directory's engine lock.
     pid = int((root / "engine.pid").read_text())
     registry = registry_path(city, metadata["run_id"])
     if registry.exists() and read_json(registry)["run_dir"] != str(root):
@@ -181,7 +182,7 @@ def start_locked(root):
             "--description", f"FunSearch results: {root}", "--silent")
     write_lifecycle(root, fs)
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
-             "run_bead": fs["run_bead"], "rig": rig, "pid": pid, "notify": notify}
+             "run_bead": fs["run_bead"], "rig": rig, "notify": notify}
     write_json(registry, entry)
     cap = mutator_pool_cap()
     if cap is not None and cfg["search"]["mutators"] > cap:
@@ -306,8 +307,8 @@ def sweep():
                 try:
                     entry = read_json(registry)
                     root = Path(entry["run_dir"]).resolve()
-                    # The engine's exit record beats a PID a new process may reuse.
-                    if engine_alive(root, entry["pid"]):
+                    # The run directory's engine lock, not a PID a new process may reuse.
+                    if engine_alive(root):
                         continue
                     with lock(root / ".gc-lifecycle.lock"):
                         metadata = read_json(root / "run.json")

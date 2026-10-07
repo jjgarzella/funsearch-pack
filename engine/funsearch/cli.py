@@ -178,7 +178,7 @@ def wait_result(db, evaluation):
             return current.result
         if is_terminal(db.get_state("status")):
             raise RunOver("RUN_OVER")
-        if not engine_alive(db.path.parent, db.get_state("pid")):
+        if not engine_alive(db.path.parent):
             raise RuntimeError("engine process is not alive")
         now = time.time()
         if (current.state == "running" and now - current.started_at > claim_timeout_s) or now > end_by:
@@ -250,10 +250,9 @@ def evaluate(args, root, cfg, db):
 
 def recover_run(args):
     root, metadata, cfg = read_run(args.run_dir, require_db=False)
-    pid_file = root / "engine.pid"
-    if pid_file.exists() and engine_alive(root, pid_file.read_text().strip()):
+    if engine_alive(root):
         raise ConfigError(f"engine is still running: {root}")
-    # A cleanly finished run removes engine.pid too; never relabel its outcome.
+    # A cleanly finished run's engine is gone too; never relabel its outcome.
     try:
         status = json.loads((root / "summary.json").read_text()).get("status")
     except (OSError, ValueError, AttributeError):
@@ -291,7 +290,7 @@ def dispatch(args):
             print("STOP_REQUESTED")
         elif args.command == "run":
             status = db.all_state()
-            status.update(run_id=metadata["run_id"], pid_alive=engine_alive(root, status.get("pid")))
+            status.update(run_id=metadata["run_id"], pid_alive=engine_alive(root))
             print(json.dumps(status))
         elif args.command == "best":
             if args.k <= 0:

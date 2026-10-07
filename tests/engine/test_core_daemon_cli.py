@@ -4,8 +4,10 @@ import contextlib
 import io
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from engine.funsearch import cli
 from engine.funsearch.config import Config
 from engine.funsearch.daemon import store_result
 from engine.funsearch.db import Database
+from engine.funsearch.runtime import engine_alive, hold_engine_lock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -166,6 +169,39 @@ class RecoverTests(unittest.TestCase):
         self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
 
 
+class EngineAliveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.run = Path(temp.name)
+        # A live process under the recorded PID, as after PID reuse.
+        (self.run / "engine.pid").write_text(str(os.getpid()))
+
+    def test_engine_lock_is_the_authority_over_a_reused_pid(self):
+        self.assertTrue(engine_alive(self.run))  # No lock: a pre-lock engine's PID probe.
+        with hold_engine_lock(self.run):
+            self.assertTrue(engine_alive(self.run))
+            self.assertTrue(engine_alive(self.run))  # Probes do not hold the lock.
+            with self.assertRaisesRegex(RuntimeError, "another engine holds"):
+                hold_engine_lock(self.run, timeout_s=0.05)
+        # Released with no exit record, as when the whole process tree is lost.
+        self.assertFalse(engine_alive(self.run))
+
+    def test_killed_engine_releases_its_lock(self):
+        engine = subprocess.Popen([sys.executable, "-c",
+            "import sys, time; sys.path.insert(0, sys.argv[1]); "
+            "from funsearch.runtime import hold_engine_lock; "
+            "lock = hold_engine_lock(sys.argv[2]); print(flush=True); time.sleep(60)",
+            str(ROOT / "engine"), str(self.run)], stdout=subprocess.PIPE)
+        self.addCleanup(engine.wait)
+        self.addCleanup(engine.kill)
+        engine.stdout.readline()
+        self.assertTrue(engine_alive(self.run))
+        os.kill(engine.pid, signal.SIGKILL)
+        engine.wait(timeout=10)
+        self.assertFalse(engine_alive(self.run))
+
+
 class WaitResultTests(unittest.TestCase):
     """The client waits within the deadlines the engine published, on a fake clock."""
 
@@ -222,9 +258,9 @@ class WaitResultTests(unittest.TestCase):
         with patch.object(cli, "engine_alive", return_value=False), \
                 self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
             cli.wait_result(self.db, self.evaluation)
-        # A live process under the recorded PID is not the engine once the
-        # exit observer has recorded that PID's exit.
-        self.db.set_state("pid", os.getpid())
+        # A live process under a pre-lock engine's PID is not the engine once
+        # the exit observer has recorded that PID's exit.
+        (self.db.path.parent / "engine.pid").write_text(str(os.getpid()))
         (self.db.path.parent / "engine-exit.json").write_text(json.dumps({"pid": os.getpid()}))
         with self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
             cli.wait_result(self.db, self.evaluation)

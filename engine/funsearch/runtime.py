@@ -1,11 +1,13 @@
 """Run metadata and hook utilities shared by the CLI and daemon."""
 
 from contextlib import closing
+import fcntl
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import time
 
 from .config import Config, ConfigError
 
@@ -16,6 +18,8 @@ STARTING, RUNNING, STOPPING = "starting", "running", "stopping"
 COMPLETED, STOPPED, FAILED = "completed", "stopped", "failed"
 TERMINAL_STATUSES = frozenset({COMPLETED, STOPPED, FAILED})
 HOOK_TIMEOUT_S = 120
+# The engine holds an exclusive flock on this run-directory file for its life.
+ENGINE_LOCK = "engine.lock"
 
 
 def is_terminal(status):
@@ -63,16 +67,59 @@ def pid_alive(pid):
         return False
 
 
-def engine_alive(run_dir, pid):
-    """Whether the run's engine process pid is still running.
+def engine_alive(run_dir):
+    """Whether the run's engine process is still running.
 
-    The detached observer writes engine-exit.json when its engine exits. A
-    record naming this pid is definitive even if the PID has since been reused
-    by an unrelated process; without one, fall back to a liveness probe.
+    The run directory is the authority: the engine holds an exclusive flock on
+    ENGINE_LOCK for its whole life, and the kernel drops it however the engine
+    dies (SIGKILL, OOM, a container or host restart), so an unrelated process
+    that later reuses its PID never looks like the engine. Other recorded PIDs
+    are informational.
+
+    A run whose engine predates the lock falls back to engine.pid: an exit
+    record from the observer naming that PID is definitive, otherwise probe it.
     """
+    root = Path(run_dir)
     try:
-        record = json.loads((Path(run_dir) / "engine-exit.json").read_text())
-        if pid and str(record.get("pid")) == str(pid).strip():
+        handle = open(root / ENGINE_LOCK, "rb")
+    except FileNotFoundError:
+        return _legacy_engine_alive(root)
+    with handle:
+        try:
+            # Shared, so concurrent probes never mistake each other for the engine.
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def hold_engine_lock(root, timeout_s=5):
+    """Take the run's engine lock for this process's life; return its handle.
+
+    Probes hold the shared lock only for an instant, so wait briefly for them;
+    a lock still held after timeout_s belongs to another live engine.
+    """
+    handle = open(Path(root) / ENGINE_LOCK, "ab")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError(f"another engine holds {Path(root) / ENGINE_LOCK}") from None
+            time.sleep(0.01)
+
+
+def _legacy_engine_alive(root):
+    try:
+        pid = (root / "engine.pid").read_text().strip()
+    except OSError:
+        return False
+    try:
+        record = json.loads((root / "engine-exit.json").read_text())
+        if pid and str(record.get("pid")) == pid:
             return False
     except (OSError, ValueError, AttributeError):
         pass

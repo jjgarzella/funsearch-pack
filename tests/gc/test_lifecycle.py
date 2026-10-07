@@ -12,6 +12,7 @@ import tomllib
 import unittest
 
 from engine.funsearch.config import Config
+from engine.funsearch.runtime import hold_engine_lock
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
 
 SCRIPTS = ROOT / "scripts"
@@ -103,7 +104,7 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.assertEqual(sum(args[0] == "sling" for args in self.calls()), 3)
         entry = json.loads((self.registry / "run-one.json").read_text())
         self.assertEqual(entry, {"run_id": "run-one", "run_dir": str(root),
-            "run_bead": "test-1", "rig": "example", "pid": os.getpid(), "notify": "operator"})
+            "run_bead": "test-1", "rig": "example", "notify": "operator"})
         self.assertEqual(json.loads((root / "gc-lifecycle.json").read_text())["run_bead"], "test-1")
         # The engine's manifest stays write-once; Gas City state lives beside it.
         self.assertEqual(json.loads((root / "run.json").read_text()), metadata)
@@ -256,6 +257,19 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         failed = json.loads((root / "summary.json").read_text())
         self.assertEqual((failed["status"], failed["reason"]), ("failed", "engine died"))
         self.assertFalse((self.registry / "reused.json").exists())
+
+    def test_sweep_trusts_the_engine_lock_over_a_reused_pid(self):
+        # A lost process tree leaves no exit record; engine.pid names this
+        # live test process, as after the PID is reused.
+        root = self.run_dir("lost")
+        self.hook("on-start", root)
+        with hold_engine_lock(root):
+            self.hook("sweep")
+            self.assertFalse((root / "summary.json").exists())
+        self.hook("sweep")
+        failed = json.loads((root / "summary.json").read_text())
+        self.assertEqual((failed["status"], failed["reason"]), ("failed", "engine died"))
+        self.assertFalse((self.registry / "lost.json").exists())
 
     def test_sweep_keeps_failed_delivery_entry_and_touches_timestamp(self):
         root = self.run_dir(pid=99999999)
