@@ -3,6 +3,8 @@
 import hashlib
 import re
 
+from ._protocol import IDEA_PREFIX
+
 # Keep token boundaries: x + +y and x++ + y must remain different.
 _TOKEN = re.compile(
     r'(?P<comment>//[^\n]*|/\*[\s\S]*?\*/)|'
@@ -11,6 +13,10 @@ _TOKEN = re.compile(
     r'(?:\.?[0-9])(?:[eEpP][+-]|[A-Za-z_0-9.])*|'
     r'>>=|<<=|\.\.\.|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||'
     r'\*=|/=|%=|\+=|-=|&=|\^=|\|=|%:%:|%:|<:|:>|<%|%>|##|[^\s]', re.MULTILINE)
+
+# Anchored to the shared IDEA_PREFIX constant so the writer (tasks.py's
+# instructions) and this parser cannot silently drift.
+_IDEA = re.compile(re.escape(IDEA_PREFIX) + r"\s*(.*)")
 
 
 def normalize_source(source: str) -> str:
@@ -56,7 +62,7 @@ def normalized_hash(source: str) -> str:
 def extract_idea(source: str) -> str:
     for match in _TOKEN.finditer(source):
         if match.lastgroup == "comment":
-            idea = re.match(r"//\s*IDEA:\s*(.*)", match.group())
+            idea = _IDEA.match(match.group())
             if idea:
                 return idea.group(1).strip()
     return ""

@@ -5,8 +5,9 @@ import random
 import re
 import shutil
 
+from ._protocol import CHILD_FILENAME, IDEA_PREFIX, TASK_FILENAME
 from .config import Config
-from .db import Database
+from .db import Database, NEXT_ISLAND
 from .evolve import sample_parents
 
 
@@ -27,12 +28,12 @@ def render_task(cfg: Config, statement: str, header: str, parents, children, tas
     if not children:
         sections.append("No children tried yet.\n")
     for child in children:
-        idea = child.idea.replace("\n", " ") or "(no IDEA line)"
+        idea = child.idea.replace("\n", " ") or f"(no {IDEA_PREFIX} line)"
         sections.append(f"- {idea} — status: {child.status}; score: {child.score}\n")
     sections.append(
         "\n## Instructions\n\n"
-        f"Write a whole C file to `child.c` in this task directory: `{task_dir}`.\n"
-        "Start the file with a one-line `// IDEA: <what you changed and why>`.\n"
+        f"Write a whole C file to `{CHILD_FILENAME}` in this task directory: `{task_dir}`.\n"
+        f"Start the file with a one-line `{IDEA_PREFIX} <what you changed and why>`.\n"
         f"You may try up to {cfg.search.trial_budget} times, then submit.\n")
     return "".join(sections)
 
@@ -52,17 +53,17 @@ def create_task(db: Database, cfg: Config, problem_dir, run_dir, slot="", *,
     created_directory = False
     try:
         with db.transaction():
-            island = db.get_state("next_island", 0) % cfg.search.islands
+            island = db.get_state(NEXT_ISLAND, 0) % cfg.search.islands
             parents = sample_parents(db, island, cfg.search.parents_per_task, rng)
             if not parents:
                 raise ValueError(f"island {island} has no OK parents; seed the database first")
             task = db.add_task(island, [parent.id for parent in parents], slot=slot)
-            db.set_state("next_island", (island + 1) % cfg.search.islands)
+            db.set_state(NEXT_ISLAND, (island + 1) % cfg.search.islands)
             task_dir = Path(run_dir).resolve() / "tasks" / str(task.id)
             task_dir.mkdir(parents=True, exist_ok=False)
             created_directory = True
             text = render_task(cfg, statement, header, parents, db.recent_children(island), task_dir)
-            (task_dir / "TASK.md").write_text(text, encoding="utf-8")
+            (task_dir / TASK_FILENAME).write_text(text, encoding="utf-8")
         return task.id
     except BaseException:
         if created_directory:

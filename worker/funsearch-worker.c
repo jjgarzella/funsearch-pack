@@ -322,7 +322,12 @@ int main(int argc, char **argv)
     while ((length = read_request()) != -1) {
         if (length == -2) {
             fatal("stdin read failed");
-            exit_code = 3;
+            /* Distinct from the pre-loop exit code 3, which the host treats
+             * as a permanent, non-restartable evaluator-init failure: this
+             * read() failure can happen after fs_init and any number of
+             * completed scoring replies, so it must be an ordinary crash the
+             * host restarts the worker from, not one that disables it. */
+            exit_code = 4;
             break;
         }
         if (length == -3) {

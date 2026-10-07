@@ -13,6 +13,7 @@ import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
+from funsearch._protocol import CHILD_FILENAME, TASK_FILENAME  # noqa: E402
 from funsearch.db import Database  # noqa: E402
 
 
@@ -51,8 +52,9 @@ def task_file(value, home, data, *, write=False):
     # Resolving only the user path would otherwise accept a symlinked task dir.
     if directory.resolve() != directory or path.parent != directory:
         raise ValueError("file must belong to this slot's current task")
-    if path.name not in ({"child.c"} if write else {"TASK.md", "child.c"}):
-        raise ValueError("only TASK.md and child.c are exposed; write only child.c")
+    if path.name not in ({CHILD_FILENAME} if write else {TASK_FILENAME, CHILD_FILENAME}):
+        raise ValueError(f"only {TASK_FILENAME} and {CHILD_FILENAME} are exposed; "
+                         f"write only {CHILD_FILENAME}")
     return task
 
 

@@ -4,7 +4,7 @@ import math
 import random
 
 from .config import Config
-from .db import Database, Program, ProgramSummary
+from .db import Database, ISLAND_RESETS, ISLANDS, NEXT_ISLAND, Program, ProgramSummary
 
 
 DEFAULT_TEMPERATURE = 0.1
@@ -45,8 +45,8 @@ def seed_islands(db: Database, cfg: Config, source: str, *, score: float,
             raise ValueError("program database is already seeded")
         seeds = [db.add_program(i, source, score=score, sig=sig, msg=msg, program_id=0 if i == 0 else None)
                  for i in range(cfg.search.islands)]
-        db.set_state("islands", cfg.search.islands)
-        db.set_state("next_island", 0)
+        db.set_state(ISLANDS, cfg.search.islands)
+        db.set_state(NEXT_ISLAND, 0)
         return seeds
 
 
@@ -77,7 +77,7 @@ def sample_parents(db: Database, island: int, count: int, rng: random.Random,
 def reset_weakest(db: Database, rng: random.Random, *, islands=None) -> list[int]:
     """Reset the weaker floor(N/2) islands from random survivors' best programs."""
     with db.transaction():
-        count = islands if islands is not None else db.get_state("islands")
+        count = islands if islands is not None else db.get_state(ISLANDS)
         if count is None:
             ids = sorted({p.island for p in db.list_programs()})
         else:
@@ -97,5 +97,5 @@ def reset_weakest(db: Database, rng: random.Random, *, islands=None) -> list[int
             db.archive_island(island)
             db.add_program(island, seed.source, score=seed.score, sig=seed.sig,
                            msg=seed.msg, idea=seed.idea, norm_hash=seed.norm_hash)
-        db.increment_state("island_resets")
+        db.increment_state(ISLAND_RESETS)
         return weakest

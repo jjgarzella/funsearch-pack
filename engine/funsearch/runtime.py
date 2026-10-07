@@ -10,6 +10,7 @@ import subprocess
 import time
 
 from .config import Config, ConfigError
+from .db import STATUS, STOP_REQUESTED
 
 
 # Run lifecycle, recorded as the "status" state key by the engine daemon:
@@ -49,7 +50,7 @@ def read_run(run_dir, *, require_db=True):
 
 
 def require_running(db):
-    if db.get_state("status") != RUNNING or db.get_state("stop_requested", False):
+    if db.get_state(STATUS) != RUNNING or db.get_state(STOP_REQUESTED, False):
         raise RunOver("RUN_OVER")
 
 

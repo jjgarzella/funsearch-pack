@@ -17,7 +17,8 @@ import uuid
 from .compile import compile_candidate
 from .config import ConfigError, load_config
 from .daemon import daemonize, recover_outputs
-from .db import Database
+from .db import (BEST_SCORE, CHILDREN_OK, CHILDREN_SCORED, CLAIM_TIMEOUT_S, Database, END_BY,
+                 PLATEAU_COUNT, SEED_SCORE, STARTED_AT, STATUS, STOP_REQUESTED)
 from .evaluator import build_evaluator, evaluator_digest, snapshot_evaluator
 from .evolve import seed_islands
 from .normalize import normalized_hash
@@ -139,10 +140,10 @@ def start_run(args):
     with Database(root / "db.sqlite") as db:
         with db.transaction():
             seed_islands(db, cfg, source, score=result["score"], sig=result["sig"], msg=result["msg"])
-            for key, value in {"status": STARTING, "started_at": time.time(),
-                               "seed_score": result["score"], "best_score": result["score"],
-                               "children_scored": 0, "children_ok": 0, "plateau_count": 0,
-                               "stop_requested": False}.items():
+            for key, value in {STATUS: STARTING, STARTED_AT: time.time(),
+                               SEED_SCORE: result["score"], BEST_SCORE: result["score"],
+                               CHILDREN_SCORED: 0, CHILDREN_OK: 0, PLATEAU_COUNT: 0,
+                               STOP_REQUESTED: False}.items():
                 db.set_state(key, value)
     # Returns once the daemon has started its workers and run the on-start hook.
     daemonize(root)
@@ -165,8 +166,8 @@ def wait_result(db, evaluation):
     which covers worker replacement around the candidate's own timeout.
     The engine publishes both keys together with status running.
     """
-    claim_timeout_s = db.get_state("claim_timeout_s")
-    end_by = db.get_state("end_by")
+    claim_timeout_s = db.get_state(CLAIM_TIMEOUT_S)
+    end_by = db.get_state(END_BY)
     if claim_timeout_s is None or end_by is None:
         raise RuntimeError("the engine published no client deadlines (claim_timeout_s, end_by); "
                            "it predates this funsearch, so restart the run")
@@ -176,7 +177,7 @@ def wait_result(db, evaluation):
             if current.result.get("run_over"):
                 raise RunOver("RUN_OVER")
             return current.result
-        if is_terminal(db.get_state("status")):
+        if is_terminal(db.get_state(STATUS)):
             raise RunOver("RUN_OVER")
         if not engine_alive(db.path.parent):
             raise RuntimeError("engine process is not alive")
@@ -286,7 +287,7 @@ def dispatch(args):
         elif args.command in ("try", "submit"):
             return evaluate(args, root, cfg, db)
         elif args.command == "stop":
-            db.set_state("stop_requested", True)
+            db.set_state(STOP_REQUESTED, True)
             print("STOP_REQUESTED")
         elif args.command == "run":
             status = db.all_state()

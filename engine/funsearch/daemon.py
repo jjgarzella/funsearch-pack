@@ -13,7 +13,9 @@ import time
 import traceback
 
 from .compile import try_worker_env
-from .db import Database
+from .db import (BEST_SCORE, CHILDREN_OK, CHILDREN_SCORED, CLAIM_TIMEOUT_S, Database,
+                 END_BY, ENDED_AT, PID, PLATEAU_COUNT, REASON, SEED_SCORE, SNAPSHOTS,
+                 STARTED_AT, STATUS, STOP_REQUESTED)
 from .evolve import reset_weakest
 from .normalize import normalized_hash
 from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
@@ -50,7 +52,7 @@ def _busy(exc):
 def snapshot(db, root):
     directory = root / "snapshots"
     directory.mkdir(exist_ok=True)
-    n = db.increment_state("snapshots")
+    n = db.increment_state(SNAPSHOTS)
     db.backup(directory / f"db-{n}.sqlite")
     files = sorted(directory.glob("db-*.sqlite"), key=lambda p: int(p.stem[3:]))
     for path in files[:-5]:
@@ -59,13 +61,13 @@ def snapshot(db, root):
 
 def stop_reason(db, cfg):
     state = db.all_state()  # One read transaction for every condition.
-    if state.get("stop_requested", False):
+    if state.get(STOP_REQUESTED, False):
         return "stop requested"
-    if time.time() - state["started_at"] >= cfg.stop.duration_s:
+    if time.time() - state[STARTED_AT] >= cfg.stop.duration_s:
         return "duration_s"
-    if state.get("children_scored", 0) >= cfg.stop.max_children:
+    if state.get(CHILDREN_SCORED, 0) >= cfg.stop.max_children:
         return "max_children"
-    if cfg.stop.plateau_children and state.get("plateau_count", 0) >= cfg.stop.plateau_children:
+    if cfg.stop.plateau_children and state.get(PLATEAU_COUNT, 0) >= cfg.stop.plateau_children:
         return "plateau_children"
     return None
 
@@ -92,9 +94,9 @@ def store_result(db, evaluation, result):
         else:
             task = db.get_task(evaluation.task_id)
             # Every scored submission spends budget, stored or not.
-            db.increment_state("children_scored")
+            db.increment_state(CHILDREN_SCORED)
             if result["status"] == "OK":
-                db.increment_state("children_ok")
+                db.increment_state(CHILDREN_OK)
             duplicate = db.has_normalized_hash(norm_hash)
             if result["status"] == "OK":
                 duplicate = duplicate or db.has_scored_duplicate(result["score"], result["sig"])
@@ -110,11 +112,11 @@ def store_result(db, evaluation, result):
                 result["program_id"] = program.id
             # Only a stored program can improve the best score; a rejected
             # child must not leave later children chasing a phantom best.
-            if "program_id" in result and result["status"] == "OK" and result["score"] > db.get_state("best_score"):
-                db.set_state("best_score", result["score"])
-                db.set_state("plateau_count", 0)
+            if "program_id" in result and result["status"] == "OK" and result["score"] > db.get_state(BEST_SCORE):
+                db.set_state(BEST_SCORE, result["score"])
+                db.set_state(PLATEAU_COUNT, 0)
             else:
-                db.increment_state("plateau_count")
+                db.increment_state(PLATEAU_COUNT)
         db.finish_evaluation(evaluation.id, result)
 
 
@@ -143,16 +145,16 @@ def finish_unscored(db, reason):
 
 def write_outputs(db, root, metadata, cfg, status, reason):
     ended = time.time()
-    started = db.get_state("started_at")
-    scored = db.get_state("children_scored", 0)
-    ok = db.get_state("children_ok", 0)
+    started = db.get_state(STARTED_AT)
+    scored = db.get_state(CHILDREN_SCORED, 0)
+    ok = db.get_state(CHILDREN_OK, 0)
     best = top_programs(db)
     summary = {"run_id": metadata["run_id"], "instance": cfg.problem.instance,
                "status": status, "reason": reason, "started_at": started, "ended_at": ended,
                "children_scored": scored, "children_ok": ok,
                "ok_rate": ok / scored if scored else 0,
                "best_score": best[0].score if best else None,
-               "seed_score": db.get_state("seed_score"),
+               "seed_score": db.get_state(SEED_SCORE),
                "best_program_id": best[0].id if best else None,
                "throughput_per_hour": scored * 3600 / max(ended - started, 0.001),
                "islands": [{"island": i, "best_program_id": p.id if p else None,
@@ -160,9 +162,9 @@ def write_outputs(db, root, metadata, cfg, status, reason):
                            for i in range(cfg.search.islands)
                            for p in [db.best_program(i)]]}
     with db.transaction():
-        db.set_state("status", status)
-        db.set_state("reason", reason)
-        db.set_state("ended_at", ended)
+        db.set_state(STATUS, status)
+        db.set_state(REASON, reason)
+        db.set_state(ENDED_AT, ended)
     temporary = root / "summary.json.tmp"
     temporary.write_text(json.dumps(summary, indent=2) + "\n")
     temporary.replace(root / "summary.json")
@@ -199,7 +201,39 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
     raise RuntimeError("no readable run database" + "".join(f"\n{e}" for e in errors))
 
 
+def _dispatch(pools, executors, pending, db, cfg):
+    """Claim queued evaluations up to each pool's free capacity and submit them.
+
+    submit capacity is additionally capped by the run's remaining max_children
+    budget (including other in-flight submissions), so concurrent workers
+    cannot overshoot it; try capacity is bounded only by pool size.
+    """
+    for kind in ("submit", "try"):
+        occupied = sum(e.kind == kind for e in pending.values())
+        capacity = cfg.search.workers - occupied
+        if kind == "submit":
+            capacity = min(capacity, cfg.stop.max_children -
+                           db.get_state(CHILDREN_SCORED, 0) - occupied)
+        for _ in range(capacity):
+            evaluation = db.claim_evaluation(kind)
+            if evaluation is None:
+                break
+            future = executors[kind].submit(pools[kind].score, evaluation.so_path,
+                                             cfg.evaluator.timeout_s)
+            pending[future] = evaluation
+
+
 def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_s, busy_retry_s):
+    """Run one engine's whole life: worker pools, the scoring loop, and teardown.
+
+    Entered by daemonize()'s bootstrap in the detached engine process. Holds
+    the run's engine lock for its entire life (engine_alive's restart-proof
+    identity), runs the on-start hook before signaling readiness on ready_fd,
+    then loops claiming and scoring queued evaluations (see _dispatch) until a
+    stop condition or a fatal error, and finally writes durable outputs, runs
+    the on-finish hook, and cleans up — all from one finally so a failure in
+    any step cannot skip the ones after it.
+    """
     root, metadata, cfg = read_run(run_dir)
     # Held until this process exits: engine_alive's restart-proof identity.
     engine_lock = hold_engine_lock(root)  # noqa: F841
@@ -229,11 +263,11 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
         # finishes within claim_timeout_s, and every request by end_by.
         claim_timeout_s = score_budget_s(cfg.evaluator.timeout_s) + CLAIM_SLACK_S
         with db.transaction():
-            db.set_state("claim_timeout_s", claim_timeout_s)
-            db.set_state("end_by", db.get_state("started_at") + cfg.stop.duration_s
+            db.set_state(CLAIM_TIMEOUT_S, claim_timeout_s)
+            db.set_state(END_BY, db.get_state(STARTED_AT) + cfg.stop.duration_s
                          + stop_grace_s + claim_timeout_s)
-            db.set_state("status", RUNNING)
-            db.set_state("pid", os.getpid())
+            db.set_state(STATUS, RUNNING)
+            db.set_state(PID, os.getpid())
         (root / "engine.pid").write_text(str(os.getpid()) + "\n")
         log_event("worker pools ready")
         # The engine owns startup as it owns shutdown: the on-start hook runs
@@ -256,7 +290,7 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
         while True:
             try:
                 if signal_stop:
-                    db.set_state("stop_requested", True)
+                    db.set_state(STOP_REQUESTED, True)
                 for future, evaluation in list(pending.items()):
                     if future.done():
                         try:
@@ -275,7 +309,7 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
                     if found:
                         reason = found
                         status = STOPPED if found == "stop requested" else COMPLETED
-                        db.set_state("status", STOPPING)
+                        db.set_state(STATUS, STOPPING)
                         stop_deadline = time.monotonic() + stop_grace_s
                 if stop_deadline is not None:
                     cancel_queued(db)
@@ -285,19 +319,7 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
                         for pool in pools.values():
                             pool.abort()
                 else:
-                    for kind in ("submit", "try"):
-                        occupied = sum(e.kind == kind for e in pending.values())
-                        capacity = cfg.search.workers - occupied
-                        if kind == "submit":
-                            capacity = min(capacity, cfg.stop.max_children -
-                                           db.get_state("children_scored", 0) - occupied)
-                        for _ in range(capacity):
-                            evaluation = db.claim_evaluation(kind)
-                            if evaluation is None:
-                                break
-                            future = executors[kind].submit(pools[kind].score, evaluation.so_path,
-                                                             cfg.evaluator.timeout_s)
-                            pending[future] = evaluation
+                    _dispatch(pools, executors, pending, db, cfg)
                 now = time.monotonic()
                 if stop_deadline is None and now - last_reset >= cfg.search.reset_period_s:
                     reset_weakest(db, rng)
@@ -339,7 +361,7 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
             except BaseException:
                 traceback.print_exc()
         try:
-            db.set_state("status", STOPPING)
+            db.set_state(STATUS, STOPPING)
         except BaseException:
             traceback.print_exc()
     finally:

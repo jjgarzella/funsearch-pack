@@ -131,6 +131,29 @@ CREATE INDEX IF NOT EXISTS programs_island_recent
 """
 _RANK_ORDER = "ORDER BY score DESC, source_length, id"
 
+# Keys of the generic state(key,value) table (Database.get_state/set_state/
+# increment_state), named here so a typo'd key is a NameError at the call
+# site instead of a silently-defaulted read, and the set of keys that exist
+# is this list instead of a grep across cli.py/daemon.py/evolve.py. Values
+# are JSON-encoded by set_state; the type noted is what each key holds.
+STATUS = "status"                    # str: one of runtime.py's lifecycle statuses
+REASON = "reason"                    # str: stop_reason()'s reason or an error message
+STARTED_AT = "started_at"            # float: time.time() when the run started
+ENDED_AT = "ended_at"                # float: time.time() when the run ended
+PID = "pid"                          # int: informational; engine_alive() is authoritative
+STOP_REQUESTED = "stop_requested"    # bool
+CHILDREN_SCORED = "children_scored"  # int: authoritative submitted-evaluation count
+CHILDREN_OK = "children_ok"          # int
+BEST_SCORE = "best_score"            # float
+SEED_SCORE = "seed_score"            # float
+PLATEAU_COUNT = "plateau_count"      # int: consecutive non-improving submissions
+CLAIM_TIMEOUT_S = "claim_timeout_s"  # float: published client deadline, see workers.py
+END_BY = "end_by"                    # float: published client deadline (epoch seconds)
+ISLANDS = "islands"                  # int: island count at seeding time
+NEXT_ISLAND = "next_island"          # int: round-robin cursor for create_task
+ISLAND_RESETS = "island_resets"      # int: counter incremented by reset_weakest
+SNAPSHOTS = "snapshots"              # int: counter used to number snapshot files
+
 # PRAGMA user_version of the layout above. Version 0 is any database written
 # before the layout was versioned, with or without trial_n and source_length.
 SCHEMA_VERSION = 1
