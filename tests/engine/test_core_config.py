@@ -1,3 +1,4 @@
+from dataclasses import fields
 from pathlib import Path
 import shutil
 import tempfile
@@ -25,6 +26,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.search.islands, 4)
         self.assertEqual(cfg.stop.plateau_children, 0)
         self.assertEqual(cfg.mutator.model, "claude-haiku-4-5-20251001")
+
+    def test_float_fields_have_float_defaults_and_accept_integers(self):
+        # _check_type picks numeric checking from the default's type.
+        for section in fields(Config):
+            for field in fields(section.type):
+                if field.type is float:
+                    key = f"{section.name}.{field.name}"
+                    with self.subTest(key=key):
+                        self.assertIs(type(getattr(getattr(Config(), section.name), field.name)), float)
+                        self.assertEqual(getattr(getattr(apply_overrides(Config(), [f"{key}=2"]), section.name),
+                                                 field.name), 2)
+                        self.assertEqual(getattr(getattr(apply_overrides(Config(), [f"{key}=2.5"]), section.name),
+                                                 field.name), 2.5)
 
     def test_typed_overrides(self):
         cfg = load_config(self.root, ["search.islands=6", "stop.max_children=50", "stop.duration_s=0.5",

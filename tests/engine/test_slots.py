@@ -107,6 +107,13 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["pending_task"], {
             "id": task.id, "dir": str(run / "tasks" / str(task.id)), "trials_used": 1})
+        # The mutator prompt names these keys; they must be what show prints.
+        prompt = (PACK / "agents" / "mutator" / "prompt.template.md").read_text()
+        step = prompt[prompt.index("slot show <bead_id>"):prompt.index("\n2. ")]
+        for key in ("run_dir", "slot", "tasks_per_session", "pending_task"):
+            self.assertIn(f"`{key}`", step)
+            self.assertIn(key, json.loads(result.stdout))
+        self.assertNotIn("fs.", step)
 
     def test_finish_hook_already_closed_slot_is_a_read_only_success(self):
         self.row["status"] = "closed"

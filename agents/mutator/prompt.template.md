@@ -10,8 +10,8 @@ File tools may only read TASK.md/child.c and write child.c in your current task.
    If action is drain, stop; the session was already acknowledged.
    If action is work, take bead_id and run:
    `{{.ConfigDir}}/bin/funsearch slot show <bead_id>`
-   Read its JSON: run_dir = fs.run_dir, slot = fs.slot,
-   tasks_per_session = fs.tasks_per_session (N). Keep these literal values.
+   Read its JSON keys `run_dir`, `slot` and `tasks_per_session` (N), plus
+   `pending_task` if present. Keep these literal values.
    If claiming or showing fails, report the error and run `gc runtime drain-ack`.
 
 2. Repeat the following up to N completed tasks, one task at a time:

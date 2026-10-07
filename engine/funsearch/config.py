@@ -28,7 +28,7 @@ class Candidate:
 class Evaluator:
     build: str = "make -C evaluator"
     library: str = "evaluator/libevaluator.so"
-    timeout_s: float = 30
+    timeout_s: float = 30.0
     memory_mb: int = 2048
     # Extra variable names (fnmatch patterns) evaluator workers inherit.
     env: list[str] = field(default_factory=list)
@@ -42,12 +42,12 @@ class Search:
     trial_budget: int = 3
     parents_per_task: int = 2
     workers: int = 2
-    reset_period_s: float = 1800
+    reset_period_s: float = 1800.0
 
 
 @dataclass
 class Stop:
-    duration_s: float = 3600
+    duration_s: float = 3600.0
     max_children: int = 100
     plateau_children: int = 0
 
@@ -73,7 +73,7 @@ class Config:
 def _check_type(key, value, default):
     if isinstance(default, list):
         valid = isinstance(value, list) and all(isinstance(v, str) and v.strip() for v in value)
-    elif isinstance(default, float) or key in {"evaluator.timeout_s", "search.reset_period_s", "stop.duration_s"}:
+    elif isinstance(default, float):
         valid = type(value) in (int, float) and math.isfinite(value)
     else:
         valid = type(value) is type(default)
