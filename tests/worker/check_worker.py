@@ -182,6 +182,18 @@ class WorkerTests(unittest.TestCase):
                     "status": "ERROR", "score": 0, "sig": [], "msg": "bad request",
                 })
 
+    def test_sync_echoes_its_token_only(self):
+        process = self.start()
+        self.assertEqual(self.receive(process, "SYNC #ab12"), {"sync": "ab12"})
+        for request in ("SYNC", "SYNC #", "SYNC ab12", "SYNC #ab12 extra", "SYNC #XYZ"):
+            with self.subTest(request=request):
+                self.assertEqual(self.receive(process, request), {
+                    "status": "ERROR", "score": 0, "sig": [], "msg": "bad request",
+                })
+        # An overlong request is rejected and the next request still parses.
+        self.assertEqual(self.receive(process, "SCORE /" + "a" * 70000)["msg"], "bad request")
+        self.assertEqual(self.score(process, "good")["score"], 3.5)
+
     def test_memory_limit(self):
         process = self.start("limit", "edge_eval", {"FS_MEMORY_MB": "128"})
         result = self.score(process, "good")

@@ -25,6 +25,9 @@ STDERR_LIMIT_BYTES = 1 << 20
 RECYCLE_SCORES = 100
 # Startup and scoring failures carry this much of the worker's stderr (evaluator output).
 STDERR_TAIL_BYTES = 2048
+# After a scoring reply, an honest worker answers the SYNC barrier at once; a
+# reply that arrives just before the deadline still gets this long for it.
+SYNC_TIMEOUT_S = 5
 _build_lock = threading.Lock()
 
 
@@ -36,10 +39,11 @@ def start_budget_s():
 def score_budget_s(timeout_s):
     """Longest one Worker.score call may take.
 
-    A recycle may replace the worker before the candidate runs, and a timeout
-    or crash replaces it again before the call returns.
+    A recycle may replace the worker before the candidate runs, the SYNC
+    barrier may follow the reply, and a timeout or crash replaces the worker
+    again before the call returns.
     """
-    return timeout_s + 2 * start_budget_s()
+    return timeout_s + SYNC_TIMEOUT_S + 2 * start_budget_s()
 
 
 class WorkerError(RuntimeError):
@@ -198,6 +202,29 @@ class Worker:
         self.process.stdin.write((request + "\n").encode("utf-8"))
         self.process.stdin.flush()
 
+    def _sync(self, deadline):
+        """Require the accepted reply to be the only line before a barrier.
+
+        Candidate code shares the worker process. If it wrote a reply carrying
+        this request's token, the worker's own reply is a second line here.
+        """
+        token = secrets.token_hex(16)
+        self._send(f"SYNC #{token}")
+        line = self._line(deadline)
+        try:
+            synced = json.loads(line) == {"sync": token}
+        except ValueError:
+            synced = False
+        if not synced:
+            raise WorkerError("extra output on the protocol fd during scoring")
+
+    def _stale_output(self):
+        """Whether protocol output arrived after the last completed request."""
+        if self.process is None or self._buffer:
+            return True
+        readable, _, _ = select.select([self.process.stdout], [], [], 0)
+        return bool(readable)
+
     def _dispose(self, graceful=False):
         if self.process is not None:
             try:
@@ -290,9 +317,11 @@ class Worker:
                 raise WorkerError("worker is closed")
             if self._failure is not None:
                 raise self._failure
-            if self._recycle_due:
+            if self._recycle_due or self._stale_output():
                 # Outside the deadline: the replacement's fs_init is not
-                # charged to this candidate's timeout.
+                # charged to this candidate's timeout. Late output (an earlier
+                # candidate's leftover thread or child, or a dead worker's EOF)
+                # is never read as this request's reply.
                 self._recycle()
                 if self._failure is not None:
                     raise self._failure
@@ -303,6 +332,7 @@ class Worker:
             try:
                 self._send(f"SCORE #{nonce} {path}")
                 reply = _checked_reply(json.loads(self._line(deadline)), nonce)
+                self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
             except TimeoutError:
                 result = _error(f"timeout after {timeout_s:g}s")
             except (EOFError, BrokenPipeError):

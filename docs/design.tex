@@ -292,6 +292,8 @@ There is one request per stdin line and one JSON result per stdout line:
 \begin{lstlisting}
 SCORE [#<hex token> ]<absolute path to candidate .so>
 {["nonce":"<token>",]"status":"OK|INVALID|ERROR","score":<num>|null,"sig":[...],"msg":"..."}
+SYNC #<hex token>
+{"sync":"<token>"}
 QUIT
 \end{lstlisting}
 For each SCORE request, the worker opens the candidate using
@@ -303,8 +305,13 @@ The worker evaluates one candidate at a time. JSON has no NaN, so an
 \code{INVALID} or \code{ERROR} result keeps its own status and message: a
 non-finite score is sent as \code{null} and a non-finite signature is dropped
 (empty \code{sig}). When the request carries a token, the reply echoes it; the
-engine always sends one and discards replies without it, so candidate code
-cannot trivially forge a result on the inherited protocol fd. On \code{QUIT}, it calls
+engine always sends one and discards replies without it. The worker reads
+requests with \code{read(2)} and wipes them before candidate code runs. After
+each reply the engine sends a \code{SYNC} barrier and requires its echo as the
+next line, so a forged reply carrying the token is exposed by the worker's own
+reply that follows it; output after the barrier replaces the worker before the
+next request. Candidate code shares the worker process, so this raises the bar
+against forged results without being an isolation boundary. On \code{QUIT}, it calls
 \code{fs\_fini} if present and exits 0; EOF also runs finalization. The worker
 reserves a protocol stream and redirects evaluator/candidate stdout to stderr
 so native output does not corrupt JSON replies. It restores blocking stdin

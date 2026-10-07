@@ -64,8 +64,10 @@ class WorkerPoolTests(PipelineTestCase):
         process.terminate()
         process.wait(timeout=5)
         good = self.candidate("good")
-        self.assertTrue(pool.score(good, 5)["msg"].startswith(f"worker crashed: signal {signal.SIGTERM}"))
+        # The dead worker's EOF is noticed before the request is sent, so the
+        # next candidate is scored by a replacement instead of being charged.
         self.assertEqual(pool.score(good, 5)["status"], "OK")
+        self.assertIsNot(pool.workers[0].process, process)
 
     def test_timeout_and_recovery(self):
         pool = self.pool()
@@ -243,6 +245,69 @@ double f(void) {
         self.assertEqual(result["status"], "ERROR")
         self.assertIn("does not answer this request", result["msg"])
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    def test_forged_reply_with_the_request_token_is_detected(self):
+        # The token is not in any request buffer, but a candidate sharing the
+        # process can still find the worker's copy. The SYNC barrier then sees
+        # the worker's own reply as a second line.
+        source = self.source(r"""#define _GNU_SOURCE
+#include <link.h>
+#include <stdio.h>
+#include <string.h>
+static char token[33];
+static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    if (info->dlpi_name[0]) return 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
+        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
+        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
+            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
+                memcpy(token, p + j, 32);
+                return 1;
+            }
+    }
+    return 0;
+}
+double f(void) {
+    if (!dl_iterate_phdr(scan, NULL)) return -1;
+    for (int fd = 3; fd < 64; ++fd)
+        dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
+    return 0;
+}
+""")
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "forge-token", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        process = pool.workers[0].process
+        result = pool.score(library, 5)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("extra output on the protocol fd", result["msg"])
+        self.assertIsNot(pool.workers[0].process, process)
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    def test_late_protocol_output_is_not_charged_to_the_next_request(self):
+        source = self.source(r"""#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+double f(void) {
+    if (fork() == 0) {
+        usleep(200000);
+        dprintf(3, "{\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n");
+        _exit(0);
+    }
+    return 1;
+}
+""")
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "late", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        process = pool.workers[0].process
+        self.assertEqual(pool.score(library, 5)["score"], 1)
+        time.sleep(0.6)
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+        self.assertIsNot(pool.workers[0].process, process)
 
     def test_reply_validation(self):
         good = {"status": "OK", "score": 1.5, "sig": [1, 2.5], "msg": ""}

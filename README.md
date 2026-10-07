@@ -271,9 +271,15 @@ Best-effort hygiene for trusted local experiments:
   `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
   the problem's `evaluator.env`. Gas City identity, store scope, agent sockets
   and credentials are not passed on unless a pattern names them.
-- Each scoring request carries a random token that a reply must echo, so a
-  candidate cannot trivially forge its own score on the worker's protocol fd.
-  Candidates share the worker's address space, so this only raises the bar.
+- Each scoring request carries a random token that a reply must echo, and
+  the worker never keeps the request in a stdio buffer. After each reply the
+  engine sends a `SYNC` barrier; any extra line before its echo (such as the
+  worker's genuine reply following a forged one) scores ERROR and replaces the
+  worker, and output arriving after the barrier replaces the worker before the
+  next request. Candidates share the worker's address space, so a determined
+  candidate can still find the token, intercept the barrier or suppress the
+  worker's own reply: this raises the bar against accidental or casual reward
+  hacking and is not an isolation boundary.
 
 These are hygiene measures within the trusted-local model. V1 does not support
 untrusted runs; OS-level isolation remains future work (`mc-v8f3.5`).

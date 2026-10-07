@@ -80,10 +80,18 @@ constructors see what the worker will.
 
 Each request is `SCORE #<token> <path>` with a fresh random token. A reply
 counts only if it echoes that token; anything else is a protocol error, scored
-ERROR, and the worker is replaced. This stops a candidate from trivially
-forging a reply on the inherited protocol fd. Replies must also carry a finite
-score (or null for non-OK statuses) and at most eight finite signature values;
-otherwise the result becomes ERROR.
+ERROR, and the worker is replaced. The worker reads requests with `read(2)`
+into a private buffer and wipes it before candidate code runs. After accepting
+a reply, the engine sends `SYNC #<token2>` and requires the next line to be
+`{"sync":"<token2>"}`; a second reply first (candidate code wrote one carrying
+the token) is a protocol error, scored ERROR, and the worker is replaced. The
+barrier waits until the scoring deadline, or at least `SYNC_TIMEOUT_S` (5 s)
+after the reply. Before each request, any protocol output that arrived after
+the last barrier, or a dead worker's EOF, replaces the worker outside the
+deadline instead of being read as the next candidate's reply. Candidates share
+the worker's address space, so this raises the bar without being a boundary.
+Replies must also carry a finite score (or null for non-OK statuses) and at
+most eight finite signature values; otherwise the result becomes ERROR.
 
 A warm worker accumulates whatever earlier candidates retained. The engine
 recycles it after 100 completed scoring replies (OK, INVALID or ERROR), at the
@@ -103,8 +111,8 @@ process group and start a replacement before returning. A failure to start that
 replacement raises `WorkerError` or `EvaluatorInitError`. The timeout starts
 once a worker becomes available; time waiting for an idle worker and restarting
 a process is additional. `start_budget_s()` and `score_budget_s(timeout_s)`
-bound a worker start and a whole `score` call (a recycle before the candidate
-and a replacement after it); the daemon publishes its client deadlines from
+bound a worker start and a whole `score` call (a recycle before the candidate,
+the SYNC barrier, and a replacement after it); the daemon publishes its client deadlines from
 them as the `claim_timeout_s` and `end_by` state keys, which waiting `try` and
 `submit` clients compare against. `claim_timeout_s` is a duration in seconds
 (`score_budget_s(timeout_s)` plus 60 s of slack), measured from a claimed
