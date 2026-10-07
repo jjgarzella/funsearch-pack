@@ -278,6 +278,7 @@ class Database:
         self._depth += 1
         try:
             yield self
+            self.connection.execute("COMMIT" if depth == 0 else f"RELEASE nested_{depth}")
         except BaseException:
             if depth == 0:
                 self.connection.execute("ROLLBACK")
@@ -285,8 +286,6 @@ class Database:
                 self.connection.execute(f"ROLLBACK TO nested_{depth}")
                 self.connection.execute(f"RELEASE nested_{depth}")
             raise
-        else:
-            self.connection.execute("COMMIT" if depth == 0 else f"RELEASE nested_{depth}")
         finally:
             self._depth -= 1
 

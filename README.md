@@ -99,8 +99,12 @@ selects the correct rig even from another cwd. Direct hook launches require
 
 ## Using the engine directly
 
-The engine needs Python 3.11 or later, a C compiler, `make`, and `flock`; its Python
-modules use only the standard library. It also works without Gas City:
+The engine needs Python 3.11 or later, a C compiler, the ASan runtime,
+`make`, and `flock`; its Python modules use only the standard library.
+Every run initializes an ASan trial pool, even if no `try` calls are planned.
+Check that `${CC:-cc} -print-file-name=libasan.so` resolves to an existing file.
+`CC` selects this runtime discovery compiler independently of
+`candidate.compile_try`. It also works without Gas City:
 
 ```sh
 bin/funsearch check /path/to/problem --instance n=6

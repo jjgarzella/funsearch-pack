@@ -2,9 +2,10 @@
 
 from fnmatch import fnmatchcase
 import os
+import select
 import signal
 import subprocess
-import tempfile
+import threading
 
 
 LOG_BYTES = 4096
@@ -52,23 +53,56 @@ def kill_group(process):
     process.wait()
 
 
+class _StderrPrefix:
+    """Drain stderr continuously, retaining only the first LOG_BYTES in RAM."""
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self.buffer = bytearray()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while True:
+                readable, _, _ = select.select([self.pipe], [], [], 0.1)
+                if readable:
+                    chunk = os.read(self.pipe.fileno(), 65536)
+                    if not chunk:
+                        break
+                    self.buffer.extend(chunk[:max(0, LOG_BYTES - len(self.buffer))])
+                if self.stop.is_set():
+                    break
+        finally:
+            self.pipe.close()
+
+    def close(self):
+        # A descendant may still hold the pipe after the shell exits. Do not
+        # wait for EOF from it; the reader stops within one select interval.
+        self.stop.set()
+        self.thread.join()
+        return self.buffer.decode("utf-8", errors="replace")
+
+
 def run_command(command, cwd, timeout_s):
     """Return (success, bounded stderr), killing the shell group on timeout."""
-    with tempfile.TemporaryFile() as stderr:
-        try:
-            process = subprocess.Popen(command, shell=True, cwd=cwd,
-                                       stdout=subprocess.DEVNULL, stderr=stderr,
-                                       start_new_session=True)
-        except OSError as exc:
-            return False, str(exc)[:LOG_BYTES]
-        timed_out = False
+    try:
+        process = subprocess.Popen(command, shell=True, cwd=cwd,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+    except OSError as exc:
+        return False, str(exc)[:LOG_BYTES]
+    stderr = _StderrPrefix(process.stderr)
+    timed_out = False
+    try:
         try:
             process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             kill_group(process)
-        stderr.seek(0)
-        log = stderr.read(LOG_BYTES).decode("utf-8", errors="replace")
+    finally:
+        log = stderr.close()
     if timed_out:
         message = f"command timed out after {timeout_s:g}s\n"
         return False, message + log[:LOG_BYTES - len(message)]

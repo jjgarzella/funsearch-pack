@@ -122,6 +122,25 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(saved.get_state("filler-49"), "x" * 2000)
         self.assertEqual(sorted(p.name for p in backup.parent.glob("busy.sqlite*")), ["busy.sqlite"])
 
+    def test_busy_commit_rolls_back_and_write_can_be_retried(self):
+        self.db.set_state("status", "running")
+        self.db.connection.execute("PRAGMA busy_timeout=25")
+        reader = sqlite3.connect(self.path)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM state").fetchall()
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            with self.db.transaction():
+                self.db.set_state("status", "failed")
+                self.db.add_task(0)
+        self.assertFalse(self.db.connection.in_transaction)
+        self.assertEqual(self.db._depth, 0)
+        reader.rollback()
+        self.assertEqual(self.db.get_state("status"), "running")
+        self.assertEqual(self.db.list_tasks(), [])
+        self.db.set_state("status", "retried")
+        self.assertEqual(self.db.get_state("status"), "retried")
+
     def test_readonly_client_and_missing_file(self):
         self.db.set_state("status", "running")
         with Database(self.path, readonly=True) as client:

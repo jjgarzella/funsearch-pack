@@ -89,6 +89,24 @@ class WorkerPoolTests(PipelineTestCase):
             with self.assertRaisesRegex(EvaluatorInitError, "code 3"):
                 self.pool()
 
+    def test_candidate_exit_three_is_recoverable_after_startup(self):
+        pool = self.pool()
+        for body in ("double f(void) { exit(3); }",
+                     "__attribute__((constructor)) static void die(void) { exit(3); }\n"
+                     "double f(void) { return 1; }"):
+            with self.subTest(body=body):
+                source = self.source("#include <stdlib.h>\n" + body)
+                ok, library, log = compile_candidate(self.cfg, source,
+                                                     self.root / "exit-three-candidate", "final")
+                self.assertTrue(ok, log)
+                process = pool.workers[0].process
+                result = pool.score(library, 5)
+                self.assertEqual(result["status"], "ERROR")
+                self.assertIn("worker crashed: exit code 3", result["msg"])
+                self.assertIsNone(pool.workers[0]._failure)
+                self.assertIsNot(pool.workers[0].process, process)
+                self.assertEqual(pool.score(self.candidate("good"), 5)["status"], "OK")
+
     def test_partial_pool_startup_failure_closes_previous_workers(self):
         counter = self.root / "init-counter"
         mark = self.root / "previous-fini"

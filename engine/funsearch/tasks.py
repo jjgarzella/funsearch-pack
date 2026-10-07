@@ -4,6 +4,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import uuid
 
 from ._protocol import CHILD_FILENAME, IDEA_PREFIX, TASK_FILENAME
 from .config import Config
@@ -44,6 +45,8 @@ def create_task(db: Database, cfg: Config, problem_dir, run_dir, slot="", *,
 
     File creation and DB updates are coordinated under a short write transaction.
     A failed write rolls back the task and island cursor and removes its directory.
+    Directories left by killed clients are preserved under .orphan-* names when
+    their uncommitted IDs are reused; committed task directories are untouched.
     """
     root = Path(problem_dir)
     statement = (root / "problem.md").read_bytes().decode("utf-8")
@@ -60,7 +63,15 @@ def create_task(db: Database, cfg: Config, problem_dir, run_dir, slot="", *,
             task = db.add_task(island, [parent.id for parent in parents], slot=slot)
             db.set_state(NEXT_ISLAND, (island + 1) % cfg.search.islands)
             task_dir = Path(run_dir).resolve() / "tasks" / str(task.id)
-            task_dir.mkdir(parents=True, exist_ok=False)
+            try:
+                task_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                # INSERT allocated an ID above every committed task while we
+                # hold the writer lock. A preexisting directory at this ID can
+                # only belong to an allocation whose transaction rolled back.
+                # Preserve its contents for inspection, then retry publication.
+                task_dir.rename(task_dir.with_name(f".orphan-{task.id}-{uuid.uuid4().hex}"))
+                task_dir.mkdir(exist_ok=False)
             created_directory = True
             text = render_task(cfg, statement, header, parents, db.recent_children(island), task_dir)
             (task_dir / TASK_FILENAME).write_text(text, encoding="utf-8")

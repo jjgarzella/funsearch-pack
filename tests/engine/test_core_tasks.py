@@ -1,5 +1,7 @@
 from pathlib import Path
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -66,15 +68,42 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(text.startswith(statement))
         self.assertIn(header, text)
 
-    def test_existing_directory_rolls_back_and_preserves_files(self):
+    def test_orphan_directory_is_preserved_and_allocation_recovers(self):
         directory = self.run / "tasks" / "1"
         directory.mkdir(parents=True)
         (directory / "keep").write_text("existing")
-        with self.assertRaises(FileExistsError):
-            create_task(self.db, self.cfg, FIXTURE, self.run)
+        task_id = create_task(self.db, self.cfg, FIXTURE, self.run)
+        self.assertEqual(task_id, 1)
+        self.assertEqual(self.db.get_state("next_island"), 1)
+        orphan, = (self.run / "tasks").glob(".orphan-1-*")
+        self.assertEqual((orphan / "keep").read_text(), "existing")
+        self.assertTrue((directory / "TASK.md").exists())
+
+    def test_client_death_before_outer_commit_does_not_stall_slots(self):
+        script = """
+import os, sys
+from engine.funsearch.config import load_config
+from engine.funsearch.db import Database
+from engine.funsearch.tasks import create_task
+with Database(sys.argv[1]) as db, db.transaction():
+    create_task(db, load_config(sys.argv[2]), sys.argv[2], sys.argv[3], 'dead')
+    os._exit(77)
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(self.run / "db.sqlite"),
+                                 str(FIXTURE), str(self.run)], timeout=10)
+        self.assertEqual(result.returncode, 77)
         self.assertEqual(self.db.list_tasks(), [])
-        self.assertEqual(self.db.get_state("next_island"), 0)
-        self.assertEqual((directory / "keep").read_text(), "existing")
+        original = (self.run / "tasks" / "1" / "TASK.md").read_text()
+        for slot in ("1", "2", "3"):
+            task_id = create_task(self.db, self.cfg, FIXTURE, self.run, slot)
+            self.assertEqual(self.db.get_task(task_id).slot, slot)
+            self.assertTrue((self.run / "tasks" / str(task_id) / "TASK.md").exists())
+        orphan, = (self.run / "tasks").glob(".orphan-1-*")
+        self.assertEqual((orphan / "TASK.md").read_text(), original)
+        # Another allocation leaves every committed task directory in place.
+        committed = (self.run / "tasks" / "1" / "TASK.md").read_text()
+        create_task(self.db, self.cfg, FIXTURE, self.run, "4")
+        self.assertEqual((self.run / "tasks" / "1" / "TASK.md").read_text(), committed)
 
     def test_unseeded_island_rejected(self):
         self.db.archive_island(0)

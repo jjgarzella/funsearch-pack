@@ -1,4 +1,5 @@
 from collections import Counter
+import math
 from pathlib import Path
 import random
 import tempfile
@@ -52,13 +53,31 @@ class EvolutionTests(unittest.TestCase):
         self.assertGreater(counts[short.id], counts[long.id])
         self.assertLess(counts[low.id], 50)
 
-    def test_temperature_cycles_and_extreme_finite_scores(self):
+    def test_extreme_finite_scores_and_invalid_schedule(self):
         self.db.add_program(0, "negative", score=-1e308)
         best = self.db.add_program(0, "positive", score=1e308)
         self.assertEqual(sample_parents(self.db, 0, 1, random.Random(0), period=2)[0], best)
         for kwargs in ({"temperature": 0}, {"period": 0}):
             with self.assertRaises(ValueError):
                 sample_parents(self.db, 0, 1, random.Random(0), **kwargs)
+
+    def test_temperature_cools_and_resets_at_period_boundary(self):
+        class CapturingRandom(random.Random):
+            def choices(self, population, *, weights, k):
+                self.weights.append(list(weights))
+                return [population[-1]]
+
+        rng = CapturingRandom(0)
+        self.db.add_program(0, "low", score=0)
+        self.db.add_program(0, "high", score=1)
+        # Counts 2, 3, 4, 5 cool toward the boundary, reset, then cool again.
+        for count, temperature in ((2, 0.5), (3, 0.25), (4, 1.0), (5, 0.75)):
+            with self.subTest(count=count):
+                rng.weights = []
+                sample_parents(self.db, 0, 1, rng, temperature=1.0, period=4)
+                self.assertAlmostEqual(rng.weights[0][0], math.exp(-1 / temperature))
+                self.assertEqual(rng.weights[0][1], 1)
+            self.db.add_program(0, f"invalid-{count}", status="INVALID")
 
     def test_reset_preserves_history_and_reseeds_weak_half(self):
         seeds = seed_islands(self.db, self.cfg, "seed", score=0)

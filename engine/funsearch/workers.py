@@ -243,12 +243,12 @@ class Worker:
             self._stderr.close()
         self._buffer.clear()
 
-    def _crash_message(self):
+    def _crash_message(self, *, startup=False):
         try:
             code = self.process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             return "worker crashed: closed stdout"
-        if code == 3:
+        if startup and code == 3:
             raise EvaluatorInitError("worker exited with code 3")
         detail = f"signal {-code}" if code < 0 else f"exit code {code}"
         return "worker crashed: " + detail
@@ -292,7 +292,7 @@ class Worker:
             except (EOFError, OSError, TimeoutError, ValueError, WorkerError) as exc:
                 if isinstance(exc, (EOFError, BrokenPipeError)) and self.process is not None:
                     try:
-                        last_error = self._crash_message()
+                        last_error = self._crash_message(startup=True)
                     except EvaluatorInitError as init_error:
                         self._dispose()
                         message = self._with_stderr(str(init_error))
@@ -336,12 +336,7 @@ class Worker:
             except TimeoutError:
                 result = _error(f"timeout after {timeout_s:g}s")
             except (EOFError, BrokenPipeError):
-                try:
-                    result = _error(self._crash_message())
-                except EvaluatorInitError as exc:
-                    self._dispose()
-                    self._failure = EvaluatorInitError(self._with_stderr(str(exc)))
-                    raise self._failure from None
+                result = _error(self._crash_message())
             except (OSError, ValueError, WorkerError) as exc:
                 result = _error(f"worker protocol error: {exc}")
             else:
