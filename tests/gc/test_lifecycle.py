@@ -235,6 +235,8 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         for root in (dead, live, complete):
             self.hook("on-start", root)
         self.summary(complete)
+        live_engine = hold_engine_lock(live)
+        self.addCleanup(live_engine.close)
         self.hook("sweep")
         failed = json.loads((dead / "summary.json").read_text())
         self.assertEqual(failed["status"], "failed")
@@ -246,17 +248,6 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.assertTrue((self.registry.parent / "last-sweep").exists())
         self.hook("sweep")
         self.assertEqual(len(self.mails()), 2)
-
-    def test_sweep_trusts_the_exit_record_over_a_reused_pid(self):
-        root = self.run_dir("reused")  # engine.pid names this live test process
-        self.hook("on-start", root)
-        self.hook("sweep")
-        self.assertFalse((root / "summary.json").exists())
-        (root / "engine-exit.json").write_text(json.dumps({"pid": os.getpid(), "exitcode": -9}))
-        self.hook("sweep")
-        failed = json.loads((root / "summary.json").read_text())
-        self.assertEqual((failed["status"], failed["reason"]), ("failed", "engine died"))
-        self.assertFalse((self.registry / "reused.json").exists())
 
     def test_sweep_trusts_the_engine_lock_over_a_reused_pid(self):
         # A lost process tree leaves no exit record; engine.pid names this

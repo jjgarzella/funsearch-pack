@@ -149,11 +149,12 @@ class RecoverTests(unittest.TestCase):
         self.assertIn("no readable run database", result.stderr)
         self.assertFalse((self.run / "summary.json").exists())
         seed_database(self.run / "db.sqlite", 1)
+        # engine.pid names a live process throughout, as after PID reuse.
         (self.run / "engine.pid").write_text(str(os.getpid()))
-        self.assertIn("still running", self.recover(code=2).stderr)
+        with hold_engine_lock(self.run):
+            self.assertIn("still running", self.recover(code=2).stderr)
         self.assertFalse((self.run / "summary.json").exists())
-        # The exit record shows the PID now belongs to some other process.
-        (self.run / "engine-exit.json").write_text(json.dumps({"pid": os.getpid(), "exitcode": -9}))
+        # Released with no exit record, as when the whole process tree is lost.
         self.recover()
         self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
 
@@ -178,7 +179,7 @@ class EngineAliveTests(unittest.TestCase):
         (self.run / "engine.pid").write_text(str(os.getpid()))
 
     def test_engine_lock_is_the_authority_over_a_reused_pid(self):
-        self.assertTrue(engine_alive(self.run))  # No lock: a pre-lock engine's PID probe.
+        self.assertFalse(engine_alive(self.run))  # No lock: no engine has started.
         with hold_engine_lock(self.run):
             self.assertTrue(engine_alive(self.run))
             self.assertTrue(engine_alive(self.run))  # Probes do not hold the lock.
@@ -257,12 +258,6 @@ class WaitResultTests(unittest.TestCase):
         self.db.set_state("status", "running")
         with patch.object(cli, "engine_alive", return_value=False), \
                 self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
-            cli.wait_result(self.db, self.evaluation)
-        # A live process under a pre-lock engine's PID is not the engine once
-        # the exit observer has recorded that PID's exit.
-        (self.db.path.parent / "engine.pid").write_text(str(os.getpid()))
-        (self.db.path.parent / "engine-exit.json").write_text(json.dumps({"pid": os.getpid()}))
-        with self.assertRaisesRegex(RuntimeError, "engine process is not alive"):
             cli.wait_result(self.db, self.evaluation)
 
     def test_engine_without_published_deadlines_is_reported(self):

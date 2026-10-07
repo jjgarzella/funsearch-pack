@@ -73,17 +73,14 @@ def engine_alive(run_dir):
     The run directory is the authority: the engine holds an exclusive flock on
     ENGINE_LOCK for its whole life, and the kernel drops it however the engine
     dies (SIGKILL, OOM, a container or host restart), so an unrelated process
-    that later reuses its PID never looks like the engine. Other recorded PIDs
-    are informational.
-
-    A run whose engine predates the lock falls back to engine.pid: an exit
-    record from the observer naming that PID is definitive, otherwise probe it.
+    that later reuses its PID never looks like the engine. Recorded PIDs are
+    informational. A missing lock means no engine: serve takes it before
+    anything else.
     """
-    root = Path(run_dir)
     try:
-        handle = open(root / ENGINE_LOCK, "rb")
+        handle = open(Path(run_dir) / ENGINE_LOCK, "rb")
     except FileNotFoundError:
-        return _legacy_engine_alive(root)
+        return False
     with handle:
         try:
             # Shared, so concurrent probes never mistake each other for the engine.
@@ -110,20 +107,6 @@ def hold_engine_lock(root, timeout_s=5):
                 handle.close()
                 raise RuntimeError(f"another engine holds {Path(root) / ENGINE_LOCK}") from None
             time.sleep(0.01)
-
-
-def _legacy_engine_alive(root):
-    try:
-        pid = (root / "engine.pid").read_text().strip()
-    except OSError:
-        return False
-    try:
-        record = json.loads((root / "engine-exit.json").read_text())
-        if pid and str(record.get("pid")) == pid:
-            return False
-    except (OSError, ValueError, AttributeError):
-        pass
-    return pid_alive(pid)
 
 
 def run_hook(command, run_dir):

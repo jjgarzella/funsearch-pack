@@ -99,7 +99,7 @@ terms are used in code, documentation, and prompts.
 \node[box] (engine) at (5.5,0) {Engine\\program database\\SQLite DELETE journal};
 \node[box] (worker) at (11,0) {Worker pool\\C host processes};
 \node[outer] (slots) at (0,-3) {K slot beads\\fresh sessions};
-\node[outer] (registry) at (5.5,-3) {Active-run registry\\engine PID};
+\node[outer] (registry) at (5.5,-3) {Active-run registry\\run directory};
 \node[box] (evaluator) at (11,-3) {\code{evaluator.so}\\author-supplied code};
 \node[outer] (mail) at (0,-6) {Notify mail\\\code{gc mail}};
 \node[outer] (sweep) at (5.5,-6) {Crash-cleanup order\\condition-triggered EXEC};
@@ -116,7 +116,7 @@ terms are used in code, documentation, and prompts.
 \draw[flow] (worker.east) -- ++(1.1,0) |- node[lab,pos=0.45,right] {dlopen /\\dlclose} (candidate.north east);
 \draw[flow] (slots) -- node[lab,left] {claim / release} (mutator);
 \draw[flow] (engine) -- node[lab,right] {start / clean finish} (registry);
-\draw[flow] (registry) -- node[lab,right] {dead PID; aged check} (sweep);
+\draw[flow] (registry) -- node[lab,right] {engine lock released; aged check} (sweep);
 \draw[flow] (sweep) -- node[lab,above] {failed-run notice} (mail);
 \draw[flow] (slots) -- node[lab,left] {on-finish hook} (mail);
 \end{tikzpicture}}
@@ -491,7 +491,7 @@ Liveness instead rests on an exclusive \code{flock} the engine holds on
 \code{engine.lock} in the run directory for its whole life. The kernel drops it
 however the process tree is lost, so clients, \code{run status}, \code{run
 recover} and the Gas City sweep never mistake a process reusing the engine's PID
-for the engine; runs from an engine without the lock fall back to the PID.
+for the engine. A run directory without the lock has no live engine.
 
 \section{Mutator role}
 \path{agents/mutator/agent.toml} defines the rig-scoped
@@ -589,8 +589,8 @@ run directory, instance, PID, status, counters and notify. Slots carry run/slot,
 N and model metadata. \path{gc-lifecycle.json} beside the engine's write-once
 \code{run.json} saves bead IDs, city/rig/notify context, and lifecycle
 checkpoints. The registry at
-\path{<city>/.gc/funsearch/active/<run-id>.json} stores run directory, run bead,
-rig and engine PID; run IDs must be unique across the city.
+\path{<city>/.gc/funsearch/active/<run-id>.json} stores run ID, run directory, run
+bead, rig and notify; run IDs must be unique across the city.
 
 \subsection{Completion and crash sweep}
 The start and finish shell hooks delegate to \path{scripts/gc_lifecycle.py}.
@@ -605,7 +605,7 @@ an agent, with a ten-second check timeout and five-minute execution timeout.
 The shell wrappers invoke the Python sweep. Its check returns 0 only with active
 JSON entries and a missing or more-than-30-minute-old last-sweep timestamp.
 False checks create no tracking beads. A city-wide lock prevents overlapping
-sweeps from importing rigs. Live PIDs are untouched; dead/zombie PIDs without a
+sweeps from importing rigs. Live engines (held \code{engine.lock}) are untouched; dead engines without a
 terminal summary run \code{funsearch run recover}, which writes failed/engine
 died outputs from the live database or the newest readable snapshot. Dead engines with a terminal summary retry delivery with
 the actual outcome preserved. The sweep updates its timestamp even on errors,

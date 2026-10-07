@@ -19,7 +19,7 @@ from engine.funsearch import daemon
 from engine.funsearch.compile import compile_candidate
 from engine.funsearch.db import Database
 from engine.funsearch.evaluator import evaluator_digest
-from engine.funsearch.runtime import pid_alive
+from engine.funsearch.runtime import engine_alive, hold_engine_lock, pid_alive
 from engine.funsearch.workers import score_budget_s
 from .pipeline_support import PipelineTestCase, ROOT
 
@@ -157,7 +157,7 @@ class EndToEndTests(PipelineTestCase):
         self.assertTrue((root / "finished.marker").exists())
         self.assertFalse(pid_alive(engine_pid))
         self.assertTrue(all(not pid_alive(pid) for pid in workers))
-        self.assertFalse(json.loads(self.cli("run", "status", root))["pid_alive"])
+        self.assertFalse(json.loads(self.cli("run", "status", root))["engine_alive"])
         self.assertEqual(json.loads(self.cli("best", root, "-k", 1))[0]["score"], 10)
         self.assertEqual(json.loads(self.cli("rescore", root, "best", "--instance", "n=2"))["score"], 10)
         with sqlite3.connect(next((root / "snapshots").glob("*.sqlite"))) as saved:
@@ -628,10 +628,19 @@ class EndToEndTests(PipelineTestCase):
                 workers = [int(line.split()[0]) for line in process_text.splitlines()[1:]
                            if int(line.split()[1]) == pid and "funsearch-worker" in line]
                 try:
+                    # The running engine holds its lock and refuses a second engine.
+                    self.assertTrue(engine_alive(root))
+                    self.assertTrue(json.loads(self.cli("run", "status", root))["engine_alive"])
+                    with self.assertRaisesRegex(RuntimeError, "another engine holds"):
+                        hold_engine_lock(root, timeout_s=0.05)
                     os.kill(pid, signum)
                     evidence = self.exit_evidence(root)
                     self.assertEqual(evidence["exitcode"], -signum)
                     self.assertEqual(evidence["signal"], signum)
+                    # Its lock died with it, though its workers may still run
+                    # and engine.pid now names a live process, as after reuse.
+                    (root / "engine.pid").write_text(str(os.getpid()))
+                    self.assertFalse(engine_alive(root))
                     self.assertFalse((root / "summary.json").exists())
                     log = (root / "engine.log").read_text()
                     self.assertIn(f"signal={signum}", log)

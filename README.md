@@ -69,9 +69,9 @@ routed directly to `<rig>/funsearch.mutator` with `--no-formula`.
 The start hook creates a `funsearch-run` bead in the importing rig and K child
 `funsearch-slot` beads, carrying N and the configured mutator model. It stores
 bead ids and rig/notify context in the run's `gc-lifecycle.json` (the engine's
-`run.json` manifest stays write-once), and registers the engine PID at
-`<city>/.gc/funsearch/active/<run-id>.json`. Run ids must be unique across the
-city. At completion the finish hook records best versus seed, children scored,
+`run.json` manifest stays write-once), and registers the run (directory, run
+bead, rig and notify) at `<city>/.gc/funsearch/active/<run-id>.json`. Run ids
+must be unique across the city. At completion the finish hook records best versus seed, children scored,
 throughput, OK rate, reason and `best.c`, closes slots before the run bead,
 sends `gc mail` to `notify`, then removes the registry entry.
 
@@ -199,12 +199,11 @@ Liveness does not depend on that record or on a PID: the engine holds an
 exclusive `flock` on `engine.lock` in the run directory for its whole life,
 and the kernel releases it however the engine dies, including a loss of the
 whole process tree (container or host restart, cgroup OOM, process-group
-kill) where no exit record is written. Waiting clients, `run status`, `run
-recover` and the Gas City sweep probe that lock, so an unrelated process that
-later reuses the PID never looks like the engine. Runs started by an engine
-that predates the lock fall back to `engine.pid`, treating an exit record
-naming it as definitive. The PID copies (database `pid` state, `engine.pid`,
-run-bead `fs.pid`) only name the engine.
+kill) where no exit record is written. Waiting clients, `run status` (its
+`engine_alive` field), `run recover` and the Gas City sweep probe that lock, so
+an unrelated process that later reuses the PID never looks like the engine. A
+run directory without `engine.lock` has no live engine. The PID copies
+(database `pid` state, `engine.pid`, run-bead `fs.pid`) only name the engine.
 The detached observer execs without the launching agent's session identity,
 so Gas City orphan cleanup cannot mistake the search for a retired agent.
 City, rig, and notification context remain available to lifecycle hooks.

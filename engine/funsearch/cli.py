@@ -290,7 +290,7 @@ def dispatch(args):
             print("STOP_REQUESTED")
         elif args.command == "run":
             status = db.all_state()
-            status.update(run_id=metadata["run_id"], pid_alive=engine_alive(root))
+            status.update(run_id=metadata["run_id"], engine_alive=engine_alive(root))
             print(json.dumps(status))
         elif args.command == "best":
             if args.k <= 0:
