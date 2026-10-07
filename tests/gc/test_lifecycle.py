@@ -1,16 +1,22 @@
 """Actual hook entry points against a gc shim, plus a real toy-engine run."""
 import json
+import contextlib
+import fcntl
+import io
 import os
 from pathlib import Path
 import re
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
 import unittest
+from unittest.mock import patch
 
+from engine.funsearch import daemon
 from engine.funsearch.config import Config
 from engine.funsearch.daemon import write_outputs
 from engine.funsearch.db import Database
@@ -75,6 +81,164 @@ class LifecycleTests(HookFixture, unittest.TestCase):
                    "ok_rate": 0.75, "throughput_per_hour": 20}
         summary.update(changes)
         (root / "summary.json").write_text(json.dumps(summary))
+
+    def wait_for(self, path):
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists(), str(path))
+
+    def background_hook(self, name, *args, observe_lock=None):
+        env = self.env.copy()
+        if observe_lock:
+            # Observe the attempt immediately before acquiring the production
+            # lock, so the overlap is established without scheduling guesses.
+            env["FS_TEST_LOCK_ATTEMPT"] = str(observe_lock)
+            bootstrap = """import contextlib, os, sys
+from pathlib import Path
+from scripts import gc_lifecycle as lifecycle
+original = lifecycle.lock
+@contextlib.contextmanager
+def observed(path, **kwargs):
+    Path(os.environ['FS_TEST_LOCK_ATTEMPT']).touch()
+    with original(path, **kwargs) as acquired:
+        yield acquired
+lifecycle.lock = observed
+sys.exit(lifecycle.main())
+"""
+            command = [sys.executable, "-c", bootstrap, name, *map(str, args)]
+        else:
+            command = [str(SCRIPTS / f"{name}.sh"), *map(str, args)]
+        process = subprocess.Popen(command, env=env, cwd=ROOT,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def finish_process(self, process, code=0):
+        output, errors = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, code, output + errors)
+
+    def reset_pause(self, command):
+        for name in ("pause-entered", "pause-release"):
+            (self.shim_state / name).unlink(missing_ok=True)
+        owner = self.shim_state / "pause-owner"
+        if owner.exists():
+            owner.rmdir()
+        self.env["FS_SHIM_PAUSE"] = command
+
+    def test_overlapping_starts_allocate_once_and_serialize_city_collisions(self):
+        for collision in (False, True):
+            with self.subTest(collision=collision):
+                root = self.run_dir(f"start-{collision}")
+                other = root
+                if collision:
+                    other = self.run_dir("collision")
+                    metadata = json.loads((other / "run.json").read_text())
+                    metadata["run_id"] = root.name
+                    (other / "run.json").write_text(json.dumps(metadata))
+                self.reset_pause("bd create")
+                first = self.background_hook("on-start", root)
+                self.wait_for(self.shim_state / "pause-entered")
+                before = len(self.calls())
+                marker = self.root / f"start-attempt-{collision}"
+                second = self.background_hook("on-start", other, observe_lock=marker)
+                self.wait_for(marker)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    second.communicate(timeout=0.2)
+                self.assertEqual(len(self.calls()), before)
+                (self.shim_state / "pause-release").touch()
+                self.finish_process(first)
+                self.finish_process(second, code=int(collision))
+                calls = self.calls()[before - 1:]
+                self.assertEqual(sum(args[:2] == ["bd", "create"] for args in calls), 4)
+                self.assertEqual(sum(args[0] == "sling" for args in calls), 3)
+                entry = json.loads((self.registry / f"{root.name}.json").read_text())
+                self.assertEqual(entry["run_dir"], str(root))
+
+    def test_overlapping_finish_and_sweep_deliver_once(self):
+        for first_name, second_name in (("on-finish", "on-finish"), ("on-finish", "sweep"),
+                                        ("sweep", "on-finish"), ("sweep", "sweep")):
+            with self.subTest(first=first_name, second=second_name):
+                root = self.run_dir(f"{first_name}-{second_name}")
+                self.hook("on-start", root)
+                self.summary(root)
+                self.reset_pause("mail send")
+                first = self.background_hook(first_name, *([root] if first_name == "on-finish" else []))
+                self.wait_for(self.shim_state / "pause-entered")
+                before = len(self.calls())
+                mail_count = len(self.mails())
+                marker = self.root / f"attempt-{root.name}"
+                second = self.background_hook(second_name, *([root] if second_name == "on-finish" else []),
+                                              observe_lock=marker)
+                self.wait_for(marker)
+                if first_name == second_name == "sweep":
+                    # The nonblocking city sweep lock returns while the first
+                    # sweep is still deliberately paused in the mail shim.
+                    self.finish_process(second)
+                else:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        second.communicate(timeout=0.2)
+                self.assertEqual(len(self.calls()), before)
+                (self.shim_state / "pause-release").touch()
+                self.finish_process(first)
+                self.finish_process(second)
+                self.assertEqual(len(self.mails()), mail_count + 1)
+                self.assertFalse((self.registry / f"{root.name}.json").exists())
+                self.assertTrue(all(row["status"] == "closed" for row in self.beads().values()))
+
+    def test_sweep_returns_while_city_sweep_lock_is_held(self):
+        state = self.registry.parent
+        state.mkdir(parents=True)
+        with (state / "sweep.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self.finish_process(self.background_hook("sweep"))
+            self.assertFalse((state / "last-sweep").exists())
+
+    def test_daemon_preserves_delivered_outcome_after_registry_cleanup_failure(self):
+        from scripts import gc_lifecycle as lifecycle
+        root = self.run_dir()
+        self.hook("on-start", root)
+        cfg = Config()
+        cfg.stop.max_children = 0
+        with Database(root / "db.sqlite") as db:
+            db.add_program(0, "double f(void) { return 2; }\n", score=2)
+            for key, value in {"started_at": time.time() - 10, "seed_score": 0,
+                               "children_scored": 1, "children_ok": 1}.items():
+                db.set_state(key, value)
+        metadata = json.loads((root / "run.json").read_text())
+        metadata.update(evaluator_library="unused", on_finish="gc-finish")
+
+        def hook(command, _root):
+            if command:
+                lifecycle.on_finish(root)
+
+        with patch.dict(os.environ, self.env), \
+                patch.object(daemon, "read_run", return_value=(root, metadata, cfg)), \
+                patch.object(daemon, "WorkerPool"), \
+                patch.object(daemon.signal, "signal"), \
+                patch.object(daemon, "run_hook", side_effect=hook), \
+                patch.object(lifecycle, "remove_registry", side_effect=PermissionError("registry denied")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            daemon.serve(root, os.open(os.devnull, os.O_WRONLY), snapshot_period_s=60,
+                         stop_grace_s=1, abandon_period_s=60, busy_retry_s=1)
+        published = (root / "summary.json").read_bytes()
+        self.assertEqual(json.loads(published)["status"], "completed")
+        with Database(root / "db.sqlite", readonly=True) as db:
+            self.assertEqual(db.get_state("status"), "completed")
+        self.assertEqual(self.beads()["test-1"]["metadata"]["fs.status"], "completed")
+        self.assertTrue(json.loads((root / "gc-lifecycle.json").read_text())["finished"])
+        self.assertIn("registry denied", json.loads((root / "finish-hook-error.json").read_text())["error"])
+        self.assertTrue((self.registry / "run-one.json").exists())
+        self.hook("on-finish", root)
+        self.assertEqual((root / "summary.json").read_bytes(), published)
+        self.assertEqual(len(self.mails()), 1)
+        self.assertFalse((self.registry / "run-one.json").exists())
 
     def test_start_warns_when_mutators_exceed_the_pool_cap(self):
         with (ROOT / "agents" / "mutator" / "agent.toml").open("rb") as handle:
@@ -197,7 +361,8 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.env["FS_SHIM_FAIL"] = "mail"
         self.hook("on-finish", root, code=1)
         del self.env["FS_SHIM_FAIL"]
-        # The daemon marks the run failed if a finish hook exits nonzero.
+        # Reconcile a changed summary from an older engine that marked a
+        # finish-hook error as a run failure before delivery completed.
         self.summary(root, status="failed", reason="on-finish hook: mail failed")
         self.hook("on-finish", root)
         self.assertEqual(self.beads()["test-1"]["metadata"]["fs.status"], "failed")

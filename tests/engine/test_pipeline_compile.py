@@ -1,9 +1,12 @@
 import os
+import hashlib
+import json
 from pathlib import Path
 import shlex
 import shutil
 import sys
 import time
+import tracemalloc
 from unittest.mock import patch
 
 from engine.funsearch._process import LOG_BYTES, _StderrPrefix
@@ -266,6 +269,29 @@ class CompileTests(PipelineTestCase):
 
 
 class EvaluatorTests(PipelineTestCase):
+    def test_resource_digest_preserves_format_with_bounded_memory(self):
+        directory = self.root / "resources"
+        directory.mkdir()
+        resource = directory / "table.bin"
+        content_hash = hashlib.sha256()
+        chunk = b"resource" * (128 * 1024)
+        with resource.open("wb") as output:
+            for _ in range(16):
+                output.write(chunk)
+                content_hash.update(chunk)
+        os.symlink("table.bin", directory / "current")
+        entries = [["file", "table.bin", content_hash.hexdigest()],
+                   ["link", "current", "table.bin"]]
+        expected = hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()
+        tracemalloc.start()
+        try:
+            actual = evaluator_digest(directory)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(actual, expected)
+        self.assertLess(peak, 4 * 1024 * 1024)
+
     def test_build_and_prebuilt_library(self):
         library = self.evaluator()
         self.assertEqual(library, self.problem / "evaluator" / "libevaluator.so")

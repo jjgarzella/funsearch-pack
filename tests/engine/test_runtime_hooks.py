@@ -64,10 +64,13 @@ daemon.serve(sys.argv[1], os.open(os.devnull, os.O_WRONLY),
                 self.assertLess(time.monotonic() - started, 5)
                 self.assertIn(b"hook timed out after 0.5s", errors)
                 summary = json.loads((root / "summary.json").read_text())
-                self.assertEqual(summary["status"], "failed")
-                self.assertIn(f"on-{phase} hook: hook timed out", summary["reason"])
+                expected = "failed" if phase == "start" else "completed"
+                self.assertEqual(summary["status"], expected)
+                error = summary["reason"] if phase == "start" else json.loads(
+                    (root / "finish-hook-error.json").read_text())["error"]
+                self.assertIn(f"on-{phase} hook: hook timed out", error)
                 with Database(root / "db.sqlite", readonly=True) as db:
-                    self.assertEqual(db.get_state("status"), "failed")
+                    self.assertEqual(db.get_state("status"), expected)
                 for filename in ("best.c", "summary.json"):
                     self.assertTrue((root / filename).exists(), filename)
                 self.assertFalse((root / "engine.pid").exists())

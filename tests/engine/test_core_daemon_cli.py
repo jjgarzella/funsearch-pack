@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import sqlite3
 import stat
 from pathlib import Path
 import subprocess
@@ -31,6 +32,49 @@ def seed_database(path, scored, *, started_at=None):
         for key, value in {"started_at": started_at or time.time() - 10, "children_scored": scored,
                            "children_ok": scored, "seed_score": 0, "best_score": scored}.items():
             db.set_state(key, value)
+
+
+class BusyRetryTests(unittest.TestCase):
+    def test_positive_budget_expires_and_success_resets_it(self):
+        for outcomes, expected_times in (([False] * 4, [1, 2, 3, 4]),
+                                         ([False, False, True] + [False] * 4,
+                                          [1, 2, 3, 4, 5, 6, 7])):
+            with self.subTest(outcomes=outcomes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seed_database(root / "db.sqlite", 0)
+                cfg = Config()
+                cfg.search.reset_period_s = 1000
+                clock = [1]
+                ticks = []
+                results = iter(outcomes)
+
+                def tick(db, _cfg):
+                    self.assertEqual(db.get_state("status"), "running")
+                    ticks.append(clock[0])
+                    if not next(results):
+                        raise sqlite3.OperationalError("database is locked")
+                    return None
+
+                def sleep(_seconds):
+                    clock[0] += 1
+
+                metadata = {"run_id": "budget", "evaluator_library": "unused"}
+                with patch.object(daemon, "read_run", return_value=(root, metadata, cfg)), \
+                        patch.object(daemon, "WorkerPool"), \
+                        patch.object(daemon, "stop_reason", side_effect=tick), \
+                        patch.object(daemon, "_dispatch"), \
+                        patch.object(daemon, "snapshot"), \
+                        patch.object(daemon.signal, "signal"), \
+                        patch.object(daemon.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(daemon.time, "sleep", side_effect=sleep), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    daemon.serve(root, os.open(os.devnull, os.O_WRONLY),
+                                 snapshot_period_s=1000, stop_grace_s=1,
+                                 abandon_period_s=1000, busy_retry_s=3)
+                self.assertEqual(ticks, expected_times)
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertEqual(summary["status"], "failed")
+                self.assertEqual(summary["reason"], "database busy for 3s: database is locked")
 
 
 class StoreResultTests(unittest.TestCase):

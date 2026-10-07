@@ -153,15 +153,17 @@ does not consume the task; a fresh session can also resume an unfinished task.
 ends the run. Task commands then report \code{RUN\_OVER}, exiting 3.
 Mutators close their slots and drain. Queued requests are rejected; in-flight
 scoring may finish for at most 120 seconds.
-\item The engine writes \code{summary.json}, exports \code{best.c} and
-\code{top/<rank>-<score>.c}, backs up SQLite, and stops workers. It invokes the
+\item The engine stops workers, atomically installs and fsyncs \code{best.c} and
+\code{top/<rank>-<score>.c} and their directory entries, then publishes
+\code{summary.json} last as the durable completion marker. Interrupted exports
+leave that marker unpublished so recovery can retry. It backs up SQLite and invokes the
 finish hook with the run directory and \code{FS\_RUN\_DIR} set, then exits.
 \item The finish hook updates the run summary, force-closes remaining slot
 beads before closing their parent run bead, mails \code{notify}, then deletes
 the active registry entry. No result or source is automatically committed.
 \item If the engine dies before clean finish, the condition-triggered sweep runs
-with active entries and a last-sweep age greater than 30 minutes. A dead PID
-without a terminal summary is marked failed with reason ``engine died'':
+with active entries and a last-sweep age greater than 30 minutes. A run with
+no held \code{engine.lock} and no terminal summary is marked failed with reason ``engine died'':
 \code{funsearch run recover} rewrites outputs from the live database or the newest
 readable snapshot. A terminal summary is preserved and its finish
 hook retried. Failed deliveries retain the entry; the sweep always updates its
@@ -395,8 +397,10 @@ slow start hook fails the run. The engine never calls \code{gc};
 \item[run status / best / stop] Inspect JSON run state, list top programs
 (default ten), or request graceful termination through SQLite.
 \item[run recover] For a run whose engine died, writes failed outputs from the
-live database or the newest readable snapshot. It refuses while the engine
-PID is alive, and for a run whose summary already records a terminal status.
+live database or the newest readable snapshot. It refuses while the engine's
+\code{engine.lock} flock is held, and for a run whose summary already records a
+terminal status. Recorded PIDs are informational; an unrelated process reusing
+the old PID does not prevent recovery.
 \item[next-task] Prints \code{TASK <task-id> <absolute-task-dir>} containing
 \code{TASK.md}: problem prose, candidate header, scored parents and messages,
 a recent-history summary, trial budget, and instructions. If stopped it prints
@@ -474,9 +478,15 @@ RUN\_OVER at stop, and active work gets a bounded 120-second completion window.
 Open tasks older than twice (trial budget times scoring timeout plus 600 seconds)
 are abandoned when they have no queued or running evaluation.
 
-On stopping, the engine writes \code{summary.json}, exports \code{best.c} and
-up to ten distinct OK programs as \code{top/<rank>-<score>.c}, shuts down workers,
-runs the finish hook, and exits. Snapshots every 600 seconds and at completion
+On stopping, the engine shuts down workers, atomically installs and fsyncs
+\code{best.c} and up to ten distinct OK programs as \code{top/<rank>-<score>.c},
+then flushes the files and their directory entries. It publishes
+\code{summary.json} last as the completion marker. Interrupted candidate
+exports leave the marker unpublished.
+It then takes a snapshot, runs the finish hook, and exits. A finish-hook failure
+leaves the published search outcome unchanged and records delivery/cleanup errors
+in \code{finish-hook-error.json} and \code{engine.log} for later retry.
+Snapshots every 600 seconds and at completion
 use SQLite's backup API; the latest five live in \code{snapshots/}.
 
 \code{engine.log} contains flushed UTC startup, shutdown and signal events,

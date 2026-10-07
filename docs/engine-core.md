@@ -33,7 +33,10 @@ clients use `readonly=True` and a `mode=ro` URI without schema changes.
 `Database.backup` copies `BACKUP_PAGES` (1024) pages per step with a short
 pause, into a temporary file renamed into place. A client write restarts the
 stepped copy; after `BACKUP_RESTARTS` (3) restarts it finishes in one pass that
-blocks writers, so a snapshot in the engine's tick stays bounded. The daemon retries a tick that
+blocks writers. Both copy modes bound SQLite's internal BUSY/LOCKED retries
+with one monotonic deadline based on the connection's busy timeout; expiry
+raises `database is locked` and removes the incomplete temporary snapshot.
+The daemon retries a tick that
 raises `database is locked`/`busy` and fails the run only after `BUSY_RETRY_S`
 (60 s) without a successful tick; each tick step commits atomically, and a
 result whose store failed stays pending for the retry.

@@ -419,9 +419,13 @@ def serve(run_dir, ready_fd, *, snapshot_period_s, stop_grace_s, abandon_period_
             run_hook(metadata.get("on_finish"), root)
         except BaseException as exc:
             traceback.print_exc()
+            # Outputs are already published and the hook may already have
+            # delivered them. Delivery/registry cleanup cannot change the
+            # authoritative search outcome; the adapter can retry it later.
             try:
-                write_outputs(db, root, metadata, cfg, FAILED, f"on-finish hook: {exc}")
-                snapshot(db, root)
+                _write_output(root / "finish-hook-error.json", json.dumps({
+                    "error": f"on-finish hook: {exc}", "at": time.time()
+                }, indent=2) + "\n")
             except BaseException:
                 traceback.print_exc()
         finally:

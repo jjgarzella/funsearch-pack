@@ -559,8 +559,10 @@ class EndToEndTests(PipelineTestCase):
         self.runs.append(root)
         self.cli("run", "start", self.problem, "--run-id", root.name,
                  "--set", "stop.duration_s=0.5", "--on-finish", "false")
-        summary = self.finished(root, "failed")
-        self.assertIn("on-finish hook", summary["reason"])
+        summary = self.finished(root)
+        self.assertEqual(summary["reason"], "duration_s")
+        error = json.loads((root / "finish-hook-error.json").read_text())
+        self.assertIn("on-finish hook", error["error"])
         self.assertIn("Traceback", (root / "engine.log").read_text())
 
     def exit_evidence(self, root):

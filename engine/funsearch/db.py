@@ -561,25 +561,37 @@ class Database:
         whole-database copy. A write by another connection restarts the copy
         from its first page; after BACKUP_RESTARTS restarts the copy finishes
         in one pass that blocks writers, so steady client writes cannot keep
-        the engine's tick in an unbounded copy. A failed copy never leaves a
-        partial snapshot under path.
+        the engine's tick in an unbounded copy. Both modes stop retrying locked
+        sources at a shared monotonic deadline based on busy_timeout. A failed
+        copy never leaves a partial snapshot under path.
         """
         path = Path(path)
         temporary = path.with_name(path.name + ".tmp")
+        timeout_s = self.connection.execute("PRAGMA busy_timeout").fetchone()[0] / 1000
+        deadline = time.monotonic() + timeout_s
         try:
             try:
-                self._copy(temporary, BACKUP_PAGES)
+                self._copy(temporary, BACKUP_PAGES, deadline)
             except _BackupRestarted:
-                self._copy(temporary, -1)
+                self._copy(temporary, -1, deadline)
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _copy(self, destination_path, pages):
+    def _copy(self, destination_path, pages, deadline):
         last, restarts = None, 0
 
         def progress(status, remaining, _total):
             nonlocal last, restarts
+            # sqlite3.backup retries BUSY/LOCKED itself, ignoring the source
+            # connection's busy_timeout. Its callback is our cancellation point,
+            # including the one-pass fallback after client-write restarts.
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                if time.monotonic() >= deadline:
+                    raise sqlite3.OperationalError("database is locked: backup retry deadline exceeded")
+                return
+            if pages <= 0:
+                return
             # A completed step that made no progress started over.
             if status == sqlite3.SQLITE_OK and last is not None and remaining >= last:
                 restarts += 1
@@ -593,5 +605,5 @@ class Database:
         with closing(sqlite3.connect(str(destination_path))) as destination:
             destination.execute("PRAGMA journal_mode=DELETE")
             self.connection.backup(destination, pages=pages, sleep=BACKUP_SLEEP_S,
-                                   progress=progress if pages > 0 else None)
+                                   progress=progress)
             destination.execute("PRAGMA journal_mode=DELETE")

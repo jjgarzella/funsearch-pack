@@ -89,5 +89,9 @@ def evaluator_digest(directory):
             if path.is_symlink():
                 entries.append(["link", relative, os.readlink(path)])
             elif path.is_file():
-                entries.append(["file", relative, hashlib.sha256(path.read_bytes()).hexdigest()])
+                digest = hashlib.sha256()
+                with path.open("rb") as resource:
+                    while chunk := resource.read(1024 * 1024):
+                        digest.update(chunk)
+                entries.append(["file", relative, digest.hexdigest()])
     return hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()

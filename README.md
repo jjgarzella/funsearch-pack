@@ -196,7 +196,9 @@ busy timeout and fails the run only after 60 s without a successful tick.
 Snapshots normally copy 1024 pages per step and pause between steps, so writers
 wait for a step. After three restarts caused by client writes, the backup
 finishes in one pass that blocks writers for the whole copy. A failed copy
-leaves no partial snapshot. This is sized for one host and a handful of mutators
+leaves no partial snapshot. Both copy modes stop retrying a locked source at a
+shared monotonic deadline based on the connection's busy timeout, allowing the
+engine's elapsed retry budget to apply. This is sized for one host and a handful of mutators
 per run (the default is three); much larger mutator counts or very large source
 histories would need measuring first.
 
@@ -227,7 +229,9 @@ once it finishes, and fails the run if it fails), the finish hook after outputs
 are written, including when the daemon fails. Each hook must exit within
 120 s (`HOOK_TIMEOUT_S`); on timeout the engine kills the hook's whole process
 group and treats it as a failure, so a slow start hook fails the run. The PID
-file is removed after shutdown and the finish hook completes.
+file is removed after shutdown and the finish hook completes. Finish-hook failures
+preserve the published search outcome and record the delivery or cleanup error
+in `finish-hook-error.json` and `engine.log`; the Gas City sweep can retry delivery.
 
 CLI exit codes: 0 success; 1 runtime or seed failure; 2 usage/configuration
 error; 3 RUN_OVER for next-task/try/submit; 4 rejection or exhausted trial

@@ -1,6 +1,8 @@
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -157,6 +159,56 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.list_tasks(), [])
         self.db.set_state("status", "retried")
         self.assertEqual(self.db.get_state("status"), "retried")
+
+    def test_backup_lock_deadline_in_stepped_and_fallback_copies(self):
+        from engine.funsearch.db import _BackupRestarted
+        backup = Path(self.temp.name) / "deadline.sqlite"
+        self.db.set_state("value", "published")
+        self.db.backup(backup)
+        self.db.set_state("value", "new")
+        self.db.connection.execute("PRAGMA busy_timeout=25")
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                blocker = sqlite3.connect(self.path, check_same_thread=False)
+                blocker.execute("BEGIN EXCLUSIVE")
+                release = threading.Event()
+
+                def unblock():
+                    # Bound even a broken implementation so the test fails
+                    # with an elapsed-time assertion instead of hanging.
+                    release.wait(1)
+                    blocker.rollback()
+                    blocker.close()
+
+                thread = threading.Thread(target=unblock)
+                thread.start()
+                original = self.db._copy
+                calls = []
+
+                def copy(path, pages, deadline):
+                    calls.append((pages, deadline))
+                    if fallback and pages > 0:
+                        raise _BackupRestarted
+                    return original(path, pages, deadline)
+
+                started = time.monotonic()
+                try:
+                    with patch.object(self.db, "_copy", copy), \
+                            self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        self.db.backup(backup)
+                    self.assertLess(time.monotonic() - started, 0.7)
+                finally:
+                    release.set()
+                    thread.join(timeout=2)
+                if fallback:
+                    self.assertEqual(calls[1][0], -1)
+                    self.assertEqual(calls[0][1], calls[1][1])
+                self.assertFalse(backup.with_suffix(".sqlite.tmp").exists())
+                with Database(backup, readonly=True) as saved:
+                    self.assertEqual(saved.get_state("value"), "published")
+        self.db.backup(backup)
+        with Database(backup, readonly=True) as saved:
+            self.assertEqual(saved.get_state("value"), "new")
 
     def test_readonly_client_and_missing_file(self):
         self.db.set_state("status", "running")
