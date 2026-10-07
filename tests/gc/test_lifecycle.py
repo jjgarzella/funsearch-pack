@@ -54,11 +54,11 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.root = Path(self.temp.name)
         self.setup_gc(self.root)
 
-    def run_dir(self, name="run-one", pid=None):
+    def run_dir(self, name="run-one", pid=None, mutators=3):
         root = self.root / name
         root.mkdir()
         cfg = Config()
-        cfg.search.mutators = 3
+        cfg.search.mutators = mutators
         cfg.search.tasks_per_session = 2
         metadata = {"run_id": name, "problem_dir": str(self.root / "problem"),
                     "instance": "n=1", "config": cfg.to_dict()}
@@ -72,6 +72,15 @@ class LifecycleTests(HookFixture, unittest.TestCase):
                    "ok_rate": 0.75, "throughput_per_hour": 20}
         summary.update(changes)
         (root / "summary.json").write_text(json.dumps(summary))
+
+    def test_start_warns_when_mutators_exceed_the_pool_cap(self):
+        with (ROOT / "agents" / "mutator" / "agent.toml").open("rb") as handle:
+            cap = tomllib.load(handle)["max_active_sessions"]
+        self.assertNotIn("warning", self.hook("on-start", self.run_dir(mutators=cap)).stderr)
+        result = self.hook("on-start", self.run_dir("run-two", mutators=cap + 1))
+        self.assertIn(f"search.mutators={cap + 1} exceeds the mutator pool's "
+                      f"max_active_sessions={cap}", result.stderr)
+        self.assertEqual(sum(args[0] == "sling" for args in self.calls()), 2 * cap + 1)
 
     def test_start_finish_and_repeat(self):
         root = self.run_dir()

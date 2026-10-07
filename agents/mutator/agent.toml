@@ -1,6 +1,9 @@
 # Claude Haiku is the small coding role; model defaults remain overridable by
 # slot opt_model metadata. full-auto means dontAsk, NOT permission bypass.
-# A demand-driven pool has no always-on sessions; cap 3 matches default K.
+# A demand-driven pool has no always-on sessions. max_active_sessions caps
+# concurrent mutators across ALL runs in the rig, so a run's effective
+# concurrency is min(search.mutators, cap minus other runs' sessions); on-start
+# warns when search.mutators alone exceeds it. Raise both together.
 # Fresh context and a private control/settings directory per concrete session
 # avoid sharing state. pre_start installs the mandatory task/tool guard.
 # ConfigDir is the authored pack root; GC_RIG selects the rig's bead store.

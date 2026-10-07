@@ -219,8 +219,12 @@ session can resume after a crash or error without allocating a second task.
 
 N is `[search] tasks_per_session`, copied to `fs.tasks_per_session` on each
 slot bead. K is `[search] mutators`, the number of slot beads per run.
-The agent's `max_active_sessions = 3` supports the default K=3; increase the
-rig's agent patch cap for larger K, allowing for other concurrent runs and
+The agent's `max_active_sessions = 3` supports the default K=3. That cap is
+shared by every concurrent run in the rig, so a run's effective mutator
+concurrency is `min(search.mutators, cap minus other runs' sessions)`: slots
+beyond it wait for a free session. The on-start hook warns (in `engine.log`)
+when `search.mutators` alone exceeds the pack's cap. For larger K, raise the
+rig's agent patch cap too, allowing for other concurrent runs and
 rig/workspace limits. `[mutator] model` is passed by the run lifecycle hooks
 as slot `opt_model` metadata to override the agent default. Slot metadata must
 also include `fs.run_dir` (absolute) and `fs.slot` (string or integer).

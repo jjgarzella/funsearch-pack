@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
 
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK / "engine"))
@@ -31,6 +32,7 @@ SLOT_RETIRED_FILE = ".funsearch-retired.json"
 # Formula/launch overrides tune the search only. Command-bearing keys
 # (candidate.compile*, evaluator.build) stay in the problem's own problem.toml.
 LAUNCH_OVERRIDE_SECTIONS = ("search.", "stop.")
+MUTATOR_AGENT = PACK / "agents" / "mutator" / "agent.toml"
 
 
 class UsageError(ValueError):
@@ -145,6 +147,18 @@ def on_start(root):
             start_locked(root)
 
 
+def mutator_pool_cap():
+    """The pack's mutator max_active_sessions, or None if it cannot be read.
+
+    A city may patch the pool, so this is the pack default, not a guarantee.
+    """
+    try:
+        with MUTATOR_AGENT.open("rb") as handle:
+            return int(tomllib.load(handle)["max_active_sessions"])
+    except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
+        return None
+
+
 def start_locked(root):
     metadata = read_json(root / "run.json")
     fs = read_lifecycle(root, metadata)
@@ -169,6 +183,13 @@ def start_locked(root):
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
              "run_bead": fs["run_bead"], "rig": rig, "pid": pid, "notify": notify}
     write_json(registry, entry)
+    cap = mutator_pool_cap()
+    if cap is not None and cfg["search"]["mutators"] > cap:
+        # Slots beyond the pool cap wait for a free session; the cap is also
+        # shared by every concurrent run in the rig.
+        print(f"warning: search.mutators={cfg['search']['mutators']} exceeds the mutator pool's "
+              f"max_active_sessions={cap}, shared by all runs in rig {rig}; at most {cap} "
+              "slots run at once", file=sys.stderr)
     slots = fs.setdefault("slots", {})
     routed = fs.setdefault("routed_slots", [])
     for index in range(1, cfg["search"]["mutators"] + 1):
