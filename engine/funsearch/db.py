@@ -413,7 +413,7 @@ class Database:
 
     def archive_island(self, island: int) -> None:
         with self.transaction():
-            self.connection.execute("UPDATE programs SET active=0 WHERE island=?", (island,))
+            self.connection.execute("UPDATE programs SET active=0 WHERE island=? AND active=1", (island,))
 
     def add_task(self, island: int, parent_ids=(), *, slot="") -> Task:
         with self.transaction():

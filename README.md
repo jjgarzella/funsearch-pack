@@ -146,7 +146,9 @@ its task open. A compile failure during try consumes a trial and records an
 ERROR result. Invalid and crashing submissions are stored so future mutators
 can see what was tried. Exact and normalized duplicates are rejected before
 scoring; candidates with the same OK score and signature as an active
-program are rejected after scoring.
+program are rejected after scoring. Sources that include headers or use
+whitespace-sensitive preprocessing retain their source text for hashing,
+so distinct macro arguments and source positions remain eligible for scoring.
 
 The daemon stops for a requested stop, the duration limit, the submitted-child
 limit, or the configured plateau. `children_scored` counts authoritative
@@ -155,7 +157,11 @@ tries and compile failures do not count. The maximum-child limit includes
 in-flight submissions so multiple workers cannot overshoot it. Evaluations
 already running can finish for up to two minutes after stopping; queued
 requests receive RUN_OVER. Runs export `summary.json`, `best.c`, and the top
-ten distinct OK candidates in `top/`. The final and periodic SQLite backups
+ten distinct OK candidates in `top/`. Candidate exports are installed atomically
+and flushed before the terminal summary is published; an interrupted export
+leaves the run eligible for recovery and the crash sweep. If publication still
+fails while run data is readable, the sweep retains its registry entry for a
+later retry before sending completion mail. The final and periodic SQLite backups
 live in `snapshots/`, with the latest five retained. Worker failure results
 include the last 2 KiB of native stderr from a
 continuously drained, bounded 1 MiB tail; daemon tracebacks appear in

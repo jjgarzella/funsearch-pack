@@ -12,6 +12,8 @@ import tomllib
 import unittest
 
 from engine.funsearch.config import Config
+from engine.funsearch.daemon import write_outputs
+from engine.funsearch.db import Database
 from engine.funsearch.runtime import hold_engine_lock
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
 
@@ -261,6 +263,35 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         failed = json.loads((root / "summary.json").read_text())
         self.assertEqual((failed["status"], failed["reason"]), ("failed", "engine died"))
         self.assertFalse((self.registry / "lost.json").exists())
+
+    def test_sweep_recovers_interrupted_candidate_exports_before_delivery(self):
+        root = self.run_dir("interrupted", 99999999)
+        self.hook("on-start", root)
+        metadata = json.loads((root / "run.json").read_text())
+        obstruction = root / "best.c"
+        obstruction.mkdir()
+        with Database(root / "db.sqlite") as db:
+            db.add_program(0, "double f(void) { return 2; }\n", score=2)
+            for key, value in {"started_at": time.time() - 10, "seed_score": 0,
+                               "children_scored": 1, "children_ok": 1}.items():
+                db.set_state(key, value)
+            with self.assertRaises(OSError):
+                write_outputs(db, root, metadata, Config(), "completed", "max_children")
+        self.assertFalse((root / "summary.json").exists())
+        # A persistent export error must leave the registry available for retry,
+        # without claiming completion or mailing an unavailable best.c.
+        self.hook("sweep", code=1)
+        self.assertFalse((root / "summary.json").exists())
+        self.assertTrue((self.registry / "interrupted.json").exists())
+        self.assertEqual(self.mails(), [])
+        obstruction.rmdir()
+        self.hook("sweep")
+        summary = json.loads((root / "summary.json").read_text())
+        self.assertEqual((summary["status"], summary["best_score"]), ("failed", 2))
+        self.assertEqual((root / "best.c").read_text(), (root / "top/1-2.c").read_text())
+        self.assertTrue(all(row["status"] == "closed" for row in self.beads().values()))
+        self.assertEqual(len(self.mails()), 1)
+        self.assertFalse((self.registry / "interrupted.json").exists())
 
     def test_sweep_keeps_failed_delivery_entry_and_touches_timestamp(self):
         root = self.run_dir(pid=99999999)

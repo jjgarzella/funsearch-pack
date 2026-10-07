@@ -20,13 +20,13 @@ fs_result fs_score(fs_resolve_fn resolve, const char *instance)
 {
     double (*f)(void) = (double (*)(void))resolve("f");
     fs_result result = { .status = FS_ERROR };
-    (void)instance;
+    const char *scale = strstr(instance, "scale=");
     puts("toy evaluator score on stdout");
     if (!f) {
         strcpy(result.msg, "missing f");
         return result;
     }
-    result.score = f();
+    result.score = f() * (scale ? strtod(scale + 6, NULL) : 1.0);
     if (result.score < 0) {
         result.status = FS_INVALID;
         strcpy(result.msg, "negative");

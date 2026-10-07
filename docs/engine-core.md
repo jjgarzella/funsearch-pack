@@ -85,7 +85,10 @@ The primary operations are:
   any request the dead engine still held as an error and writes failed outputs
   from the live database, or from the newest readable snapshot when the live
   one is unreadable. The CLI verb refuses a run whose `summary.json` status is
-  already terminal, so it never relabels a finished run.
+  already terminal, so it never relabels a finished run. The writer atomically
+  installs and flushes `best.c` and the `top/` candidates before publishing
+  that terminal summary, which recovery and the sweep use as the completion
+  marker. An interrupted candidate export therefore remains recoverable.
 - State: `set_state`, `get_state`, `increment_state`, `all_state` (every key);
   values are JSON.
 
@@ -98,12 +101,19 @@ accessors; the daemon owns the client deadlines `claim_timeout_s` and `end_by`
 (see engine-pipeline.md). Task ids and program ids are integers. Task directories are
 `<run-dir>/tasks/<task-id>/`; `create_task` returns the id after writing TASK.md.
 It rolls back database changes and removes newly created task files on an error.
-Existing directories are preserved and cause an error rather than being reused.
+When an uncommitted task id is reused after a client dies, an existing directory
+is preserved as `<run-dir>/tasks/.orphan-<task-id>-<uuid>/` for inspection, and
+a fresh task directory is published automatically. Committed task directories
+are untouched.
 
 Normalization hashes canonical C tokens with SHA-256. It ignores comments
 (including IDEA lines), preserves string and character literals, and preserves
 preprocessor line boundaries and object/function macro distinctions. IDEA
 extraction skips literal contents and returns the first actual `// IDEA:` comment.
+Sources that include headers, stringify or paste macro tokens, or use
+`__LINE__`/`__builtin_LINE` retain their complete source text for hashing:
+preprocessing can make whitespace, comments, and physical line positions
+observable, including through macros defined in a header.
 It does not attempt general C semantic equivalence.
 
 Evolution groups OK programs by exact score and signatures rounded to eight

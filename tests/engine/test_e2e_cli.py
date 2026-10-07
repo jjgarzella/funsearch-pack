@@ -159,7 +159,7 @@ class EndToEndTests(PipelineTestCase):
         self.assertTrue(all(not pid_alive(pid) for pid in workers))
         self.assertFalse(json.loads(self.cli("run", "status", root))["engine_alive"])
         self.assertEqual(json.loads(self.cli("best", root, "-k", 1))[0]["score"], 10)
-        self.assertEqual(json.loads(self.cli("rescore", root, "best", "--instance", "n=2"))["score"], 10)
+        self.assertEqual(json.loads(self.cli("rescore", root, "best", "--instance", "n=2,scale=2"))["score"], 20)
         with sqlite3.connect(next((root / "snapshots").glob("*.sqlite"))) as saved:
             self.assertEqual(json.loads(saved.execute("SELECT value FROM state WHERE key='status'").fetchone()[0]), "completed")
         self.cli("try", root, task_id, child, code=3)
@@ -201,6 +201,28 @@ class EndToEndTests(PipelineTestCase):
         self.assert_requests_compiled_out(root, 8)
         with Database(root / "db.sqlite") as db:
             self.assertEqual(len(db.list_programs(status="ERROR")), 1)
+
+    def test_distinct_stringified_macro_arguments_are_both_scored(self):
+        root = self.start("stop.max_children=2")
+        for expression, expected in (("a+b", 4), ("a + b", 6)):
+            task, directory = self.task(root)
+            child = self.child(directory, source=f"#define STR(x) #x\n"
+                               f"double f(void) {{ return sizeof(STR({expression})); }}\n")
+            output = self.cli("submit", root, task, child)
+            self.assertEqual(output.split()[-2:], ["OK", str(expected)])
+        self.assertEqual(self.finished(root)["best_score"], 6)
+
+    def test_rescore_uses_requested_instance_for_init_and_scoring(self):
+        root = self.start("stop.max_children=1")
+        task, directory = self.task(root)
+        self.cli("submit", root, task, self.child(directory, 2))
+        self.finished(root)
+        result = json.loads(self.cli("rescore", root, "best", "--instance", "scale=3"))
+        self.assertEqual(result["score"], 6)
+        self.assertEqual(result["sig"], [6, 1])
+        self.cli("rescore", root, "best", "--instance", "fail=1", code=1)
+        # Rescoring is observational; it leaves the stored score unchanged.
+        self.assertEqual(json.loads(self.cli("best", root, "-k", 1))[0]["score"], 2)
 
     def test_check_broken_seed_config_errors_and_init_failure(self):
         self.assertEqual(json.loads(self.cli("check", self.problem))["status"], "OK")

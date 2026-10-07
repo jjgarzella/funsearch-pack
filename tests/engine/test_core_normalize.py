@@ -36,3 +36,19 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(normalized_hash("#define F /**/(x) x\n"), normalized_hash("#define F (x) x\n"))
         self.assertEqual(normalized_hash("#define A /* multiline\ncomment */ 1\n"), normalized_hash("#define A 1\n"))
         self.assertNotEqual(normalized_hash("double x=1e+3;"), normalized_hash("double x=1e + 3;"))
+
+    def test_stringification_and_source_positions_preserve_observable_spacing(self):
+        prefix = "#define STR(x) #x\n"
+        self.assertNotEqual(normalized_hash(prefix + "sizeof(STR(a+b))"),
+                            normalized_hash(prefix + "sizeof(STR(a + b))"))
+        for identifier in ("__LINE__", "__builtin_LINE()", "__LI\\\nNE__"):
+            with self.subTest(identifier=identifier):
+                source = f"int f(void) {{ return {identifier}; }}"
+                self.assertNotEqual(normalized_hash(source), normalized_hash("\n" + source))
+        # A header or pasted token may introduce an observer absent in this file.
+        for prefix in ('#include "candidate.h"\n', "#define JOIN(a,b) a##b\n"):
+            with self.subTest(prefix=prefix):
+                self.assertNotEqual(normalized_hash(prefix + "F(a+b)"),
+                                    normalized_hash(prefix + "F(a + b)"))
+        source = 'char *s = "__LINE__"; /* __LINE__ */ int x;'
+        self.assertEqual(normalized_hash(source), normalized_hash("\n" + source))

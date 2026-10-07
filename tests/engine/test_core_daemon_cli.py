@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from engine.funsearch import cli
 from engine.funsearch.config import Config
-from engine.funsearch.daemon import store_result
+from engine.funsearch.daemon import store_result, write_outputs
 from engine.funsearch.db import Database
 from engine.funsearch.runtime import engine_alive, hold_engine_lock
 
@@ -168,6 +168,31 @@ class RecoverTests(unittest.TestCase):
         (self.run / "summary.json").write_text("{")
         self.recover()
         self.assertEqual(json.loads((self.run / "summary.json").read_text())["status"], "failed")
+
+    def test_failed_candidate_exports_do_not_publish_completion_and_can_recover(self):
+        parent = self.run
+        metadata = json.loads((parent / "run.json").read_text())
+        cfg = Config()
+        cfg.search.islands = 1
+        for blocked in ("best.c", "top/1-2.c"):
+            with self.subTest(blocked=blocked):
+                self.run = parent / blocked.split("/")[0]
+                self.run.mkdir()
+                (self.run / "run.json").write_text(json.dumps(metadata))
+                seed_database(self.run / "db.sqlite", 2)
+                obstruction = self.run / blocked
+                obstruction.mkdir(parents=True)
+                with Database(self.run / "db.sqlite") as db, self.assertRaises(OSError):
+                    write_outputs(db, self.run, metadata, cfg, "completed", "max_children")
+                self.assertFalse((self.run / "summary.json").exists())
+                obstruction.rmdir()
+                self.recover()
+                summary = json.loads((self.run / "summary.json").read_text())
+                self.assertEqual(summary["status"], "failed")
+                self.assertEqual(summary["best_score"], 2)
+                self.assertEqual((self.run / "best.c").read_text(),
+                                 (self.run / "top/1-2.c").read_text())
+                self.assertIn("return 2", (self.run / "best.c").read_text())
 
 
 class EngineAliveTests(unittest.TestCase):

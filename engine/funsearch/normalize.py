@@ -20,13 +20,21 @@ _IDEA = re.compile(re.escape(IDEA_PREFIX) + r"\s*(.*)")
 
 
 def normalize_source(source: str) -> str:
-    """Canonical tokens, preserving literals and preprocessor line boundaries."""
+    """Canonical tokens unless preprocessing can observe whitespace or lines.
+
+    Stringification observes gaps between argument tokens; source-position
+    builtins observe physical lines. Headers can define either kind of macro,
+    and token pasting can construct them. Preserve the original source in
+    those cases rather than declaring different compiled behaviors duplicates.
+    """
+    original = source
     source = source.replace("\\\r\n", "").replace("\\\n", "")
     tokens = []
     directive = False
     directive_tokens = []
     previous_end = 0
     line_start = True
+    whitespace_sensitive = False
     for match in _TOKEN.finditer(source):
         value = match.group()
         if match.lastgroup in ("comment", "space"):
@@ -42,6 +50,10 @@ def normalize_source(source: str) -> str:
             directive = True
             directive_tokens = []
             tokens.append("\n")
+        if (value in ("__LINE__", "__builtin_LINE") or
+                (directive and directive_tokens and value in
+                 ("#", "%:", "##", "%:%:", "include", "include_next", "import", "embed"))):
+            whitespace_sensitive = True
         if (directive and len(directive_tokens) == 3 and
                 directive_tokens[1] == "define" and value == "(" and
                 match.start() != previous_end):
@@ -52,7 +64,7 @@ def normalize_source(source: str) -> str:
         if directive:
             directive_tokens.append(value)
         previous_end = match.end()
-    return " ".join(tokens).strip()
+    return "source\0" + original if whitespace_sensitive else " ".join(tokens).strip()
 
 
 def normalized_hash(source: str) -> str:

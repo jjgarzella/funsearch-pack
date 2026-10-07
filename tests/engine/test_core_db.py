@@ -53,6 +53,23 @@ class DatabaseTests(unittest.TestCase):
         other = self.db.add_task(0)
         self.assertEqual(self.db.close_task(other.id, status="abandoned").status, "abandoned")
 
+    def test_repeated_archival_writes_only_new_active_programs(self):
+        for n in range(10):
+            self.db.add_program(0, f"old-{n}", score=n)
+        self.db.archive_island(0)
+        other = self.db.add_program(1, "survivor", score=12)
+        self.db.add_program(0, "new-a", score=11)
+        self.db.add_program(0, "new-b", score=12)
+        before = self.db.connection.total_changes
+        self.db.archive_island(0)
+        self.assertEqual(self.db.connection.total_changes - before, 2)
+        self.assertEqual(self.db.list_programs(0), [])
+        self.assertEqual(len(self.db.list_programs(0, active_only=False)), 12)
+        self.assertEqual(self.db.get_program(other.id), other)
+        before = self.db.connection.total_changes
+        self.db.archive_island(0)
+        self.assertEqual(self.db.connection.total_changes, before)
+
     def test_eval_queue_round_trip_and_claim(self):
         task = self.db.add_task(0)
         first = self.db.enqueue("try", "/tmp/a.c", "/tmp/a.so", task_id=task.id)

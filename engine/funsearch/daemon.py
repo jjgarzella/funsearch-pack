@@ -143,6 +143,25 @@ def finish_unscored(db, reason):
         discard_candidate(evaluation)
 
 
+def _sync_directory(directory):
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_output(path, text):
+    """Atomically install a complete, flushed output and its directory entry."""
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        file.write(text)
+        file.flush()
+        os.fsync(file.fileno())
+    temporary.replace(path)
+    _sync_directory(path.parent)
+
+
 def write_outputs(db, root, metadata, cfg, status, reason):
     ended = time.time()
     started = db.get_state(STARTED_AT)
@@ -165,14 +184,16 @@ def write_outputs(db, root, metadata, cfg, status, reason):
         db.set_state(STATUS, status)
         db.set_state(REASON, reason)
         db.set_state(ENDED_AT, ended)
-    temporary = root / "summary.json.tmp"
-    temporary.write_text(json.dumps(summary, indent=2) + "\n")
-    temporary.replace(root / "summary.json")
     if best:
-        (root / "best.c").write_text(best[0].source)
+        _write_output(root / "best.c", best[0].source)
     (root / "top").mkdir(exist_ok=True)
+    _sync_directory(root)
     for rank, program in enumerate(best, 1):
-        (root / "top" / f"{rank}-{program.score:g}.c").write_text(program.source)
+        _write_output(root / "top" / f"{rank}-{program.score:g}.c", program.source)
+    # Recovery and the sweep trust a terminal summary as the completion marker.
+    # Publish it only after all candidate exports and their directory entries
+    # have reached disk, so interrupted exports remain eligible for recovery.
+    _write_output(root / "summary.json", json.dumps(summary, indent=2) + "\n")
 
 
 def recover_outputs(root, metadata, cfg, reason="engine died"):
@@ -196,6 +217,10 @@ def recover_outputs(root, metadata, cfg, reason="engine died"):
                     traceback.print_exc()  # Outputs matter more than queue rows.
                 write_outputs(db, root, metadata, cfg, FAILED, reason)
             return database
+        except OSError:
+            # A failed export does not make this database unreadable; retain
+            # its authoritative results and retry publication later.
+            raise
         except Exception as exc:
             errors.append(f"{database}: {exc}")
     raise RuntimeError("no readable run database" + "".join(f"\n{e}" for e in errors))

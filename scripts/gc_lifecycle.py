@@ -286,6 +286,18 @@ def failed_summary(root, metadata):
                             capture_output=True, text=True, timeout=300)
     if result.returncode == 0:
         return
+    # Recovery may have readable data but be unable to publish its exports
+    # (for example, a full disk or an obstructed output path). Preserve the
+    # registry for another sweep rather than inventing a terminal summary.
+    for database in [root / "db.sqlite", *sorted((root / "snapshots").glob("db-*.sqlite"))]:
+        try:
+            with Database(database, readonly=True) as db:
+                started = db.get_state("started_at")
+                db.best_program()
+        except Exception:
+            continue
+        if type(started) in (int, float):
+            raise RuntimeError(f"cannot publish recovered outputs for {root}: {result.stderr.strip()}")
     print(f"cannot recover {root}: {result.stderr.strip()}", file=sys.stderr)
     previous = read_json(root / "summary.json") if (root / "summary.json").exists() else {}
     previous.update(run_id=metadata["run_id"], instance=metadata["instance"],
