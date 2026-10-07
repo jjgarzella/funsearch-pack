@@ -163,7 +163,13 @@ Run databases and snapshots use SQLite DELETE rollback journaling and a
 5000 ms busy timeout. WAL is avoided because its shared-memory mmap can
 SIGBUS on host-mounted run directories (observed on a Docker Desktop host
 mount). Writable opens convert existing WAL databases to DELETE; stop old
-engines/clients before migrating a legacy run.
+engines/clients before migrating a legacy run. Status, best, rescore, and
+mutator inspection open read-only connections without schema writes. The
+database layout is versioned (`PRAGMA user_version`); only the engine
+upgrades an older run, when it starts or when `run recover` runs after it
+exits. `next-task`, `try`, `submit` and `stop` refuse a run whose layout
+differs, rather than change it under an older engine that is still running.
+
 Rollback journaling makes readers and the writer exclude each other, and
 SQLite is the only channel between clients and the engine (clients poll
 results every 0.1 s; the mutator tool guard opens the database on each tool
@@ -174,12 +180,6 @@ for a step rather than the whole copy, and a failed copy leaves no partial
 snapshot. This is sized for one host and a handful of mutators per run (the
 default is three); much larger mutator counts or very large source histories
 would need measuring first.
- Status, best, rescore, and
-mutator inspection open read-only connections without schema writes. The
-database layout is versioned (`PRAGMA user_version`); only the engine
-upgrades an older run, when it starts or when `run recover` runs after it
-exits. `next-task`, `try`, `submit` and `stop` refuse a run whose layout
-differs, rather than change it under an older engine that is still running.
 
 The engine flushes timestamped startup, shutdown, and SIGTERM/SIGHUP/SIGINT
 events to `engine.log`; those signals request normal shutdown. Python's
@@ -196,7 +196,9 @@ absolute run directory as an argument and in `FS_RUN_DIR`. The engine daemon
 runs both, logging their output to `engine.log`: the start hook after its
 workers are ready and before any evaluation is dispatched (`run start` returns
 once it finishes, and fails the run if it fails), the finish hook after outputs
-are written, including when the daemon fails. The PID
+are written, including when the daemon fails. Each hook must exit within
+120 s (`HOOK_TIMEOUT_S`); on timeout the engine kills the hook's whole process
+group and treats it as a failure, so a slow start hook fails the run. The PID
 file is removed after shutdown and the finish hook completes.
 
 CLI exit codes: 0 success; 1 runtime or seed failure; 2 usage/configuration

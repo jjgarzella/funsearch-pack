@@ -21,6 +21,11 @@ typedef enum { FS_OK = 0, FS_INVALID = 1, FS_ERROR = 2 } fs_status;
 typedef struct {
   fs_status status;
   double    score;      /* higher is better; meaningful only if FS_OK */
+  /* Optional signature: up to 8 finite values (e.g. per-size scores) that
+   * group programs into clusters (rounded to 8 decimals). It never ranks.
+   * An FS_OK submission with exactly the same score and sig as an active OK
+   * program is rejected as a duplicate, so with nsig = 0 every submission
+   * that ties an existing score is a duplicate whatever its code. */
   int32_t   nsig;       /* 0..8 */
   double    sig[8];
   char      msg[256];   /* shown to the mutator during `try`; NUL-terminated */

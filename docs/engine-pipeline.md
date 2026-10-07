@@ -25,9 +25,13 @@ with WorkerPool(cfg, evaluator, cfg.problem.instance, cfg.search.workers) as fin
             pending = executor.submit(try_pool.score, library, cfg.evaluator.timeout_s)
 ```
 
-`compile_candidate(cfg, source, out_dir, mode)` accepts `try` and `final`, uses
-the corresponding configured shell command, and replaces `{src}` and `{out}`
-with shell-quoted absolute paths. It returns `(ok, library_path, log)`. Each
+`compile_candidate(cfg, src_path, out_dir, mode)` takes the path of a C source
+file and a mode of `try` or `final`. It first reads the file and runs the
+best-effort `source_policy_error` lint (README Security notes); a hit returns
+`(False, out_dir/candidate.so, "source policy lint: ...")` without running any
+compiler. Otherwise it uses the mode's configured shell command and replaces
+`{src}` and `{out}` with shell-quoted absolute paths. It returns
+`(ok, library_path, log)`. Each
 concurrent compilation must use its own output directory. The output is
 `candidate.so`; an existing output is removed before compilation, and failed
 outputs are removed too. Commands run in the output directory for at most 60
