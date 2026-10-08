@@ -157,9 +157,9 @@ tries and compile failures do not count. `summary.json` reports `duplicate_rate`
 (behaviour-duplicate rejections divided by `children_scored`) and
 `distinct_stored` (retained submission program rows, excluding seeds). The
 maximum-child limit includes in-flight submissions so multiple workers cannot
-overshoot it. Evaluations already running can finish for up to two minutes after stopping; queued
-requests receive RUN_OVER. Runs export `summary.json`, `best.c`, and the top
-ten distinct OK candidates in `top/`. Candidate exports are installed atomically
+overshoot it. Evaluations already running can finish for up to two minutes
+after stopping; queued requests receive RUN_OVER. Runs export `summary.json`,
+`best.c`, and the top ten distinct OK candidates in `top/`. Candidate exports are installed atomically
 and flushed before the terminal summary is published; an interrupted export
 leaves the run eligible for recovery and the crash sweep. If publication still
 fails while run data is readable, the sweep retains its registry entry for a
