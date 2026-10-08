@@ -38,7 +38,7 @@ class Evaluator:
 class Search:
     islands: int = 4
     mutators: int = 3
-    tasks_per_session: int = 5
+    tasks_per_session: int = 1
     trial_budget: int = 3
     parents_per_task: int = 2
     workers: int = 2

@@ -19,7 +19,7 @@ env = ["JULIA_*", "FS_CAPSET_*"]
 [search]
 islands = 4
 mutators = 3
-tasks_per_session = 5
+tasks_per_session = 1
 trial_budget = 3
 parents_per_task = 2
 workers = 2

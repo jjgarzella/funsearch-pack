@@ -24,7 +24,7 @@ class ConfigTests(unittest.TestCase):
         expected["evaluator"]["build"] = "mkdir -p evaluator && cc -shared -fPIC -I../../../include -o evaluator/libevaluator.so ../../worker/toy_eval.c"
         self.assertEqual(cfg.to_dict(), expected)
         self.assertEqual(cfg.search.islands, 4)
-        self.assertEqual(cfg.search.tasks_per_session, 5)
+        self.assertEqual(cfg.search.tasks_per_session, 1)
         self.assertEqual(cfg.stop.plateau_children, 0)
         self.assertEqual(cfg.mutator.model, "claude-haiku-4-5-20251001")
 
