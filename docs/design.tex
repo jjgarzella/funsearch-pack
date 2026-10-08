@@ -219,7 +219,7 @@ memory_mb = 2048                 # RLIMIT_AS for the worker
 [search]
 islands = 4
 mutators = 3                     # K = number of slot beads
-tasks_per_session = 1            # N: tasks a mutator session handles before recycling
+tasks_per_session = 1            # Acceptance override; normal default N=5.
 trial_budget = 3                 # max `try` calls per task
 parents_per_task = 2
 workers = 2                      # worker processes PER POOL (submit + try)

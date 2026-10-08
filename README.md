@@ -254,8 +254,9 @@ After N accepted submissions it releases the slot and drains. RUN_OVER
 `slot show` also reports an unfinished task and its used trials so a fresh
 session can resume after a crash or error without allocating a second task.
 
-N is `[search] tasks_per_session`, copied to `fs.tasks_per_session` on each
-slot bead. K is `[search] mutators`, the number of slot beads per run.
+N is `[search] tasks_per_session` (default 5), copied to `fs.tasks_per_session`
+on each slot bead. The cap-set acceptance configuration explicitly uses N=1.
+K is `[search] mutators`, the number of slot beads per run.
 The agent's `max_active_sessions = 3` supports the default K=3. That cap is
 shared by every concurrent run in the rig, so a run's effective mutator
 concurrency is `min(search.mutators, cap minus other runs' sessions)`: slots

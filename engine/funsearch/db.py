@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS trials (
 );
 CREATE TABLE IF NOT EXISTS evalq (
  id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('try','submit','seed')),
- task_id INTEGER REFERENCES tasks(id), src_path TEXT NOT NULL, so_path TEXT NOT NULL,
+ task_id INTEGER REFERENCES tasks(id), island INTEGER, src_path TEXT NOT NULL, so_path TEXT NOT NULL,
  trial_n INTEGER,
  state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','running','done')),
  result TEXT, created_at REAL NOT NULL, started_at REAL, finished_at REAL
@@ -139,10 +139,8 @@ CREATE INDEX IF NOT EXISTS programs_island_rank
  ON programs(island,active,status,score DESC,source_length,id,sig);
 CREATE INDEX IF NOT EXISTS programs_island_recent
  ON programs(island,id,active,status,score,sig,source_length);
-"""
-_BEHAVIOR_DUPLICATES_INDEX = """
-CREATE INDEX IF NOT EXISTS evalq_behavior_recent
- ON evalq(finished_at DESC,id DESC,task_id)
+CREATE INDEX IF NOT EXISTS evalq_behavior_recent_by_island
+ ON evalq(island,finished_at DESC,id DESC)
  WHERE kind='submit' AND state='done' AND result IS NOT NULL
  AND json_extract(result,'$.rejected')='duplicate candidate'
  AND json_extract(result,'$.duplicate_kind')='behavior'
@@ -174,7 +172,7 @@ SNAPSHOTS = "snapshots"              # int: counter used to number snapshot file
 
 # PRAGMA user_version of the layout above. Version 0 is any database written
 # before the layout was versioned, with or without trial_n and source_length.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Snapshot copy step (pages per step, pause between steps, and restarts by
 # client writes before finishing in one pass); see Database.backup.
 BACKUP_PAGES = 1024
@@ -225,13 +223,6 @@ class Database:
                 if self._version() != SCHEMA_VERSION:
                     with self.transaction():
                         self._prepare(migrate)
-                # Existing version-1 runs acquire this forward-compatible index
-                # on their next writable open; duplicate history is queried by
-                # the daemon while creating tasks. Avoid DDL on ordinary opens.
-                if self.connection.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='index' "
-                        "AND name='evalq_behavior_recent'").fetchone() is None:
-                    self.connection.execute(_BEHAVIOR_DUPLICATES_INDEX)
         except BaseException:
             self.connection.close()
             raise
@@ -276,6 +267,11 @@ class Database:
         if "source_length" not in self._columns("programs"):
             self.connection.execute(
                 "ALTER TABLE programs ADD COLUMN source_length INTEGER NOT NULL DEFAULT 0")
+        if "island" not in self._columns("evalq"):
+            self.connection.execute("ALTER TABLE evalq ADD COLUMN island INTEGER")
+        self.connection.execute(
+            "UPDATE evalq SET island=(SELECT island FROM tasks WHERE tasks.id=evalq.task_id) "
+            "WHERE island IS NULL AND task_id IS NOT NULL")
         # Also repairs rows that an older engine inserted into an unversioned
         # database after a client added the column with its default of 0.
         self.connection.execute(
@@ -284,6 +280,7 @@ class Database:
             self.connection.execute(f"DROP INDEX IF EXISTS {name}")
         for statement in _statements(_INDEXES):
             self.connection.execute(statement)
+        self.connection.execute("DROP INDEX IF EXISTS evalq_behavior_recent")
         self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def __enter__(self):
@@ -338,6 +335,7 @@ class Database:
         if row is None:
             return None
         data = dict(row)
+        data.pop("island", None)
         data["result"] = json.loads(data["result"]) if data["result"] is not None else None
         return Evaluation(**data)
 
@@ -441,12 +439,11 @@ class Database:
         if limit <= 0:
             return []
         rows = self.connection.execute(
-            "SELECT e.id,e.result,e.finished_at FROM evalq e "
-            "JOIN tasks t ON t.id=e.task_id "
-            "WHERE t.island=? AND e.kind='submit' AND e.state='done' AND e.result IS NOT NULL "
-            "AND json_extract(e.result,'$.rejected')='duplicate candidate' "
-            "AND json_extract(e.result,'$.duplicate_kind')='behavior' "
-            "ORDER BY e.finished_at DESC,e.id DESC LIMIT ?", (island, limit))
+            "SELECT id,result,finished_at FROM evalq "
+            "WHERE island=? AND kind='submit' AND state='done' AND result IS NOT NULL "
+            "AND json_extract(result,'$.rejected')='duplicate candidate' "
+            "AND json_extract(result,'$.duplicate_kind')='behavior' "
+            "ORDER BY finished_at DESC,id DESC LIMIT ?", (island, limit))
         duplicates = []
         for row in rows:
             result = json.loads(row["result"])
@@ -548,9 +545,13 @@ class Database:
 
     def enqueue(self, kind: str, src_path, so_path, *, task_id=None, trial_n=None) -> Evaluation:
         with self.transaction():
+            task = (self.connection.execute("SELECT island FROM tasks WHERE id=?", (task_id,)).fetchone()
+                    if task_id is not None else None)
+            island = None if task is None else task["island"]
             cursor = self.connection.execute(
-                "INSERT INTO evalq(kind,task_id,src_path,so_path,created_at,trial_n) VALUES (?,?,?,?,?,?)",
-                (kind, task_id, str(src_path), str(so_path), time.time(), trial_n))
+                "INSERT INTO evalq(kind,task_id,island,src_path,so_path,created_at,trial_n) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (kind, task_id, island, str(src_path), str(so_path), time.time(), trial_n))
             return self.get_evaluation(cursor.lastrowid)
 
     def get_evaluation(self, evaluation_id: int) -> Evaluation | None:
