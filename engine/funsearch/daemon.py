@@ -18,7 +18,7 @@ from .db import (BEST_SCORE, CHILDREN_OK, CHILDREN_SCORED, CLAIM_TIMEOUT_S, Data
                  END_BY, ENDED_AT, PID, PLATEAU_COUNT, REASON, SEED_SCORE, SNAPSHOTS,
                  STARTED_AT, STATUS, STOP_REQUESTED)
 from .evolve import reset_weakest
-from .normalize import normalized_hash
+from .normalize import extract_idea, normalized_hash
 from .runtime import (COMPLETED, FAILED, HOOK_TIMEOUT_S, RUNNING, STOPPED, STOPPING,
                       hold_engine_lock, hold_recovery_lock, is_terminal, read_run,
                       run_hook, top_programs)
@@ -89,6 +89,7 @@ def store_result(db, evaluation, result):
         # Read and tokenize before taking the writer lock.
         source = Path(evaluation.src_path).read_text()
         norm_hash = normalized_hash(source)
+        result["idea"] = extract_idea(source)
     with db.transaction():
         if evaluation.kind == "try":
             db.add_trial(evaluation.task_id, evaluation.trial_n,
@@ -99,12 +100,14 @@ def store_result(db, evaluation, result):
             db.increment_state(CHILDREN_SCORED)
             if result["status"] == "OK":
                 db.increment_state(CHILDREN_OK)
-            duplicate = db.has_normalized_hash(norm_hash)
-            if result["status"] == "OK":
-                duplicate = duplicate or db.has_scored_duplicate(result["score"], result["sig"])
             if task.status != "open":
                 result["rejected"] = "task is no longer open"
-            elif duplicate:
+            elif db.has_normalized_hash(norm_hash):
+                result["duplicate_kind"] = "normalized"
+                result["rejected"] = "duplicate candidate"
+            elif (result["status"] == "OK" and
+                  db.has_scored_duplicate(result["score"], result["sig"])):
+                result["duplicate_kind"] = "behavior"
                 result["rejected"] = "duplicate candidate"
             else:
                 program = db.add_program(task.island, source, parent_ids=task.parent_ids,
@@ -170,10 +173,13 @@ def write_outputs(db, root, metadata, cfg, status, reason):
     scored = db.get_state(CHILDREN_SCORED, 0)
     ok = db.get_state(CHILDREN_OK, 0)
     best = top_programs(db)
+    submission_metrics = db.submission_metrics()
     summary = {"run_id": metadata["run_id"], "instance": cfg.problem.instance,
                "status": status, "reason": reason, "started_at": started, "ended_at": ended,
                "children_scored": scored, "children_ok": ok,
                "ok_rate": ok / scored if scored else 0,
+               "duplicate_rate": submission_metrics["behavior_duplicates"] / scored if scored else 0,
+               "distinct_stored": submission_metrics["distinct_stored"],
                "best_score": best[0].score if best else None,
                "seed_score": db.get_state(SEED_SCORE),
                "best_program_id": best[0].id if best else None,

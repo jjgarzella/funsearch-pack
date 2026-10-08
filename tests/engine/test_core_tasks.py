@@ -6,9 +6,10 @@ import tempfile
 import unittest
 
 from engine.funsearch.config import load_config
+from engine.funsearch.daemon import store_result
 from engine.funsearch.db import Database
 from engine.funsearch.evolve import seed_islands
-from engine.funsearch.tasks import create_task
+from engine.funsearch.tasks import create_task, render_task
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "toy-problem"
 
@@ -55,6 +56,24 @@ class TaskTests(unittest.TestCase):
     def test_round_robin(self):
         ids = [create_task(self.db, self.cfg, FIXTURE, self.run, rng=random.Random(i)) for i in range(6)]
         self.assertEqual([self.db.get_task(i).island for i in ids], [0, 1, 2, 3, 0, 1])
+
+    def test_render_marks_behavior_duplicates_and_requests_structural_diversity(self):
+        known = self.db.add_program(0, "// IDEA: known mechanism\nint f(void) { return 1; }",
+                                    parent_ids=[self.seeds[0].id], score=7, sig=[1.0, 2.0])
+        task = self.db.add_task(0, [known.id])
+        source = self.run / "duplicate.c"
+        source.write_text("// IDEA: reweighted known mechanism\nint f(void) { return 2; }\n")
+        self.db.enqueue("submit", source, self.run / "duplicate.so", task_id=task.id)
+        evaluation = self.db.claim_evaluation("submit")
+        store_result(self.db, evaluation, {"status": "OK", "score": 7, "sig": [1.0, 2.0], "msg": "same behavior"})
+
+        text = render_task(self.cfg, "problem", "double f(void);", [known],
+                           self.db.recent_children(0), self.run,
+                           duplicates=self.db.recent_behavior_duplicates(0))
+        self.assertIn("reweighted known mechanism — status: OK; score: 7; rejected as a behaviour duplicate; "
+                      "signature: [1.0, 2.0]", text)
+        self.assertIn("Propose a structurally different mechanism", text)
+        self.assertIn("State what is structurally different in your IDEA line", text)
 
     def test_problem_text_preserves_line_endings(self):
         problem = self.run / "problem"
