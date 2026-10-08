@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -353,18 +354,66 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("programs_island_recent", recent)
         self.assertNotIn("TEMP B-TREE", recent)
 
-    def test_behavior_duplicate_history_uses_filtered_order_index(self):
+    def test_behavior_duplicate_history_uses_island_order_index(self):
         query = (
-            "SELECT e.id,e.result,e.finished_at FROM evalq e "
-            "JOIN tasks t ON t.id=e.task_id "
-            "WHERE t.island=? AND e.kind='submit' AND e.state='done' AND e.result IS NOT NULL "
-            "AND json_extract(e.result,'$.rejected')='duplicate candidate' "
-            "AND json_extract(e.result,'$.duplicate_kind')='behavior' "
-            "ORDER BY e.finished_at DESC,e.id DESC LIMIT ?")
+            "SELECT id,result,finished_at FROM evalq "
+            "WHERE island=? AND kind='submit' AND state='done' AND result IS NOT NULL "
+            "AND json_extract(result,'$.rejected')='duplicate candidate' "
+            "AND json_extract(result,'$.duplicate_kind')='behavior' "
+            "ORDER BY finished_at DESC,id DESC LIMIT ?")
         plan = " ".join(row[3] for row in self.db.connection.execute(
             "EXPLAIN QUERY PLAN " + query, (0, 10)))
-        self.assertIn("evalq_behavior_recent", plan)
+        self.assertIn("evalq_behavior_recent_by_island", plan)
         self.assertNotIn("TEMP B-TREE", plan)
+
+    def test_behavior_duplicate_history_stays_within_requested_island(self):
+        def record(island, idea, finished_at):
+            task = self.db.add_task(island)
+            evaluation = self.db.enqueue("submit", "source.c", "source.so", task_id=task.id)
+            result = json.dumps({"rejected": "duplicate candidate", "duplicate_kind": "behavior",
+                                 "idea": idea, "status": "OK", "score": 3, "sig": [3]})
+            self.db.connection.execute(
+                "UPDATE evalq SET state='done',result=?,finished_at=? WHERE id=?",
+                (result, finished_at, evaluation.id))
+
+        record(0, "island-0-old", 10)
+        record(1, "island-1-new", 30)
+        record(0, "island-0-new", 20)
+
+        self.assertEqual([duplicate.idea for duplicate in self.db.recent_behavior_duplicates(0)],
+                         ["island-0-old", "island-0-new"])
+        self.assertEqual([duplicate.idea for duplicate in self.db.recent_behavior_duplicates(0, limit=1)],
+                         ["island-0-new"])
+
+    def test_version_one_duplicate_history_is_migrated_by_island(self):
+        task = self.db.add_task(4)
+        evaluation = self.db.enqueue("submit", "source.c", "source.so", task_id=task.id)
+        result = json.dumps({"rejected": "duplicate candidate", "duplicate_kind": "behavior",
+                             "idea": "before migration", "status": "OK", "score": 3, "sig": [3]})
+        self.db.connection.execute(
+            "UPDATE evalq SET state='done',result=?,finished_at=10 WHERE id=?",
+            (result, evaluation.id))
+        self.db.close()
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP INDEX evalq_behavior_recent_by_island")
+            connection.execute("ALTER TABLE evalq DROP COLUMN island")
+            connection.execute(
+                "CREATE INDEX evalq_behavior_recent ON evalq(finished_at DESC,id DESC,task_id) "
+                "WHERE kind='submit' AND state='done' AND result IS NOT NULL "
+                "AND json_extract(result,'$.rejected')='duplicate candidate' "
+                "AND json_extract(result,'$.duplicate_kind')='behavior'")
+            connection.execute("PRAGMA user_version=1")
+
+        migrated = Database(self.path, migrate=True)
+        self.addCleanup(migrated.close)
+        self.db = migrated
+        self.assertEqual([duplicate.idea for duplicate in self.db.recent_behavior_duplicates(4)],
+                         ["before migration"])
+        indexes = {row[0] for row in self.db.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn("evalq_behavior_recent_by_island", indexes)
+        self.assertNotIn("evalq_behavior_recent", indexes)
 
     def test_older_database_gains_source_length(self):
         legacy = self.path.with_name("legacy.sqlite")
