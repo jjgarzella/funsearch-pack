@@ -264,7 +264,7 @@ sys.exit(lifecycle.main())
         for index, row in enumerate(list(beads.values())[1:], 1):
             self.assertEqual(row["parent"], "test-1")
             self.assertEqual(row["metadata"]["fs.slot"], str(index))
-            self.assertEqual(row["metadata"]["fs.tasks_per_session"], "1")
+            self.assertEqual(row["metadata"]["fs.tasks_per_session"], "5")
             self.assertEqual(row["metadata"]["gc.routed_to"], "example/funsearch.mutator")
             self.assertEqual(row["metadata"]["opt_model"], Config().mutator.model)
         self.assertEqual(sum(args[0] == "sling" for args in self.calls()), 3)

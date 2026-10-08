@@ -219,7 +219,7 @@ memory_mb = 2048                 # RLIMIT_AS for the worker
 [search]
 islands = 4
 mutators = 3                     # K = number of slot beads
-tasks_per_session = 1            # N: accepted submissions before a session recycles
+tasks_per_session = 5            # N: accepted submissions before a session recycles
 trial_budget = 3                 # max `try` calls per task
 parents_per_task = 2
 workers = 2                      # worker processes PER POOL (submit + try)
@@ -731,9 +731,9 @@ These measure controller/provider/claim/startup together, not inference alone.
 
 Recommend \textbf{N=5} for the next operating run: ordinary startup amortizes
 to about 24.9 s/task, median to 26.1 s/task, or full observed mean to 62.8 s/task.
-N=5 is a candidate operating value based on these startup measurements. The
-shipped default remains N=1 until N=5 is validated on a stable host and the
-throughput projections are confirmed.
+N=5 is the operating recommendation and shipped default. The acceptance run
+used N=1; validate N=5 on a stable host before treating those projections as
+tuned throughput.
 Fifteen real restricted Haiku sessions were observed, and all three slots were
 routed, but only slots 1 and 2 received tasks; full K=3 utilization was not proven.
 
