@@ -142,6 +142,18 @@ class StoreResultTests(unittest.TestCase):
         self.assertEqual(summary["duplicate_rate"], 0.5)
         self.assertEqual(summary["distinct_stored"], 1)
 
+    def test_normalized_duplicate_is_distinct_from_behavior_duplicate(self):
+        task = self.db.add_task(0, [0])
+        evaluation = self.evaluation(task, 0)
+        store_result(self.db, evaluation,
+                     {"status": "OK", "score": 0, "sig": [], "msg": "same source"})
+
+        result = self.db.get_evaluation(evaluation.id).result
+        self.assertEqual(result["rejected"], "duplicate candidate")
+        self.assertEqual(result["duplicate_kind"], "normalized")
+        self.assertEqual(self.db.submission_metrics()["behavior_duplicates"], 0)
+        self.assertEqual(self.db.recent_behavior_duplicates(0), [])
+
     def test_cli_rejects_done_and_abandoned_tasks_before_compiling(self):
         self.db.set_state("status", "running")
         for status in ("done", "abandoned"):

@@ -140,6 +140,13 @@ CREATE INDEX IF NOT EXISTS programs_island_rank
 CREATE INDEX IF NOT EXISTS programs_island_recent
  ON programs(island,id,active,status,score,sig,source_length);
 """
+_BEHAVIOR_DUPLICATES_INDEX = """
+CREATE INDEX IF NOT EXISTS evalq_behavior_recent
+ ON evalq(finished_at DESC,id DESC,task_id)
+ WHERE kind='submit' AND state='done' AND result IS NOT NULL
+ AND json_extract(result,'$.rejected')='duplicate candidate'
+ AND json_extract(result,'$.duplicate_kind')='behavior'
+"""
 _RANK_ORDER = "ORDER BY score DESC, source_length, id"
 
 # Keys of the generic state(key,value) table (Database.get_state/set_state/
@@ -218,6 +225,13 @@ class Database:
                 if self._version() != SCHEMA_VERSION:
                     with self.transaction():
                         self._prepare(migrate)
+                # Existing version-1 runs acquire this forward-compatible index
+                # on their next writable open; duplicate history is queried by
+                # the daemon while creating tasks. Avoid DDL on ordinary opens.
+                if self.connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='index' "
+                        "AND name='evalq_behavior_recent'").fetchone() is None:
+                    self.connection.execute(_BEHAVIOR_DUPLICATES_INDEX)
         except BaseException:
             self.connection.close()
             raise
@@ -430,18 +444,15 @@ class Database:
             "SELECT e.id,e.result,e.finished_at FROM evalq e "
             "JOIN tasks t ON t.id=e.task_id "
             "WHERE t.island=? AND e.kind='submit' AND e.state='done' AND e.result IS NOT NULL "
-            "ORDER BY e.finished_at DESC,e.id DESC", (island,))
+            "AND json_extract(e.result,'$.rejected')='duplicate candidate' "
+            "AND json_extract(e.result,'$.duplicate_kind')='behavior' "
+            "ORDER BY e.finished_at DESC,e.id DESC LIMIT ?", (island, limit))
         duplicates = []
         for row in rows:
             result = json.loads(row["result"])
-            if (result.get("rejected") != "duplicate candidate" or
-                    result.get("duplicate_kind") != "behavior"):
-                continue
             duplicates.append(BehaviorDuplicate(
                 id=row["id"], idea=result.get("idea", ""), status=result["status"],
                 score=result["score"], sig=result["sig"], created_at=row["finished_at"] or 0.0))
-            if len(duplicates) >= limit:
-                break
         return duplicates[::-1]
 
     def submission_metrics(self) -> dict[str, int]:

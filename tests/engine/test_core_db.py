@@ -353,6 +353,19 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("programs_island_recent", recent)
         self.assertNotIn("TEMP B-TREE", recent)
 
+    def test_behavior_duplicate_history_uses_filtered_order_index(self):
+        query = (
+            "SELECT e.id,e.result,e.finished_at FROM evalq e "
+            "JOIN tasks t ON t.id=e.task_id "
+            "WHERE t.island=? AND e.kind='submit' AND e.state='done' AND e.result IS NOT NULL "
+            "AND json_extract(e.result,'$.rejected')='duplicate candidate' "
+            "AND json_extract(e.result,'$.duplicate_kind')='behavior' "
+            "ORDER BY e.finished_at DESC,e.id DESC LIMIT ?")
+        plan = " ".join(row[3] for row in self.db.connection.execute(
+            "EXPLAIN QUERY PLAN " + query, (0, 10)))
+        self.assertIn("evalq_behavior_recent", plan)
+        self.assertNotIn("TEMP B-TREE", plan)
+
     def test_older_database_gains_source_length(self):
         legacy = self.path.with_name("legacy.sqlite")
         with sqlite3.connect(legacy) as connection:

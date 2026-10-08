@@ -75,6 +75,36 @@ class TaskTests(unittest.TestCase):
         self.assertIn("Propose a structurally different mechanism", text)
         self.assertIn("State what is structurally different in your IDEA line", text)
 
+    def test_prompt_uses_one_recent_window_for_children_and_behavior_duplicates(self):
+        known = self.db.add_program(0, "// IDEA: known mechanism\nint f(void) { return 999; }",
+                                    parent_ids=[self.seeds[0].id], score=7, sig=[1.0, 2.0])
+        self.db.connection.execute("UPDATE programs SET created_at=99 WHERE id=?", (known.id,))
+        for n in range(6):
+            child = self.db.add_program(0, f"// IDEA: accepted-{n}\nint x={n};",
+                                        parent_ids=[self.seeds[0].id], status="INVALID", score=None)
+            self.db.connection.execute("UPDATE programs SET created_at=? WHERE id=?",
+                                       (100 + n, child.id))
+
+        task = self.db.add_task(0, [known.id])
+        for n in range(6):
+            source = self.run / f"duplicate-{n}.c"
+            source.write_text(f"// IDEA: duplicate-{n}\nint f(void) {{ return {100 + n}; }}\n")
+            self.db.enqueue("submit", source, self.run / f"duplicate-{n}.so", task_id=task.id)
+            evaluation = self.db.claim_evaluation("submit")
+            store_result(self.db, evaluation,
+                         {"status": "OK", "score": 7, "sig": [1.0, 2.0], "msg": "same behavior"})
+            self.db.connection.execute("UPDATE evalq SET finished_at=? WHERE id=?",
+                                       (106 + n, evaluation.id))
+
+        text = render_task(self.cfg, "problem", "double f(void);", [known],
+                           self.db.recent_children(0), self.run,
+                           duplicates=self.db.recent_behavior_duplicates(0))
+        recent = text.split("## Already tried on this island")[1].split("## Instructions")[0]
+        lines = [line for line in recent.splitlines() if line.startswith("- ")]
+        self.assertEqual([line[2:].split(" — status:", 1)[0] for line in lines],
+                         [f"accepted-{n}" for n in range(2, 6)] +
+                         [f"duplicate-{n}" for n in range(6)])
+
     def test_problem_text_preserves_line_endings(self):
         problem = self.run / "problem"
         problem.mkdir()
