@@ -24,7 +24,7 @@ env = []                         # e.g. ["JULIA_*", "MYEVAL_*"]
 # Keep these tuning defaults for the first validated baseline.
 islands = 4
 mutators = 3                     # Concurrent candidate authors; affects cost.
-tasks_per_session = 1            # Tasks before the author gets fresh context.
+tasks_per_session = 5            # Accepted submissions before the author gets fresh context.
 trial_budget = 3                 # Maximum trial evaluations per task.
 parents_per_task = 2
 workers = 2                      # Per pool: 2x this many resident evaluators.

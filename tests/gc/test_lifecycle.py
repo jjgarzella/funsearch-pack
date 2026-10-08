@@ -69,7 +69,6 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         root.mkdir()
         cfg = Config()
         cfg.search.mutators = mutators
-        cfg.search.tasks_per_session = 2
         metadata = {"run_id": name, "problem_dir": str(self.root / "problem"),
                     "instance": "n=1", "config": cfg.to_dict()}
         (root / "run.json").write_text(json.dumps(metadata))
@@ -265,7 +264,7 @@ sys.exit(lifecycle.main())
         for index, row in enumerate(list(beads.values())[1:], 1):
             self.assertEqual(row["parent"], "test-1")
             self.assertEqual(row["metadata"]["fs.slot"], str(index))
-            self.assertEqual(row["metadata"]["fs.tasks_per_session"], "2")
+            self.assertEqual(row["metadata"]["fs.tasks_per_session"], "5")
             self.assertEqual(row["metadata"]["gc.routed_to"], "example/funsearch.mutator")
             self.assertEqual(row["metadata"]["opt_model"], Config().mutator.model)
         self.assertEqual(sum(args[0] == "sling" for args in self.calls()), 3)
