@@ -47,6 +47,17 @@ class ProgramSummary:
 
 
 @dataclass(frozen=True)
+class BehaviorDuplicate:
+    """A scored submission rejected for matching an active program's behavior."""
+    id: int
+    idea: str
+    status: str
+    score: float
+    sig: list[float]
+    created_at: float
+
+
+@dataclass(frozen=True)
 class Task:
     id: int
     island: int
@@ -410,6 +421,42 @@ class Database:
             "SELECT * FROM programs WHERE island=? AND parent_ids != '[]' ORDER BY id DESC LIMIT ?",
             (island, limit))
         return [self._program(row) for row in rows][::-1]
+
+    def recent_behavior_duplicates(self, island: int, limit=10) -> list[BehaviorDuplicate]:
+        """Recent behavior-duplicate submissions on an island, oldest first."""
+        if limit <= 0:
+            return []
+        rows = self.connection.execute(
+            "SELECT e.id,e.result,e.finished_at FROM evalq e "
+            "JOIN tasks t ON t.id=e.task_id "
+            "WHERE t.island=? AND e.kind='submit' AND e.state='done' AND e.result IS NOT NULL "
+            "ORDER BY e.finished_at DESC,e.id DESC", (island,))
+        duplicates = []
+        for row in rows:
+            result = json.loads(row["result"])
+            if (result.get("rejected") != "duplicate candidate" or
+                    result.get("duplicate_kind") != "behavior"):
+                continue
+            duplicates.append(BehaviorDuplicate(
+                id=row["id"], idea=result.get("idea", ""), status=result["status"],
+                score=result["score"], sig=result["sig"], created_at=row["finished_at"] or 0.0))
+            if len(duplicates) >= limit:
+                break
+        return duplicates[::-1]
+
+    def submission_metrics(self) -> dict[str, int]:
+        """Return scored behavior duplicates and stored submission counts."""
+        behavior_duplicates = distinct_stored = 0
+        rows = self.connection.execute(
+            "SELECT result FROM evalq WHERE kind='submit' AND state='done' AND result IS NOT NULL")
+        for row in rows:
+            result = json.loads(row["result"])
+            if (result.get("rejected") == "duplicate candidate" and
+                    result.get("duplicate_kind") == "behavior"):
+                behavior_duplicates += 1
+            if result.get("program_id") is not None:
+                distinct_stored += 1
+        return {"behavior_duplicates": behavior_duplicates, "distinct_stored": distinct_stored}
 
     def archive_island(self, island: int) -> None:
         with self.transaction():

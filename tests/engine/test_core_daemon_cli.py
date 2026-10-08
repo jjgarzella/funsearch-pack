@@ -124,6 +124,24 @@ class StoreResultTests(unittest.TestCase):
         self.assertEqual(self.db.get_state("best_score"), 3)
         self.assertEqual(self.db.get_state("plateau_count"), 0)
 
+    def test_behavior_duplicate_rate_and_distinct_stored_summary_metrics(self):
+        duplicate_task = self.db.add_task(0, [0])
+        duplicate = self.evaluation(duplicate_task, 4)
+        store_result(self.db, duplicate, {"status": "OK", "score": 0, "sig": [], "msg": "same behavior"})
+        duplicate_result = self.db.get_evaluation(duplicate.id).result
+        self.assertEqual(duplicate_result["duplicate_kind"], "behavior")
+        self.assertEqual(duplicate_result["idea"], "")
+
+        accepted_task = self.db.add_task(0, [0])
+        accepted = self.evaluation(accepted_task, 5)
+        store_result(self.db, accepted, {"status": "OK", "score": 5, "sig": [5], "msg": "new"})
+        self.db.set_state("started_at", time.time() - 10)
+        write_outputs(self.db, self.root, {"run_id": "metrics"}, Config(), "stopped", "test")
+        summary = json.loads((self.root / "summary.json").read_text())
+        self.assertEqual(summary["children_scored"], 2)
+        self.assertEqual(summary["duplicate_rate"], 0.5)
+        self.assertEqual(summary["distinct_stored"], 1)
+
     def test_cli_rejects_done_and_abandoned_tasks_before_compiling(self):
         self.db.set_state("status", "running")
         for status in ("done", "abandoned"):

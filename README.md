@@ -153,9 +153,11 @@ so distinct macro arguments and source positions remain eligible for scoring.
 The daemon stops for a requested stop, the duration limit, the submitted-child
 limit, or the configured plateau. `children_scored` counts authoritative
 submitted evaluations, including behaviour duplicates rejected after scoring;
-tries and compile failures do not count. The maximum-child limit includes
-in-flight submissions so multiple workers cannot overshoot it. Evaluations
-already running can finish for up to two minutes after stopping; queued
+tries and compile failures do not count. `summary.json` reports `duplicate_rate`
+(behaviour-duplicate rejections divided by `children_scored`) and
+`distinct_stored` (retained submission program rows, excluding seeds). The
+maximum-child limit includes in-flight submissions so multiple workers cannot
+overshoot it. Evaluations already running can finish for up to two minutes after stopping; queued
 requests receive RUN_OVER. Runs export `summary.json`, `best.c`, and the top
 ten distinct OK candidates in `top/`. Candidate exports are installed atomically
 and flushed before the terminal summary is published; an interrupted export

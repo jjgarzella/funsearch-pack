@@ -143,7 +143,8 @@ class EndToEndTests(PipelineTestCase):
         self.cli("next-task", root, code=3)
         summary = self.finished(root)
         for key in ("run_id", "instance", "status", "reason", "started_at", "ended_at",
-                    "children_scored", "children_ok", "ok_rate", "best_score", "seed_score",
+                    "children_scored", "children_ok", "ok_rate", "duplicate_rate", "distinct_stored",
+                    "best_score", "seed_score",
                     "best_program_id", "throughput_per_hour", "islands"):
             self.assertIn(key, summary)
         self.assertEqual(summary["reason"], "max_children")
@@ -151,6 +152,8 @@ class EndToEndTests(PipelineTestCase):
         self.assertEqual(summary["children_ok"], 10)
         self.assertEqual(summary["best_score"], 10)
         self.assertEqual(summary["ok_rate"], 1)
+        self.assertEqual(summary["duplicate_rate"], 0)
+        self.assertEqual(summary["distinct_stored"], 10)
         self.assertIn("return 10", (root / "best.c").read_text())
         self.assertEqual(len(list((root / "top").glob("*.c"))), 10)
         self.assert_requests_compiled_out(root, 20)

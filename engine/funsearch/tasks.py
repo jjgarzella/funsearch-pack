@@ -19,22 +19,32 @@ def _code_block(source: str, language="c") -> str:
     return f"{fence}{language}\n{source}" + ("" if source.endswith("\n") else "\n") + f"{fence}\n"
 
 
-def render_task(cfg: Config, statement: str, header: str, parents, children, task_dir: Path) -> str:
+def render_task(cfg: Config, statement: str, header: str, parents, children, task_dir: Path, *,
+                duplicates=()) -> str:
     sections = [statement]
     sections.append("\n\n## Required exports\n\n" + _code_block(header))
     sections.append("\n## Parent programs (worst → best)\n")
     for index, parent in enumerate(sorted(parents, key=lambda p: (p.score, p.id))):
         sections.append(f"\n### v{index}\n\nScore: {parent.score}\n\nMessage:\n{parent.msg}\n\n" + _code_block(parent.source))
     sections.append("\n## Already tried on this island\n\n")
-    if not children:
+    if not children and not duplicates:
         sections.append("No children tried yet.\n")
-    for child in children:
+    attempts = [(child.created_at, child.id, child, False) for child in children]
+    attempts.extend((duplicate.created_at, duplicate.id, duplicate, True)
+                    for duplicate in duplicates)
+    for _, _, child, is_duplicate in sorted(attempts, key=lambda attempt: (attempt[0], attempt[1]))[-10:]:
         idea = child.idea.replace("\n", " ") or f"(no {IDEA_PREFIX} line)"
-        sections.append(f"- {idea} — status: {child.status}; score: {child.score}\n")
+        if is_duplicate:
+            sections.append(f"- {idea} — status: {child.status}; score: {child.score}; "
+                            f"rejected as a behaviour duplicate; signature: {child.sig}\n")
+        else:
+            sections.append(f"- {idea} — status: {child.status}; score: {child.score}\n")
     sections.append(
         "\n## Instructions\n\n"
         f"Write a whole C file to `{CHILD_FILENAME}` in this task directory: `{task_dir}`.\n"
         f"Start the file with a one-line `{IDEA_PREFIX} <what you changed and why>`.\n"
+        "Propose a structurally different mechanism from those listed above; reweighting an existing mechanism does not count. "
+        "State what is structurally different in your IDEA line.\n"
         f"You may try up to {cfg.search.trial_budget} times, then submit.\n")
     return "".join(sections)
 
@@ -73,7 +83,8 @@ def create_task(db: Database, cfg: Config, problem_dir, run_dir, slot="", *,
                 task_dir.rename(task_dir.with_name(f".orphan-{task.id}-{uuid.uuid4().hex}"))
                 task_dir.mkdir(exist_ok=False)
             created_directory = True
-            text = render_task(cfg, statement, header, parents, db.recent_children(island), task_dir)
+            text = render_task(cfg, statement, header, parents, db.recent_children(island), task_dir,
+                               duplicates=db.recent_behavior_duplicates(island))
             (task_dir / TASK_FILENAME).write_text(text, encoding="utf-8")
         return task.id
     except BaseException:
