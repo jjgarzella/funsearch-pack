@@ -15,7 +15,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.codex_mutator_setup import ACK, setup
+from scripts.codex_mutator_setup import ACK, selected_sandbox, setup
 
 
 TESTED_CODEX_VERSION = "codex-cli 0.160.0"
@@ -30,13 +30,16 @@ DISABLED = ("unified_exec", "shell_snapshot", "apps", "plugins", "multi_agent",
 
 def validate_effective(config, home):
     """Reject inherited capability/sandbox overrides before a model is loaded."""
-    if config.get("approval_policy") != "never" or config.get("sandbox_mode") != "workspace-write":
-        raise ValueError("Codex must use workspace-write and approval never")
+    expected_sandbox = selected_sandbox(os.environ)
+    if config.get("approval_policy") != "never" or config.get("sandbox_mode") != expected_sandbox:
+        raise ValueError(f"Codex must use {expected_sandbox} and approval never")
     sandbox = config.get("sandbox_workspace_write", {})
     if (sandbox.get("network_access") is not False or sandbox.get("writable_roots")
             or sandbox.get("exclude_slash_tmp") is not True
             or sandbox.get("exclude_tmpdir_env_var") is not True):
-        raise ValueError("Codex sandbox must allow writes only to the slot, with no network")
+        # In container mode these settings are retained but inactive; they do
+        # not provide filesystem/network enforcement with danger-full-access.
+        raise ValueError("Codex workspace-write settings must remain slot-only with no network")
     features = config.get("features", {})
     if (features.get("hooks") is not True or features.get("shell_tool") is not True
             or features.get("skip_host_skill_discovery") is not True
@@ -112,6 +115,7 @@ def launch(home, pack):
     if os.environ.get("FS_CODEX_POLICY_ACK") != ACK:
         raise ValueError("Codex mutators require overseer sign-off on docs/codex-mutator.md; "
                          f"then set FS_CODEX_POLICY_ACK={ACK} in the agent environment")
+    sandbox = selected_sandbox(os.environ)
     version = subprocess.run(["codex", "--version"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip()
     if version != TESTED_CODEX_VERSION:
@@ -151,7 +155,7 @@ def launch(home, pack):
         raise ValueError("slot opt_model must be a nonempty string")
     prompt = (pack / "agents/mutator-codex/prompt.template.md").read_text().replace("{{.ConfigDir}}", str(pack))
     command = ["codex", "--no-daemon", "--strict-config", "--dangerously-bypass-hook-trust",
-               "-a", "never", "-s", "workspace-write", "-C", str(home),
+               "-a", "never", "-s", sandbox, "-C", str(home),
                "exec", "--skip-git-repo-check", "-m", model, prompt]
     os.chdir(home)
     os.execvpe(command[0], command, env)

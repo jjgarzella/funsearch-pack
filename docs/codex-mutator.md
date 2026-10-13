@@ -30,7 +30,7 @@ policy.
 
 ## Containment and task policy
 
-The native shell sandbox is `workspace-write`, with network disabled,
+The default native shell sandbox is `workspace-write`, with network disabled,
 approval `never`, no additional writable roots, and both implicit `/tmp` and
 `TMPDIR` writes disabled. A configuration-only app-server preflight checks the
 installed CLI's effective settings before any model request or slot claim.
@@ -39,8 +39,50 @@ and changes to the required capability/sandbox settings. Project discovery
 stops at the private slot's marker. The CLI runs with strict configuration
 checking and without its shared daemon. The launcher pins CLI 0.160.0, the version used for the local
 configuration check, so upgrades require policy review; live launch/hook loading must still pass the next bead's
-smoke test before production use. Linux needs bubblewrap and working user
-namespaces; a host sandbox refusal must be resolved before live acceptance.
+smoke test before production use. Linux native mode needs bubblewrap and working
+user namespaces. A sandbox failure never automatically selects container mode.
+
+### Explicit container boundary
+
+For a city already running inside an operator-managed Docker container, set
+**both** variables in the Codex agent environment:
+
+```sh
+FS_CODEX_SANDBOX=container
+FS_CODEX_POLICY_ACK=trusted-local-v1
+```
+
+The default when `FS_CODEX_SANDBOX` is absent is `workspace-write`; that value
+can also be set explicitly. All other values (including `danger-full-access`,
+empty strings, aliases and whitespace variants) are refused. Container mode
+requires the exact acknowledgment above during setup and effective-config
+preflight, before claiming a slot or requesting a model. The launcher sets
+`sandbox_mode = "danger-full-access"` and passes `-s danger-full-access` with
+approval `never`. Native mode continues to require its existing acknowledgment
+at launch. Configuration cannot opt into full access by itself.
+
+This implements the overseer's **2026-10-13 decision on `mc-kfbz1.4`, option
+(1)**: the city's Docker container is the containment boundary, with no native
+OS sandbox, for trusted local experiments. Docker's default seccomp policy on
+this host blocks the namespaces bubblewrap needs. The overseer accepted the
+listed gaps and overrode the earlier requirement to fix that host refusal
+before live acceptance. Container mode neither creates a container nor verifies
+Docker isolation; selecting it on a host runs with that host user's access.
+
+**Container mode removes OS-level filesystem and network enforcement by Codex.**
+The task guard remains mandatory with exactly the same task/command scope.
+Web search and the other hosted capabilities remain disabled, and preflight
+still refuses MCP/plugins, permission profiles and capability overrides.
+The generated `sandbox_workspace_write.network_access = false` and restricted
+writable-root settings are retained and checked, but are **inactive** in
+`danger-full-access`. There is no separate network-off enforcement in this
+mode: shell networking depends on the task policy and any external Docker or
+host restrictions. Model API traffic still needs connectivity. A skipped guard
+can allow filesystem and network access throughout the container, including
+mounted host paths accessible to its user. Native sandboxing can be restored
+by removing `FS_CODEX_SANDBOX` or setting it to `workspace-write`.
+
+### Task guard (both modes)
 
 The generated `PreToolUse` hook matches every local tool. It delegates to
 `scripts/mutator_guard.py` for session ownership, retirement, task selection,
@@ -68,9 +110,10 @@ to the engine DB and Gas City; that access is **outside the model shell
 sandbox**. The hook replaces the model shell command with a trusted command
 that reads a private output receipt and returns the original exit status
 (including RUN_OVER=3 and rejection=4). This avoids granting broad write roots
-or unsandboxed model commands to make the shared engine work. The receipt is
-not another model-accessible file operation. The same native sandbox still
-applies to the receipt-reading shell and local candidate patch.
+or broad model commands to make the shared engine work. The receipt is
+not another model-accessible file operation. In native mode the same sandbox
+applies to the receipt-reading shell and local candidate patch; in container
+mode these run without a native sandbox.
 
 ## Gaps requiring overseer sign-off
 
@@ -85,11 +128,20 @@ of the following for trusted local experiments:
    automation trust of the pack-authored hook reduce configuration mistakes;
    they do not change that runtime behavior. The wrapper uses
    `--dangerously-bypass-hook-trust` **only** for these vetted automation hooks;
-   it never bypasses approvals or the shell sandbox.
+   it does not select the sandbox mode. Only the explicit acknowledged container
+   mode removes that sandbox. The pinned native hook integration has no supported
+   switch to turn callback failure into a denial. A Python supervisor could catch
+   a child guard's crash, but its own launch failure, SIGKILL or hook timeout
+   would still fail open. Fully fail-closed enforcement therefore requires a
+   Codex runtime change or an independent external boundary; this pack cannot
+   guarantee it with a hook. Caught guard errors, including broker timeouts,
+   still return an explicit deny in both modes.
 2. Workspace-write limits writes and shell networking, but permits filesystem
    reads outside the slot. Task-only reads and child-only edits rely on the
    native tool hook. A skipped hook therefore weakens those task/tool
-   restrictions. Hosted tools are not all covered by PreToolUse, so their
+   restrictions. Container mode also removes the native write/network limits,
+   so a skipped hook can permit arbitrary commands and edits as the container
+   user. Hosted tools are not all covered by PreToolUse, so their
    supported switches are disabled; the hook is not a complete enforcement
    boundary for arbitrary future Codex tools or CLI versions.
 3. The trusted hook performs only allowlisted engine/control operations outside
@@ -104,11 +156,13 @@ of the following for trusted local experiments:
    plus deliberate denied calls and no inherited tools. Do not infer live
    acceptance from unit tests or a config preflight.
 
-Until that sign-off is recorded, the launcher refuses to run. After acceptance,
-set `FS_CODEX_POLICY_ACK=trusted-local-v1` in the Codex agent environment (for
+The overseer recorded acceptance for this trusted local container policy on
+`mc-kfbz1.4` as described above. The launcher still requires the acknowledgment.
+Set `FS_CODEX_POLICY_ACK=trusted-local-v1` in the Codex agent environment (for
 example the city's agent patch), preserving the generated safety settings.
 This acknowledgment is an operational gate, not proof of isolation or a way to
-skip the review/smoke-test gates. Changing the policy or CLI semantics requires
+skip the review/smoke-test gates. Container mode also requires its explicit
+`FS_CODEX_SANDBOX=container` opt-in. Changing the policy or CLI semantics requires
 renewed review. Do not enable the role merely to make a failing launch pass.
 
 References: [official hook contracts and coverage](https://learn.chatgpt.com/docs/hooks),

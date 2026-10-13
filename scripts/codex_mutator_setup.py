@@ -1,6 +1,7 @@
 """Create a private native Codex launch configuration for one pool session."""
 
 import json
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -9,7 +10,20 @@ import sys
 ACK = "trusted-local-v1"
 
 
+def selected_sandbox(env):
+    """Only the acknowledged container policy may remove the native sandbox."""
+    mode = env.get("FS_CODEX_SANDBOX", "workspace-write")
+    if mode == "workspace-write":
+        return "workspace-write"
+    if mode != "container":
+        raise ValueError("FS_CODEX_SANDBOX must be workspace-write or container")
+    if env.get("FS_CODEX_POLICY_ACK") != ACK:
+        raise ValueError(f"container mode requires FS_CODEX_POLICY_ACK={ACK}")
+    return "danger-full-access"
+
+
 def setup(work_dir, pack_dir):
+    sandbox = selected_sandbox(os.environ)
     home, pack = Path(work_dir).resolve(), Path(pack_dir).resolve()
     home.mkdir(parents=True, exist_ok=True)
     home.chmod(0o700)
@@ -22,7 +36,7 @@ def setup(work_dir, pack_dir):
     guard = shlex.join([sys.executable, str(pack / "scripts/codex_mutator_guard.py"), str(home), str(pack)])
     settings = '''model = "gpt-6-luna"
 approval_policy = "never"
-sandbox_mode = "workspace-write"
+sandbox_mode = SANDBOX
 web_search = "disabled"
 allow_login_shell = false
 project_root_markers = [".funsearch-codex-root"]
@@ -60,7 +74,7 @@ tool_suggest = false
 recommended_plugins = false
 [projects.HOME]
 trust_level = "trusted"
-'''.replace('[projects.HOME]', f'[projects.{json.dumps(str(home))}]')
+'''.replace('SANDBOX', json.dumps(sandbox)).replace('[projects.HOME]', f'[projects.{json.dumps(str(home))}]')
     config = directory / "config.toml"
     config.write_text(settings)
     hooks = directory / "hooks.json"

@@ -1,4 +1,5 @@
 import json
+import io
 import os
 from pathlib import Path
 import shlex
@@ -6,7 +7,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from scripts.codex_mutator_guard import authorize_codex, handle
+from scripts.codex_mutator_guard import authorize_codex, handle, main
 from scripts.codex_mutator_setup import ACK, install_launcher, setup
 from scripts.codex_mutator_launch import launch, read_effective, validate_effective
 from tests.engine import test_mutator_guard as base_guard
@@ -15,7 +16,11 @@ PACK = base_guard.PACK
 
 
 class CodexGuardTests(unittest.TestCase):
-    setUp = base_guard.MutatorGuardTests.setUp
+    def setUp(self):
+        base_guard.MutatorGuardTests.setUp(self)
+        policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK="")
+        policy.start()
+        self.addCleanup(policy.stop)
 
     def event(self, command):
         return {"tool_name": "Bash", "tool_input": {"command": command}}
@@ -97,9 +102,89 @@ class CodexGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_guard_caught_process_errors_and_timeouts_return_deny_in_both_modes(self):
+        for mode in ("workspace-write", "container"):
+            for error in (OSError("cannot execute broker"), subprocess.TimeoutExpired("broker", 300)):
+                output = io.StringIO()
+                with self.subTest(mode=mode, error=error), \
+                        patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK), \
+                        patch("sys.argv", ["guard", str(self.home), str(PACK)]), \
+                        patch("sys.stdin", io.StringIO(json.dumps(self.event("gc hook --claim --drain-ack --json")))), \
+                        patch("sys.stdout", output), \
+                        patch("scripts.codex_mutator_guard.subprocess.run", side_effect=error):
+                    main()
+                result = json.loads(output.getvalue())["hookSpecificOutput"]
+                self.assertEqual(result["permissionDecision"], "deny")
+                self.assertNotIn("updatedInput", result)
+
     def test_launch_requires_explicit_policy_acknowledgment(self):
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "sign-off"):
             launch(self.home, PACK)
+
+    def test_default_setup_retains_native_sandbox(self):
+        import tomllib
+        with patch.dict(os.environ, {}, clear=True):
+            setup(self.home, PACK)
+        config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
+        self.assertEqual(config["sandbox_mode"], "workspace-write")
+        validate_effective(config, self.home)
+
+    def test_container_requires_exact_mode_and_ack_before_config_or_launch(self):
+        import tomllib
+        with patch.dict(os.environ, FS_CODEX_SANDBOX="container", FS_CODEX_POLICY_ACK=ACK):
+            setup(self.home, PACK)
+            config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
+            self.assertEqual(config["sandbox_mode"], "danger-full-access")
+            validate_effective(config, self.home)
+        for mode in ("workspace-write", "container", "danger-full-access", "", "CONTAINER", "container "):
+            for ack in (None, "", "trusted-local-v2", ACK + " ", ACK):
+                if mode == "container" and ack == ACK:
+                    continue
+                env = {"FS_CODEX_SANDBOX": mode}
+                if ack is not None:
+                    env["FS_CODEX_POLICY_ACK"] = ack
+                with self.subTest(mode=mode, ack=ack), patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(ValueError):
+                        validate_effective(config, self.home)
+                    if mode != "workspace-write" or ack != ACK:
+                        with patch("scripts.codex_mutator_launch.subprocess.run") as run, \
+                                patch("scripts.codex_mutator_launch.setup") as configure, \
+                                self.assertRaises(ValueError):
+                            launch(self.home, PACK)
+                        run.assert_not_called()
+                        configure.assert_not_called()
+                    if mode != "workspace-write":
+                        with self.assertRaises(ValueError):
+                            setup(self.home, PACK)
+
+    def test_container_preflight_preserves_all_other_refusals(self):
+        import copy
+        import tomllib
+        from scripts.codex_mutator_launch import DISABLED
+        with patch.dict(os.environ, FS_CODEX_SANDBOX="container", FS_CODEX_POLICY_ACK=ACK):
+            setup(self.home, PACK)
+            config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
+            changes = [((), key, value) for key, value in (
+                ("approval_policy", "on-request"), ("sandbox_mode", "workspace-write"),
+                ("sandbox_mode", "read-only"), ("mcp_servers", {"unwanted": {}}),
+                ("plugins", {"unwanted": {}}), ("default_permissions", "broad"),
+                ("web_search", "live"), ("allow_login_shell", True),
+                ("project_root_markers", [".git"]), ("project_doc_max_bytes", 100))]
+            changes += [(("features",), key, True) for key in DISABLED]
+            changes += [(("features",), key, False) for key in ("hooks", "shell_tool", "skip_host_skill_discovery")]
+            changes += [(("sandbox_workspace_write",), key, value) for key, value in (
+                ("network_access", True), ("writable_roots", ["/"]),
+                ("exclude_slash_tmp", False), ("exclude_tmpdir_env_var", False))]
+            changes += [(("shell_environment_policy",), "inherit", "all"),
+                        (("shell_environment_policy",), "set", {"PATH": "/usr/bin:/bin", "EXTRA": "1"})]
+            for parents, key, value in changes:
+                modified = copy.deepcopy(config)
+                target = modified
+                for parent in parents:
+                    target = target[parent]
+                target[key] = value
+                with self.subTest(parents=parents, key=key, value=value), self.assertRaises(ValueError):
+                    validate_effective(modified, self.home)
 
     def test_effective_config_rejects_inherited_capabilities(self):
         import tomllib
@@ -119,10 +204,23 @@ class CodexGuardTests(unittest.TestCase):
                 validate_effective(modified, self.home)
 
     def test_launcher_uses_claimed_slot_model_and_fixed_native_options(self):
+        self.check_launcher("workspace-write", "workspace-write")
+
+    def test_container_launcher_uses_full_access_and_keeps_guard(self):
+        self.check_launcher("container", "danger-full-access")
+
+    def check_launcher(self, mode, sandbox):
         from scripts.codex_mutator_launch import DISABLED
         import tomllib
+        policy = patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK)
+        policy.start()
+        self.addCleanup(policy.stop)
         setup(self.home, PACK)
         config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
+        hooks = json.loads((self.home / ".funsearch-codex-home/hooks.json").read_text())["hooks"]["PreToolUse"]
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0]["matcher"], "*")
+        self.assertIn("scripts/codex_mutator_guard.py", hooks[0]["hooks"][0]["command"])
         with patch.dict(os.environ, FS_CODEX_POLICY_ACK=ACK), \
                 patch("scripts.codex_mutator_launch.read_effective", return_value=config), \
                 patch("scripts.codex_mutator_launch.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.160.0\n")), \
@@ -135,7 +233,7 @@ class CodexGuardTests(unittest.TestCase):
             self.assertEqual(gc.call_args_list[0].args, ("hook", "--claim", "--drain-ack", "--json"))
             argv, env = execute.call_args.args[1:]
             self.assertEqual(argv[argv.index("-m") + 1], "custom-model")
-            self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
+            self.assertEqual(argv[argv.index("-s") + 1], sandbox)
             self.assertEqual(argv[argv.index("-a") + 1], "never")
             self.assertIn("--no-daemon", argv)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
