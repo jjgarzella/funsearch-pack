@@ -147,13 +147,14 @@ def on_start(root):
             start_locked(root)
 
 
-def mutator_pool_cap():
+def mutator_pool_cap(provider="claude"):
     """The pack's mutator max_active_sessions, or None if it cannot be read.
 
     A city may patch the pool, so this is the pack default, not a guarantee.
     """
     try:
-        with MUTATOR_AGENT.open("rb") as handle:
+        agent = MUTATOR_AGENT if provider == "claude" else PACK / "agents/mutator-codex/agent.toml"
+        with agent.open("rb") as handle:
             return int(tomllib.load(handle)["max_active_sessions"])
     except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
         return None
@@ -184,7 +185,10 @@ def start_locked(root):
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
              "run_bead": fs["run_bead"], "rig": rig, "notify": notify}
     write_json(registry, entry)
-    cap = mutator_pool_cap()
+    provider = cfg["mutator"].get("provider", "claude")
+    if provider not in ("claude", "codex"):
+        raise ValueError("unknown mutator provider")
+    cap = mutator_pool_cap(provider)
     if cap is not None and cfg["search"]["mutators"] > cap:
         # Slots beyond the pool cap wait for a free session; the cap is also
         # shared by every concurrent run in the rig.
@@ -198,14 +202,16 @@ def start_locked(root):
         if slot not in slots:
             fields = {"fs.run_dir": str(root), "fs.slot": slot,
                       "fs.tasks_per_session": str(cfg["search"]["tasks_per_session"]),
-                      "fs.run_bead": fs["run_bead"], "opt_model": cfg["mutator"]["model"]}
+                      "fs.run_bead": fs["run_bead"], "fs.provider": provider,
+                      "opt_model": cfg["mutator"]["model"]}
             slots[slot] = scoped_gc(city, rig, "bd", "create",
                 f"funsearch slot {metadata['run_id']}/{slot}", "--labels", "funsearch-slot",
                 "--parent", fs["run_bead"], "--metadata", json.dumps(fields),
                 "--description", "Follow the FunSearch mutator slot loop.", "--silent")
             write_lifecycle(root, fs)
         if slot not in routed:
-            scoped_gc(city, rig, "sling", f"{rig}/funsearch.mutator", slots[slot], "--no-formula")
+            role = "mutator" if provider == "claude" else "mutator-codex"
+            scoped_gc(city, rig, "sling", f"{rig}/funsearch.{role}", slots[slot], "--no-formula")
             routed.append(slot)
             write_lifecycle(root, fs)
 

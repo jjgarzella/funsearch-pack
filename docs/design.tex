@@ -528,6 +528,30 @@ and wrong runs/slots/tasks are denied. File tools can read only the current
 Paths with shell metacharacters are unsupported; quoted spaces are allowed.
 
 \subsection{Trust model (v1)}
+The optional \code{[mutator] provider = "codex"} routes slots to
+\code{funsearch.mutator-codex}; the default remains Claude. An omitted model
+selects the provider default (\code{gpt-6-luna} for Codex), and explicit models
+remain slot \code{opt\_model} metadata. Each provider pool has its own cap.
+The Codex-only launcher creates a private native CLI session with
+\code{workspace-write}, no shell network, approval \code{never}, no additional
+write roots, and no implicit temporary-directory writes. It checks effective
+configuration without starting a model, uses no shared daemon, and copies only
+authentication into its private Codex home. Hosted search, apps, plugins,
+subagents and other additional capabilities are disabled.
+
+The native Codex \code{PreToolUse} adapter reuses the original task policy.
+The model patches only a local staging \path{child.c}; the guard copies it into
+the current task before try/submit. Only trusted guard code performs approved
+engine/control operations outside the model shell sandbox, returning a private
+output receipt and the original exit status. Unified exec is disabled to avoid
+unchecked input to persistent shell processes. Codex hooks can fail open on
+runtime failure, and workspace-write allows broader filesystem reads; task-only
+access therefore relies on a functioning hook. These gaps and the host-code
+trust limitation require overseer sign-off before activation. The launcher
+refuses to run without \code{FS\_CODEX\_POLICY\_ACK=trusted-local-v1}.
+See \path{docs/codex-mutator.md} for the exact controls, gaps and separate live
+smoke-test gate. Unit/configuration checks alone are not live acceptance.
+
 Candidate C programs written by LLM mutators are compiled and run natively as
 the invoking user, with that user's filesystem and network access. The mutator
 tool guard and compile source policy keep honest mutators on task and catch

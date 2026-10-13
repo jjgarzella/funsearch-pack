@@ -52,7 +52,7 @@ Omit `instance` and `overrides` to use the problem defaults. `pack` is the
 absolute path of this pack (the directory containing `pack.toml`); the start
 step runs its CLI from there. Overrides may set
 only `search.*` and `stop.*`; use the separate `instance` variable for the
-instance and `problem.toml` for the mutator model. Keys that hold shell
+instance and `problem.toml` for the mutator provider and model. Keys that hold shell
 commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
 `problem.toml`. The seed must score
 `FS_OK`. For the copied evaluator template, set `evaluator.build` to
@@ -291,6 +291,24 @@ After a successful release or close, a session receipt makes the tool guard
 permit only `gc runtime drain-ack` for that retiring session. This prevents
 late nudges from reusing its context before the controller completes the drain;
 a new pool session can claim normally.
+
+### Codex variant
+
+Set `[mutator] provider = "codex"` and `model = "gpt-6-luna"` in
+`problem.toml` to route slots to `funsearch.mutator-codex`. The provider defaults
+to Claude, and an omitted model uses that provider's default. Existing problem
+files and old run manifests keep Claude behavior. Each pool has its own cap of
+three sessions, so account for both pools when budgeting concurrent runs.
+
+Codex uses a private native CLI session, workspace-write/no-network/never-approve
+settings, and a task guard adapting the existing policy. It edits a local
+`child.c`; trusted hook code copies it to the current task for try/submit and
+performs approved engine/control calls outside the model shell sandbox.
+**Codex hooks can fail open and workspace-write permits broader reads.** The
+variant refuses to launch until the overseer accepts the documented gaps and
+sets `FS_CODEX_POLICY_ACK=trusted-local-v1` in its agent environment. Read
+[the implementation, limitations and activation requirements](docs/codex-mutator.md).
+Configuration preflight and unit tests do not replace a live smoke test.
 
 ## Security notes
 

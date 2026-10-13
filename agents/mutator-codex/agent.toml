@@ -1,0 +1,14 @@
+# A dedicated native Codex launch; the wrapper enforces fixed safety options.
+# start_command intentionally bypasses city provider argument overrides.
+scope = "rig"
+provider = "codex"
+wake_mode = "fresh"
+work_dir = ".gc/funsearch/mutators/{{.Rig}}/{{.Agent}}"
+min_active_sessions = 0
+max_active_sessions = 3
+idle_timeout = "30m"
+pre_start = ["python3 '{{.ConfigDir}}/scripts/codex_mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
+start_command = "./.funsearch-codex-launch"
+prompt_mode = "none"
+lifecycle = "one_shot"
+process_names = ["codex"]
