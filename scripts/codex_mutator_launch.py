@@ -165,8 +165,8 @@ def launch(home, pack):
                          f"then set FS_CODEX_POLICY_ACK={ACK} in the agent environment")
     sandbox = selected_sandbox(os.environ)
     # Gas City forwards OPENAI_* (not CODEX_*) from ~/.gc/secrets.env.
-    key = os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY")
-    if not key or not key.strip():
+    key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY") or "").strip()
+    if not key:
         raise ValueError("Codex mutators need an API key: set OPENAI_API_KEY in ~/.gc/secrets.env")
     version = subprocess.run(["codex", "--version"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip()
@@ -196,9 +196,10 @@ def launch(home, pack):
     claim = json.loads(gc("hook", "--claim", "--drain-ack", "--json"))
     if claim.get("action") == "drain":
         return 0
-    if claim.get("action") != "work":
-        raise ValueError("unexpected gc hook action")
-    bead = claim["bead_id"]
+    bead = claim.get("bead_id")
+    if claim.get("action") != "work" or not isinstance(bead, str) or not bead:
+        raise ValueError(f"unexpected gc hook result {claim!r}; a slot may still be claimed by "
+                         f"session {os.environ.get('GC_SESSION_ID')}")
     try:
         rows = json.loads(gc("bd", "show", bead, "--json"))
         row = rows[0] if isinstance(rows, list) and len(rows) == 1 else rows

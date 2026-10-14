@@ -43,10 +43,15 @@ claiming a slot when neither is set. It removes any stale private `auth.json`,
 drops every inherited `OPENAI_*`/`CODEX_*` variable (so `OPENAI_BASE_URL`
 cannot redirect the key), and passes the key to Codex only as `CODEX_API_KEY`
 with `forced_login_method = "api"`. The configuration preflight runs without
-the key. Brokered engine/lifecycle commands run without `OPENAI_*`,
-`CODEX_API_KEY` or `CODEX_ACCESS_TOKEN`, because try/submit compile candidate C
-in-process. Never put credentials in the problem or prompt, and never print the
-key. Private receipts/config remain sensitive host files and should follow the
+the key. The hook command starts the guard through `env -u CODEX_API_KEY -u
+CODEX_ACCESS_TOKEN`, and brokered engine/lifecycle commands also run without
+`OPENAI_*`, so the guard (alive while try/submit compile and run candidate C)
+does not hold the key. **This does not make the key private:** the Codex
+process itself holds it, and same-user code can normally read
+`/proc/<codex pid>/environ`. That includes candidate C in the host evaluator
+and, in either mode, a model shell whose hook was skipped (workspace-write
+does not restrict reads). See gap 2. Never put credentials in the problem or
+prompt, and never print the key. Private receipts/config remain sensitive host files and should follow the
 city's work-directory retention policy.
 
 ## Containment and task policy
@@ -146,7 +151,9 @@ Approved read/lifecycle/engine calls execute inside the trusted hook as argv
 without a shell, with no stdin, in a new process group, and with a 280-second
 limit. On overrun the guard kills the group and returns exit 75 with `OUTCOME
 UNKNOWN`: the evaluation may still complete, so the model must run `funsearch
-slot show <bead>` before retrying. The hook timeout is 310 seconds (5 s lock
+slot show <bead>` before retrying. Engine children that start their own
+session (compile and evaluation workers) are outside that group and can
+outlive the kill. The hook timeout is 310 seconds (5 s lock
 wait + 280 s + margin). They need host access
 to the engine DB and Gas City; that access is **outside the model shell
 sandbox**. The hook replaces the model shell command with a trusted command
@@ -162,7 +169,9 @@ mode these run without a native sandbox.
 
 Each hook call holds an exclusive `flock` for its slot (5 s wait, then a
 "slot busy; retry" denial) across authorization, the brokered command and the
-receipt write; the kernel drops it if the guard dies. Locks live in
+receipt write; the kernel drops it if the guard dies. A brokered command
+does not inherit the lock, so if the guard is killed (for example by the
+hook timeout) a command already running continues without it. Locks live in
 `FS_CODEX_LOCK_DIR` (default `/var/tmp/funsearch-codex-locks`), which must be a
 real 0700 directory owned by the agent user. Setup probes that a second process
 cannot take a held lock and refuses otherwise, because the virtiofs host share
@@ -196,9 +205,9 @@ of the following for trusted local experiments:
    a child guard's crash, but its own launch failure, SIGKILL or hook timeout
    would still fail open. Fully fail-closed enforcement therefore requires a
    Codex runtime change or an independent external boundary; this pack cannot
-   guarantee it with a hook. Caught guard errors, including broker timeouts,
-   still return an explicit deny in both modes; a broker overrun returns the
-   exit-75 `OUTCOME UNKNOWN` receipt described above.
+   guarantee it with a hook. Caught guard errors still return an explicit deny
+   in both modes; a broker overrun instead returns the exit-75 `OUTCOME
+   UNKNOWN` receipt described above, because the command already started.
 2. Workspace-write limits writes and shell networking, but permits filesystem
    reads outside the slot. Task-only reads and child-only edits rely on the
    native tool hook. A skipped hook therefore weakens those task/tool
@@ -207,9 +216,12 @@ of the following for trusted local experiments:
    user. Hosted tools are not all covered by PreToolUse, so their
    supported switches are disabled; the hook is not a complete enforcement
    boundary for arbitrary future Codex tools or CLI versions. The API key is in
-   the Codex process environment: in container mode a skipped hook lets the
-   model shell read it (for example from `/proc/<codex pid>/environ`), just as
-   it could read a copied `auth.json` before. Use a dedicated, spend-capped key.
+   the Codex process environment. Unless Codex marks itself non-dumpable
+   (unverified; the smoke test checks it), any same-user process can read
+   `/proc/<codex pid>/environ`: candidate C running in the evaluator, and in
+   either mode a model shell whose hook was skipped. This is the same exposure
+   as the previously copied `auth.json`. Use a dedicated, spend-capped key and
+   revoke it if it may have leaked.
 3. The trusted hook performs only allowlisted engine/control operations outside
    the shell sandbox. Candidate C still compiles and runs in the existing host
    evaluator workers. It has the host user's filesystem/network access and can

@@ -56,6 +56,23 @@ class CodexLaunchTests(unittest.TestCase):
         (self.etc / "hooks.json").write_text('{"hooks": {}}')
         with self.assertRaisesRegex(ValueError, "hooks"):
             check_layers(result, self.home)
+        (self.etc / "hooks.json").unlink()
+        (self.etc / "hooks.json").symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(ValueError, "hooks"):
+            check_layers(result, self.home)
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "hooks.json").write_text("{}")
+        layer = {"name": {"type": "legacyManagedConfigTomlFromFile", "file": str(legacy / "managed_config.toml")},
+                 "config": {}}
+        with self.assertRaisesRegex(ValueError, "hooks"):
+            check_layers(dict(result, layers=[user, layer]), self.home)
+
+    def test_fixture_effective_config_passes_with_api_login(self):
+        config = self.layers()["config"]
+        with self.assertRaisesRegex(ValueError, "API-key"):
+            validate_effective(config, self.home)
+        validate_effective(dict(config, forced_login_method="api"), self.home)
 
     def test_effective_config_refuses_code_running_and_redirecting_settings(self):
         validate_effective(self.config, self.home)
@@ -82,13 +99,14 @@ class CodexLaunchTests(unittest.TestCase):
             gc.assert_not_called()
             run.assert_not_called()
 
-    def launch_with(self, *responses):
+    def launch_with(self, *responses, effective=None, exec_error=None):
         self.addCleanup(os.chdir, os.getcwd())
-        with patch("scripts.codex_mutator_launch.read_effective", return_value=self.config), \
+        with patch("scripts.codex_mutator_launch.read_effective",
+                   side_effect=effective or (lambda home, env: self.config)), \
                 patch("scripts.codex_mutator_launch.subprocess.run",
                       return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.160.0\n")), \
                 patch("scripts.gc_lifecycle.gc", side_effect=list(responses)) as gc, \
-                patch("scripts.codex_mutator_launch.os.execvpe") as execute:
+                patch("scripts.codex_mutator_launch.os.execvpe", side_effect=exec_error) as execute:
             try:
                 return launch(self.home, PACK)
             finally:
@@ -124,6 +142,26 @@ class CodexLaunchTests(unittest.TestCase):
         self.assertIn("slot still claimed by session session-1", message)
         self.assertNotIn("slot released", message)
         self.assertFalse((self.home / ".funsearch-retired.json").exists())
+
+    def test_exec_failure_releases_claim(self):
+        claim = json.dumps({"action": "work", "bead_id": "fs-slot.1"})
+        with self.assertRaisesRegex(ValueError, "no codex; slot released"):
+            self.launch_with(claim, self.slot(**{"fs.provider": "codex"}), self.slot(), "",
+                             exec_error=OSError("no codex"))
+        self.execute.assert_called_once()
+
+    def test_malformed_work_claim_says_slot_may_be_claimed(self):
+        with self.assertRaisesRegex(ValueError, "may still be claimed by session session-1"):
+            self.launch_with(json.dumps({"action": "work"}))
+        self.assertEqual(len(self.gc_calls), 1)
+
+    def test_hooks_changed_after_setup_refuses_before_claim(self):
+        def tamper(home, env):
+            (home / ".funsearch-codex-home/hooks.json").write_text('{"hooks": {}}')
+            return self.config
+        with self.assertRaisesRegex(ValueError, "hooks.json changed"):
+            self.launch_with(effective=tamper)
+        self.assertEqual(self.gc_calls, [])
 
     def test_drain_needs_no_release(self):
         self.assertEqual(self.launch_with(json.dumps({"action": "drain"})), 0)

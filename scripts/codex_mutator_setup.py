@@ -84,7 +84,10 @@ def probe_lock(home):
 
 
 def hooks_document(home, pack):
-    guard = shlex.join([sys.executable, str(pack / "scripts/codex_mutator_guard.py"), str(home), str(pack)])
+    # The guard waits on try/submit while candidate C runs as this user; keep
+    # the API key out of the guard's /proc/<pid>/environ.
+    guard = shlex.join(["/usr/bin/env", "-u", "CODEX_API_KEY", "-u", "CODEX_ACCESS_TOKEN",
+                        sys.executable, str(pack / "scripts/codex_mutator_guard.py"), str(home), str(pack)])
     # The hook timeout exceeds the guard's 5 s lock wait plus its 280 s broker limit.
     return json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
         {"type": "command", "command": guard, "timeout": 310}]}]}}, indent=2) + "\n"

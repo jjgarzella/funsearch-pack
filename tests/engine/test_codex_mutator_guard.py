@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -106,6 +107,14 @@ class CodexGuardTests(unittest.TestCase):
         setup(self.home, PACK)
         hooks = json.loads((self.home / ".funsearch-codex-home/hooks.json").read_text())
         argv = shlex.split(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+        # The guard (alive while candidate C runs) never holds the model API key.
+        prefix = ["/usr/bin/env", "-u", "CODEX_API_KEY", "-u", "CODEX_ACCESS_TOKEN"]
+        self.assertEqual(argv[:6], prefix + [sys.executable])
+        probe = subprocess.run(prefix + [sys.executable, "-c", "import os; print(sorted(os.environ))"],
+                               env=dict(os.environ, CODEX_API_KEY="sk-x", CODEX_ACCESS_TOKEN="t"),
+                               capture_output=True, text=True, timeout=5)
+        self.assertNotIn("CODEX_API_KEY", probe.stdout)
+        self.assertNotIn("CODEX_ACCESS_TOKEN", probe.stdout)
         for event in ({}, self.event("cat /etc/passwd")):
             result = subprocess.run(argv, input=json.dumps(event), text=True, capture_output=True,
                                     env=os.environ.copy(), timeout=5)
@@ -306,7 +315,10 @@ class CodexGuardTests(unittest.TestCase):
         install_launcher(self.home, PACK)
         workspace = self.home / "slot"
         env = dict(os.environ, CODEX_HOME=str(workspace / ".funsearch-codex-home"))
-        validate_effective(read_effective(workspace, env), workspace)
+        from scripts.codex_mutator_launch import check_layers
+        with patch("scripts.codex_mutator_launch.check_layers", wraps=check_layers) as checked:
+            validate_effective(read_effective(workspace, env), workspace)
+        checked.assert_called_once()
         self.assertIn(str(workspace), (self.home / ".funsearch-codex-launch").read_text())
 
     def test_local_staging_read_requires_current_task_and_real_file(self):
@@ -356,6 +368,16 @@ class CodexGuardTests(unittest.TestCase):
         for lines in invalid:
             with self.subTest(lines=lines), self.assertRaises(ValueError):
                 authorize_codex(self.patch_event(*lines), self.home, PACK)
+        # Codex splits only at LF: any other separator would hide a second path.
+        for separator in "\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029\x00":
+            for header in ("*** Add File: child.c", "*** Update File: child.c"):
+                lines = (f"{header}{separator}+/../.funsearch-slot.json", "+{}")
+                with self.subTest(separator=separator, header=header), self.assertRaises(ValueError):
+                    authorize_codex(self.patch_event(*lines), self.home, PACK)
+            with self.subTest(body=separator), self.assertRaises(ValueError):
+                authorize_codex(self.patch_event("*** Add File: child.c", f"+x{separator}y"), self.home, PACK)
+        tab = self.patch_event("*** Add File: child.c", "+\tint x;")
+        self.assertEqual(authorize_codex(tab, self.home, PACK), ("patch", None))
         for command in (None, "", "*** Begin Patch", "*** Begin Patch\n*** Add File: child.c\n+x\n*** End Patch\n\n"):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 authorize_codex({"tool_name": "apply_patch", "tool_input": {"command": command}}, self.home, PACK)

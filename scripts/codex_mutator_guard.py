@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,8 +57,18 @@ def check_patch(patch, home):
     """Accept exactly one Add/Update of local child.c in the plain patch grammar."""
     if not isinstance(patch, str):
         raise ValueError("expected a patch string")
-    # splitlines also accepts CRLF patches; the grammar below is unchanged.
-    lines = patch.splitlines()
+    # Codex's grammar ends lines at LF only. str.splitlines would also split
+    # at CR, form feed and Unicode separators, letting a header Python sees
+    # as child.c name another path for Codex. Accept LF (or CRLF) and refuse
+    # every other control or separator character.
+    lines = patch.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    for line in lines:
+        if any(char != "\t" and (unicodedata.category(char)[0] == "C" or char in "\u2028\u2029")
+               for char in line):
+            raise ValueError("patch lines may not contain control or separator characters")
     if len(lines) < 2 or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
         raise ValueError("expected one complete child.c patch")
     child = home / "child.c"
@@ -130,8 +141,16 @@ def run_command(argv, home, timeout=BROKER_TIMEOUT):
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A descendant in another session still holds the pipe.
+            process.stdout.close()
+            process.wait()
         raise BrokerTimeout(f"{shlex.join(argv)} exceeded {timeout} s") from None
     code = process.returncode
     return code if 0 <= code <= 255 else 1, output.decode(errors="replace")
