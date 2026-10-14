@@ -108,13 +108,15 @@ class CodexGuardTests(unittest.TestCase):
         hooks = json.loads((self.home / ".funsearch-codex-home/hooks.json").read_text())
         argv = shlex.split(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
         # The guard (alive while candidate C runs) never holds the model API key.
-        prefix = ["/usr/bin/env", "-u", "CODEX_API_KEY", "-u", "CODEX_ACCESS_TOKEN"]
-        self.assertEqual(argv[:6], prefix + [sys.executable])
+        prefix = ["/usr/bin/env", "-u", "CODEX_API_KEY", "-u", "CODEX_ACCESS_TOKEN", "-u", "OPENAI_API_KEY"]
+        self.assertEqual(argv[:8], prefix + [sys.executable])
         probe = subprocess.run(prefix + [sys.executable, "-c", "import os; print(sorted(os.environ))"],
-                               env=dict(os.environ, CODEX_API_KEY="sk-x", CODEX_ACCESS_TOKEN="t"),
+                               env=dict(os.environ, CODEX_API_KEY="sk-x", CODEX_ACCESS_TOKEN="t",
+                                        OPENAI_API_KEY="sk-y"),
                                capture_output=True, text=True, timeout=5)
         self.assertNotIn("CODEX_API_KEY", probe.stdout)
         self.assertNotIn("CODEX_ACCESS_TOKEN", probe.stdout)
+        self.assertNotIn("OPENAI_API_KEY", probe.stdout)
         for event in ({}, self.event("cat /etc/passwd")):
             result = subprocess.run(argv, input=json.dumps(event), text=True, capture_output=True,
                                     env=os.environ.copy(), timeout=5)

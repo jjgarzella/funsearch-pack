@@ -44,7 +44,8 @@ drops every inherited `OPENAI_*`/`CODEX_*` variable (so `OPENAI_BASE_URL`
 cannot redirect the key), and passes the key to Codex only as `CODEX_API_KEY`
 with `forced_login_method = "api"`. The configuration preflight runs without
 the key. The hook command starts the guard through `env -u CODEX_API_KEY -u
-CODEX_ACCESS_TOKEN`, and brokered engine/lifecycle commands also run without
+CODEX_ACCESS_TOKEN -u OPENAI_API_KEY` (Codex may run hooks via a login shell,
+whose profile output would also corrupt the hook's JSON reply), and brokered engine/lifecycle commands also run without
 `OPENAI_*`, so the guard (alive while try/submit compile and run candidate C)
 does not hold the key. **This does not make the key private:** the Codex
 process itself holds it, and same-user code can normally read
