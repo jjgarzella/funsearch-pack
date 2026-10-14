@@ -90,6 +90,17 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         self.assertEqual(len(slings), 3)
         self.assertTrue(all(args[1] == "example/funsearch.mutator-codex" for args in slings))
 
+    def test_unknown_provider_is_refused_before_any_bead_or_registry(self):
+        root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["config"]["mutator"] = {"provider": "bogus", "model": "m"}
+        (root / "run.json").write_text(json.dumps(metadata))
+        result = self.hook("on-start", root, code=1)
+        self.assertIn("unknown mutator provider", result.stderr)
+        beads = self.shim_state / "beads.json"
+        self.assertFalse(beads.exists() and self.beads())
+        self.assertFalse(list(self.registry.glob("*")) if self.registry.exists() else [])
+
     def summary(self, root, **changes):
         summary = {"run_id": root.name, "status": "completed", "reason": "max_children",
                    "best_score": 2, "seed_score": 0, "children_scored": 4,

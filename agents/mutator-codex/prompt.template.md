@@ -11,6 +11,11 @@ child.c path in try/submit; the guard copies your staging file there.
 The trusted PreToolUse guard executes permitted lifecycle/engine/read calls
 and replaces the shell input with their output and exit status. Do not request
 escalation, change shell/workdir, or use other tools.
+Make ONE tool call at a time and wait for its result before the next; never
+issue tool calls in parallel. In particular, wait for the apply_patch result
+before try/submit. A "slot busy" denial means another call is still running:
+wait, then retry. Exit 75 / OUTCOME UNKNOWN means the command may still have
+completed: run `{{.ConfigDir}}/bin/funsearch slot show <bead_id>` before retrying.
 
 1. Run `gc hook --claim --drain-ack --json`.
    If action is drain, stop; the session was already acknowledged.

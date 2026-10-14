@@ -168,6 +168,10 @@ def start_locked(root):
         return
     fs.update(city=str(city), rig=rig, notify=notify)
     cfg = metadata["config"]
+    # Refuse an unknown provider before any bead or registry entry exists.
+    provider = cfg["mutator"].get("provider", "claude")
+    if provider not in ("claude", "codex"):
+        raise ValueError("unknown mutator provider")
     # Informational only: liveness is the run directory's engine lock.
     pid = int((root / "engine.pid").read_text())
     registry = registry_path(city, metadata["run_id"])
@@ -185,9 +189,6 @@ def start_locked(root):
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
              "run_bead": fs["run_bead"], "rig": rig, "notify": notify}
     write_json(registry, entry)
-    provider = cfg["mutator"].get("provider", "claude")
-    if provider not in ("claude", "codex"):
-        raise ValueError("unknown mutator provider")
     cap = mutator_pool_cap(provider)
     if cap is not None and cfg["search"]["mutators"] > cap:
         # Slots beyond the pool cap wait for a free session; the cap is also

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -18,6 +19,9 @@ class CodexProviderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "wd"
+        locks = patch.dict(os.environ, FS_CODEX_LOCK_DIR=str(Path(self.tmp.name) / "locks"))
+        locks.start()
+        self.addCleanup(locks.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

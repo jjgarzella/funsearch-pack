@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,9 +19,15 @@ PACK = base_guard.PACK
 class CodexGuardTests(unittest.TestCase):
     def setUp(self):
         base_guard.MutatorGuardTests.setUp(self)
-        policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK="")
+        locks = tempfile.TemporaryDirectory(prefix="codex locks ")
+        self.addCleanup(locks.cleanup)
+        policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK="",
+                            FS_CODEX_LOCK_DIR=str(Path(locks.name) / "locks"))
         policy.start()
         self.addCleanup(policy.stop)
+
+    def receipts(self):
+        return list(self.home.glob(".funsearch-output-*"))
 
     def event(self, command):
         return {"tool_name": "Bash", "tool_input": {"command": command}}
@@ -37,28 +44,29 @@ class CodexGuardTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=5)
         self.assertEqual(reply.stdout, task.read_text())
         self.assertEqual(reply.returncode, 0)
-        for code in (0, 3, 4):
-            with patch("scripts.codex_mutator_guard.subprocess.run") as run:
-                run.return_value = subprocess.CompletedProcess([], code, "RUN_OVER\n")
+        self.assertEqual(self.receipts(), [])
+        for code in (0, 3, 4, 75):
+            with patch("scripts.codex_mutator_guard.run_command") as run:
+                run.return_value = (code, "RUN_OVER\n")
                 result = handle(self.event("gc hook --claim --drain-ack --json"), self.home, PACK)
                 run.assert_called_once()
-                self.assertFalse(run.call_args.kwargs.get("shell", False))
                 self.assertEqual(run.call_args.args[0], ["gc", "hook", "--claim", "--drain-ack", "--json"])
             reply = subprocess.run(result["hookSpecificOutput"]["updatedInput"]["command"], shell=True,
                                    capture_output=True, text=True, timeout=5)
             self.assertEqual(reply.returncode, code)
             self.assertEqual(reply.stdout, "RUN_OVER\n")
+            self.assertEqual(self.receipts(), [])
 
     def test_codex_stages_only_current_child_before_try(self):
         (self.home / "child.c").write_text("// IDEA: change\nint f(void) { return 2; }\n")
         argv = [str(PACK / "bin/funsearch"), "try", str(self.run), str(self.task.id),
                 str(self.directory / "child.c")]
-        with patch("scripts.codex_mutator_guard.subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "RESULT OK 2\n")
+        with patch("scripts.codex_mutator_guard.run_command") as run:
+            run.return_value = (0, "RESULT OK 2\n")
             handle(self.event(shlex.join(argv)), self.home, PACK)
         self.assertEqual((self.directory / "child.c").read_bytes(), (self.home / "child.c").read_bytes())
         argv[3] = str(self.other.id)
-        with patch("scripts.codex_mutator_guard.subprocess.run") as run, self.assertRaises(ValueError):
+        with patch("scripts.codex_mutator_guard.run_command") as run, self.assertRaises(ValueError):
             handle(self.event(shlex.join(argv)), self.home, PACK)
         run.assert_not_called()
 
@@ -66,6 +74,8 @@ class CodexGuardTests(unittest.TestCase):
         event = {"tool_name": "apply_patch", "tool_input": {"command":
                  "*** Begin Patch\n*** Add File: child.c\n+int f(void) { return 2; }\n*** End Patch"}}
         self.assertEqual(authorize_codex(event, self.home, PACK), ("patch", None))
+        # Permitted patches return no decision (see docs: inferred 0.160 contract).
+        self.assertEqual(handle(event, self.home, PACK), {})
         for header in ("*** Add File: ../secret", "*** Update File: .funsearch-slot.json",
                        "*** Delete File: child.c", "*** Update File: child.c\n*** Move to: secret",
                        "*** Add File: child.c\n+x\n*** Add File: secret"):
@@ -102,20 +112,29 @@ class CodexGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_guard_caught_process_errors_and_timeouts_return_deny_in_both_modes(self):
+    def test_guard_caught_process_errors_return_deny_and_timeouts_report_unknown(self):
+        from scripts.codex_mutator_guard import BrokerTimeout
         for mode in ("workspace-write", "container"):
-            for error in (OSError("cannot execute broker"), subprocess.TimeoutExpired("broker", 300)):
+            for error in (OSError("cannot execute broker"), BrokerTimeout("gc exceeded 280 s")):
                 output = io.StringIO()
                 with self.subTest(mode=mode, error=error), \
                         patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK), \
                         patch("sys.argv", ["guard", str(self.home), str(PACK)]), \
                         patch("sys.stdin", io.StringIO(json.dumps(self.event("gc hook --claim --drain-ack --json")))), \
                         patch("sys.stdout", output), \
-                        patch("scripts.codex_mutator_guard.subprocess.run", side_effect=error):
+                        patch("scripts.codex_mutator_guard.run_command", side_effect=error):
                     main()
                 result = json.loads(output.getvalue())["hookSpecificOutput"]
-                self.assertEqual(result["permissionDecision"], "deny")
-                self.assertNotIn("updatedInput", result)
+                if isinstance(error, OSError):
+                    self.assertEqual(result["permissionDecision"], "deny")
+                    self.assertNotIn("updatedInput", result)
+                    continue
+                # The command started, so its outcome is unknown rather than denied.
+                reply = subprocess.run(result["updatedInput"]["command"], shell=True,
+                                       capture_output=True, text=True, timeout=5)
+                self.assertEqual(reply.returncode, 75)
+                self.assertIn("OUTCOME UNKNOWN", reply.stdout)
+                self.assertIn(f"{PACK / 'bin/funsearch'} slot show fs-slot.1", reply.stdout)
 
     def test_launch_requires_explicit_policy_acknowledgment(self):
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "sign-off"):
@@ -212,10 +231,14 @@ class CodexGuardTests(unittest.TestCase):
     def check_launcher(self, mode, sandbox):
         from scripts.codex_mutator_launch import DISABLED
         import tomllib
-        policy = patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK)
+        policy = patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK,
+                            OPENAI_API_KEY="sk-test-key", OPENAI_BASE_URL="https://elsewhere.invalid",
+                            CODEX_ACCESS_TOKEN="shared-token")
         policy.start()
         self.addCleanup(policy.stop)
         setup(self.home, PACK)
+        stale = self.home / ".funsearch-codex-home/auth.json"
+        stale.write_text("{}")
         config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
         hooks = json.loads((self.home / ".funsearch-codex-home/hooks.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(len(hooks), 1)
@@ -238,6 +261,12 @@ class CodexGuardTests(unittest.TestCase):
             self.assertIn("--no-daemon", argv)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
             self.assertEqual(env["CODEX_HOME"], str(self.home / ".funsearch-codex-home"))
+            # API key from the environment only; no shared login or endpoint.
+            self.assertEqual(env["CODEX_API_KEY"], "sk-test-key")
+            self.assertFalse([name for name in env if name.startswith("OPENAI_")])
+            self.assertNotIn("CODEX_ACCESS_TOKEN", env)
+            self.assertFalse(stale.exists())
+            self.assertEqual(config["forced_login_method"], "api")
             execute.reset_mock()
             gc.side_effect = [json.dumps({"action": "drain"})]
             self.assertEqual(launch(self.home, PACK), 0)
@@ -252,8 +281,8 @@ class CodexGuardTests(unittest.TestCase):
         source.write_text("old task")
         self.db.close_task(self.task.id)
         event = self.event(shlex.join([str(PACK / "bin/funsearch"), "next-task", str(self.run), "--slot", "1"]))
-        with patch("scripts.codex_mutator_guard.subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "TASK 3 path\n")
+        with patch("scripts.codex_mutator_guard.run_command") as run:
+            run.return_value = (0, "TASK 3 path\n")
             handle(event, self.home, PACK)
         self.assertFalse(source.exists())
         new = self.db.add_task(0, [], slot="1")
@@ -261,8 +290,8 @@ class CodexGuardTests(unittest.TestCase):
         directory.mkdir()
         (directory / "child.c").write_text("pending candidate")
         event = self.event(shlex.join([str(PACK / "bin/funsearch"), "slot", "show", "fs-slot.1"]))
-        with patch("scripts.codex_mutator_guard.subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "{}\n")
+        with patch("scripts.codex_mutator_guard.run_command") as run:
+            run.return_value = (0, "{}\n")
             handle(event, self.home, PACK)
         self.assertEqual(source.read_text(), "pending candidate")
 
@@ -295,3 +324,129 @@ class CodexGuardTests(unittest.TestCase):
         (self.home / "child.c").symlink_to(self.home / "secret")
         with self.assertRaisesRegex(ValueError, "symlink"):
             authorize_codex(event, self.home, PACK)
+
+    def patch_event(self, *lines):
+        return {"tool_name": "apply_patch", "tool_input": {"command": "\n".join(
+            ["*** Begin Patch", *lines, "*** End Patch"])}}
+
+    def test_patch_grammar_is_strict(self):
+        child = self.home / "child.c"
+        valid = [("*** Add File: child.c", "+// IDEA: x", "+int f(void) { return 2; }"),
+                 (f"*** Add File: {child}", "+x"),
+                 ("*** Update File: child.c", "@@", " int f(void) {", "-  return 1;", "+  return 2;", " }"),
+                 (f"*** Update File: {child}", "@@ int f(void)", "-a", "+b", "*** End of File"),
+                 ("*** Add File: child.c", "+*** not a header once prefixed")]
+        for lines in valid:
+            with self.subTest(lines=lines):
+                self.assertEqual(authorize_codex(self.patch_event(*lines), self.home, PACK), ("patch", None))
+        crlf = self.patch_event("*** Add File: child.c", "+x")
+        crlf["tool_input"]["command"] = crlf["tool_input"]["command"].replace("\n", "\r\n")
+        self.assertEqual(authorize_codex(crlf, self.home, PACK), ("patch", None))
+        invalid = [("*** Add File: child.c", "+x", "  *** Add File: secret", "+y"),
+                   ("***  Add File: child.c", "+x"), ("*** add file: child.c", "+x"),
+                   ("*** Update File: child.c", "*** Move to: secret", "@@", "+x"),
+                   ("*** Delete File: child.c",), ("*** Add File: child.c", "+x", "*** Add File: secret", "+y"),
+                   ("*** Add File: child.c",), ("*** Update File: child.c",),
+                   ("*** Update File: child.c", "*** End of File"),
+                   ("*** Add File: child.c", "x"), ("*** Add File: child.c", "+x", "*** End of File"),
+                   ("*** Update File: child.c", "@@", "bare context"), ("*** Update File: child.c", "@@", ""),
+                   ("*** Update File: child.c", "@@", "+x", "*** end patch", "+y"),
+                   ("*** Update File: child.c", "@@", "+x", "*** End of File", "+y"),
+                   ("*** Add File: child.c ", "+x"), ()]
+        for lines in invalid:
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                authorize_codex(self.patch_event(*lines), self.home, PACK)
+        for command in (None, "", "*** Begin Patch", "*** Begin Patch\n*** Add File: child.c\n+x\n*** End Patch\n\n"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                authorize_codex({"tool_name": "apply_patch", "tool_input": {"command": command}}, self.home, PACK)
+
+    def test_broker_drops_credentials_replaces_bad_bytes_and_kills_overrun_group(self):
+        from scripts.codex_mutator_guard import BrokerTimeout, run_command
+        secrets = {"OPENAI_API_KEY": "sk-secret", "OPENAI_BASE_URL": "https://x.invalid",
+                   "CODEX_API_KEY": "sk-secret", "CODEX_ACCESS_TOKEN": "token"}
+        with patch.dict(os.environ, secrets):
+            code, output = run_command(["sh", "-c", "env; printf '\\377'; exit 3"], self.home)
+        self.assertEqual(code, 3)
+        self.assertNotIn("sk-secret", output)
+        self.assertNotIn("x.invalid", output)
+        self.assertNotIn("CODEX_ACCESS_TOKEN", output)
+        self.assertIn("GC_SESSION_ID=session-1", output)
+        self.assertTrue(output.endswith("\ufffd"))
+        marker = self.home / "background.pid"
+        with self.assertRaisesRegex(BrokerTimeout, "exceeded 0.5 s"):
+            run_command(["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(marker))}; wait"],
+                        self.home, timeout=0.5)
+        status = Path(f"/proc/{int(marker.read_text())}/stat")
+        for _ in range(100):
+            if not status.exists() or status.read_text().split(") ")[1].startswith("Z"):
+                break
+            import time
+            time.sleep(0.02)
+        else:
+            self.fail("the overrunning process group was not killed")
+
+    def test_concurrent_next_task_allocates_once(self):
+        import threading
+        import time
+        from engine.funsearch.db import Database
+        self.db.close_task(self.task.id)
+        calls, errors = [], []
+
+        def allocate(argv, home):
+            calls.append(argv)
+            time.sleep(0.3)
+            with Database(self.run / "db.sqlite") as db:
+                db.add_task(0, [], slot="1")
+            return 0, "TASK\n"
+
+        event = self.event(shlex.join([str(PACK / "bin/funsearch"), "next-task", str(self.run), "--slot", "1"]))
+
+        def call():
+            try:
+                handle(event, self.home, PACK)
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        with patch("scripts.codex_mutator_guard.run_command", side_effect=allocate):
+            threads = [threading.Thread(target=call) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(errors[0], "finish the current task|slot busy")
+
+    def test_busy_slot_lock_times_out(self):
+        import fcntl
+        from scripts.codex_mutator_guard import slot_lock
+        from scripts.codex_mutator_setup import open_lock
+        holder = open_lock(self.home)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with self.assertRaisesRegex(ValueError, "slot busy"):
+            with slot_lock(self.home, wait=0.2):
+                pass
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        with slot_lock(self.home, wait=0.2):
+            pass
+
+    def test_setup_requires_private_coherent_lock_directory_and_clears_receipts(self):
+        from scripts.codex_mutator_setup import lock_directory
+        receipt = self.home / ".funsearch-output-old"
+        receipt.write_text("stale")
+        setup(self.home, PACK)
+        self.assertFalse(receipt.exists())
+        directory = lock_directory(os.environ)
+        directory.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "0700"):
+            setup(self.home, PACK)
+        directory.chmod(0o700)
+        link = directory.parent / "link"
+        link.symlink_to(directory)
+        with patch.dict(os.environ, FS_CODEX_LOCK_DIR=str(link)), self.assertRaisesRegex(ValueError, "0700"):
+            setup(self.home, PACK)
+        # A filesystem that accepts but ignores flock lets the probe child lock too.
+        with patch("scripts.codex_mutator_setup.fcntl.flock"), \
+                self.assertRaisesRegex(ValueError, "does not enforce flock"):
+            setup(self.home, PACK)
