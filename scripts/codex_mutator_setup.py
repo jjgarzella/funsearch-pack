@@ -109,7 +109,7 @@ def setup(work_dir, pack_dir):
     # Keep the user config separate from project config and all shared homes.
     # The wrapper also checks effective config before making a model request.
     settings = '''model = "gpt-6-luna"
-forced_login_method = "api"
+forced_login_method = "chatgpt"
 approval_policy = "never"
 sandbox_mode = SANDBOX
 web_search = "disabled"

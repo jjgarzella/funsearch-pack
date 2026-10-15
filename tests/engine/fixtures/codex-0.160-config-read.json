@@ -72,7 +72,7 @@
     "feedback": null,
     "file_opener": "vscode",
     "forced_chatgpt_workspace_id": null,
-    "forced_login_method": null,
+    "forced_login_method": "chatgpt",
     "ghost_snapshot": null,
     "goals": null,
     "hide_agent_reasoning": false,

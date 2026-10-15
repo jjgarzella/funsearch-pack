@@ -20,10 +20,14 @@ PACK = base_guard.PACK
 class CodexGuardTests(unittest.TestCase):
     def setUp(self):
         base_guard.MutatorGuardTests.setUp(self)
-        locks = tempfile.TemporaryDirectory(prefix="codex locks ")
+        locks = tempfile.TemporaryDirectory(prefix="codex locks ", dir="/var/tmp")
         self.addCleanup(locks.cleanup)
+        shared = Path(locks.name) / "shared-codex"
+        shared.mkdir()
+        self.shared_auth = shared / "auth.json"
+        self.shared_auth.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "fake-token"}}))
         policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK="",
-                            FS_CODEX_LOCK_DIR=str(Path(locks.name) / "locks"))
+                            FS_CODEX_LOCK_DIR=str(Path(locks.name) / "locks"), CODEX_HOME=str(shared))
         policy.start()
         self.addCleanup(policy.stop)
 
@@ -244,7 +248,7 @@ class CodexGuardTests(unittest.TestCase):
         import tomllib
         policy = patch.dict(os.environ, FS_CODEX_SANDBOX=mode, FS_CODEX_POLICY_ACK=ACK,
                             OPENAI_API_KEY="sk-test-key", OPENAI_BASE_URL="https://elsewhere.invalid",
-                            CODEX_ACCESS_TOKEN="shared-token")
+                            CODEX_API_KEY="stale-key", CODEX_ACCESS_TOKEN="shared-token")
         policy.start()
         self.addCleanup(policy.stop)
         setup(self.home, PACK)
@@ -256,7 +260,7 @@ class CodexGuardTests(unittest.TestCase):
         self.assertEqual(hooks[0]["matcher"], "*")
         self.assertIn("scripts/codex_mutator_guard.py", hooks[0]["hooks"][0]["command"])
         with patch.dict(os.environ, FS_CODEX_POLICY_ACK=ACK), \
-                patch("scripts.codex_mutator_launch.read_effective", return_value=config), \
+                patch("scripts.codex_mutator_launch.read_effective", return_value=config) as effective, \
                 patch("scripts.codex_mutator_launch.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.160.0\n")), \
                 patch("scripts.gc_lifecycle.gc") as gc, \
                 patch("scripts.codex_mutator_launch.os.execvpe") as execute, \
@@ -272,12 +276,11 @@ class CodexGuardTests(unittest.TestCase):
             self.assertIn("--no-daemon", argv)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
             self.assertEqual(env["CODEX_HOME"], str(self.home / ".funsearch-codex-home"))
-            # API key from the environment only; no shared login or endpoint.
-            self.assertEqual(env["CODEX_API_KEY"], "sk-test-key")
-            self.assertFalse([name for name in env if name.startswith("OPENAI_")])
-            self.assertNotIn("CODEX_ACCESS_TOKEN", env)
-            self.assertFalse(stale.exists())
-            self.assertEqual(config["forced_login_method"], "api")
+            self.assertEqual({name for name in env if name.startswith(("OPENAI_", "CODEX_"))}, {"CODEX_HOME"})
+            self.assertEqual(effective.call_args.args[1], env)
+            self.assertTrue(stale.is_symlink())
+            self.assertEqual(stale.readlink(), self.shared_auth.resolve())
+            self.assertEqual(config["forced_login_method"], "chatgpt")
             execute.reset_mock()
             gc.side_effect = [json.dumps({"action": "drain"})]
             self.assertEqual(launch(self.home, PACK), 0)
@@ -316,7 +319,11 @@ class CodexGuardTests(unittest.TestCase):
         (self.home / ".codex/hooks.json").write_text('{"hooks":{"PreToolUse":[]}}')
         install_launcher(self.home, PACK)
         workspace = self.home / "slot"
-        env = dict(os.environ, CODEX_HOME=str(workspace / ".funsearch-codex-home"))
+        private = workspace / ".funsearch-codex-home"
+        (private / "auth.json").symlink_to(self.shared_auth.resolve())
+        env = {name: value for name, value in os.environ.items()
+               if not name.startswith(("OPENAI_", "CODEX_"))}
+        env["CODEX_HOME"] = str(private)
         from scripts.codex_mutator_launch import check_layers
         with patch("scripts.codex_mutator_launch.check_layers", wraps=check_layers) as checked:
             validate_effective(read_effective(workspace, env), workspace)

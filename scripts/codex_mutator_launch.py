@@ -59,10 +59,10 @@ def validate_effective(config, home):
     policy = config.get("shell_environment_policy", {})
     if policy.get("inherit") != "none" or policy.get("set") != {"PATH": "/usr/bin:/bin"}:
         raise ValueError("Codex shell environment must be private")
-    if config.get("forced_login_method") != "api":
-        raise ValueError("Codex must use API-key login")
+    if config.get("forced_login_method") != "chatgpt":
+        raise ValueError("Codex must use ChatGPT login")
     # Hook JSON does not appear here; inline hooks, notifiers, telemetry and
-    # provider/endpoint overrides could run code or redirect the API key.
+    # provider/endpoint overrides could run code or redirect credentials.
     if (any(config.get(key) is not None for key in
             ("hooks", "notify", "model_provider", "openai_base_url", "otel", "profile"))
             or config.get("model_providers")):
@@ -159,15 +159,29 @@ def release_after_refusal(bead, error):
     raise ValueError(f"refused after claiming {bead}: {error}; slot released") from error
 
 
+def shared_auth_file():
+    """Validate the shared login without exposing credentials in errors."""
+    try:
+        path = (Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json").resolve()
+        if not path.is_file():
+            raise ValueError("not a regular file")
+        auth = json.loads(path.read_text())
+        if (not isinstance(auth, dict) or auth.get("auth_mode") != "chatgpt"
+                or not isinstance(auth.get("tokens"), dict) or not auth["tokens"]):
+            raise ValueError("not a ChatGPT login")
+    except (OSError, ValueError, RuntimeError):
+        raise ValueError("Codex mutators require a shared ChatGPT login; "
+                         "run codex login with the shared account") from None
+    return path
+
+
 def launch(home, pack):
     if os.environ.get("FS_CODEX_POLICY_ACK") != ACK:
         raise ValueError("Codex mutators require overseer sign-off on docs/codex-mutator.md; "
                          f"then set FS_CODEX_POLICY_ACK={ACK} in the agent environment")
     sandbox = selected_sandbox(os.environ)
-    # Gas City forwards OPENAI_* (not CODEX_*) from ~/.gc/secrets.env.
-    key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY") or "").strip()
-    if not key:
-        raise ValueError("Codex mutators need an API key: set OPENAI_API_KEY in ~/.gc/secrets.env")
+    # Resolve the shared login before replacing CODEX_HOME with our private home.
+    auth = shared_auth_file()
     version = subprocess.run(["codex", "--version"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip()
     if version != TESTED_CODEX_VERSION:
@@ -178,8 +192,9 @@ def launch(home, pack):
         raise ValueError("Codex slot workspace must not contain project config, hooks or skills")
     setup(home, pack)
     private = home / ".funsearch-codex-home"
-    # Never use a shared Codex login: the key comes only from the environment.
+    # Share refreshes with the existing login; a copied cache can diverge.
     (private / "auth.json").unlink(missing_ok=True)
+    (private / "auth.json").symlink_to(auth)
     # Drop OPENAI_BASE_URL and every other inherited OPENAI_*/CODEX_* setting.
     env = {name: value for name, value in os.environ.items()
            if not name.startswith(("OPENAI_", "CODEX_"))}
@@ -187,7 +202,6 @@ def launch(home, pack):
     validate_effective(read_effective(home, env), home)
     if (private / "hooks.json").read_text() != hooks_document(home, pack):
         raise ValueError("private Codex hooks.json changed after setup")
-    env["CODEX_API_KEY"] = key
     # slot helpers write their context/retirement files in the working directory.
     os.chdir(home)
     # Claim via the required protocol and read opt_model from that exact bead.

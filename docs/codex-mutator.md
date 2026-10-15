@@ -26,34 +26,52 @@ If a check fails after the claim, the launcher returns the slot with
 `funsearch slot release` from the slot workspace; if that release itself fails,
 the error names both failures and says the slot is still claimed.
 
-### Authentication: API key from the environment
+### Authentication: shared ChatGPT login
 
-The overseer decided (2026-10-14) that Codex mutators authenticate only with an
-API key from the environment; no `auth.json` or shared ChatGPT login is copied.
-Gas City forwards every `OPENAI_*` variable from the supervisor environment to
-agents, and its supported persistent source is `~/.gc/secrets.env` (dotenv,
-mode 600). Put a **dedicated, spend-limited** OpenAI project key there:
+The overseer decided (2026-10-15 14:32Z, `mc-kfbz1`) to use the city's existing
+shared Codex ChatGPT login, reversing the earlier API-key decision. Plan quota
+and rate limits are shared with the city's Codex agents; there are no per-token
+charges for these plan-backed sessions.
 
-```sh
-OPENAI_API_KEY=...
-```
+Before overriding `CODEX_HOME`, the launcher resolves `auth.json` beneath the
+inherited `CODEX_HOME`, or `~/.codex` when that variable is unset or empty. Before
+claiming a slot, it requires a regular file containing JSON with
+`auth_mode = "chatgpt"` and a non-empty `tokens` object. Otherwise it refuses
+and tells the operator to run `codex login` with the shared account. It never
+prints token values.
 
-`CODEX_API_KEY` is not forwarded by Gas City. The launcher refuses before
-claiming a slot when neither is set. It removes any stale private `auth.json`,
-drops every inherited `OPENAI_*`/`CODEX_*` variable (so `OPENAI_BASE_URL`
-cannot redirect the key), and passes the key to Codex only as `CODEX_API_KEY`
-with `forced_login_method = "api"`. The configuration preflight runs without
-the key. The hook command starts the guard through `env -u CODEX_API_KEY -u
-CODEX_ACCESS_TOKEN -u OPENAI_API_KEY` (Codex may run hooks via a login shell,
-whose profile output would also corrupt the hook's JSON reply), and brokered engine/lifecycle commands also run without
-`OPENAI_*`, so the guard (alive while try/submit compile and run candidate C)
-does not hold the key. **This does not make the key private:** the Codex
-process itself holds it, and same-user code can normally read
-`/proc/<codex pid>/environ`. That includes candidate C in the host evaluator
-and, in either mode, a model shell whose hook was skipped (workspace-write
-does not restrict reads). See gap 2. Never put credentials in the problem or
-prompt, and never print the key. Private receipts/config remain sensitive host files and should follow the
-city's work-directory retention policy.
+The private `<slot>/.funsearch-codex-home/auth.json` is a **symlink** to that
+resolved shared file, replacing any stale private file or symlink. It is never
+copied: a copy can diverge during token refresh and could sign out the main
+login. The private home still supplies all configuration and hooks; shared
+configuration, MCP servers, plugins and skills remain excluded. Setup and
+preflight require `forced_login_method = "chatgpt"`. The launcher drops every
+inherited `OPENAI_*` and `CODEX_*` variable, then sets only the private
+`CODEX_HOME`; the Codex process environment no longer holds an API key.
+The hook's `env -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY` and
+broker credential stripping remain in place.
+
+`~/.codex/auth.json` is already readable by any same-user code, including
+candidate C under either mutator, so this adds no new credential exposure.
+Never put credentials in the problem or prompt, and never print them. Private
+receipts/config remain sensitive host files and should follow the city's
+work-directory retention policy.
+
+**Refresh and symlink behavior remain unverified.** Static inspection of the
+0.160 binary strings found `login/src/auth/storage.rs`, file/keyring storage
+messages, and the `allow_symlinked_codex_home` configuration key. No
+`auth.json`-specific symlink refusal or refresh replacement was found. Strings
+do not establish whether refresh writes through the symlink in place or
+replaces it (for example, with a temporary file and rename), nor the exact
+scope of the home-symlink setting. The private home itself remains a real
+directory; only `auth.json` is linked. Confidence is high that the listed
+strings exist, but low on refresh semantics or absence of refusal from this
+evidence alone. The separate smoke test must check that the private auth file
+remains linked and that the shared login still works after a mutator session;
+unit/config tests do not establish this. There is no copy-based fallback.
+See [official credential storage documentation](https://learn.chatgpt.com/docs/auth)
+for the storage modes and automatic refresh; it does not specify symlink write
+semantics.
 
 ## Containment and task policy
 
@@ -63,7 +81,7 @@ approval `never`, no additional writable roots, and both implicit `/tmp` and
 installed CLI's effective settings before any model request or slot claim.
 It refuses inherited MCP/plugin configuration, permission-profile overrides,
 and changes to the required capability/sandbox settings. The effective config
-must also have API-key login and no inline hooks, `notify`, telemetry (`otel`),
+must also have ChatGPT login and no inline hooks, `notify`, telemetry (`otel`),
 profile, model provider or `openai_base_url` override. The layer list must
 contain only known 0.160 layer types, exactly one user layer (the private
 `config.toml`, no profile), no project layer, and only empty non-user layers.
@@ -216,13 +234,13 @@ of the following for trusted local experiments:
    so a skipped hook can permit arbitrary commands and edits as the container
    user. Hosted tools are not all covered by PreToolUse, so their
    supported switches are disabled; the hook is not a complete enforcement
-   boundary for arbitrary future Codex tools or CLI versions. The API key is in
-   the Codex process environment. Unless Codex marks itself non-dumpable
-   (unverified; the smoke test checks it), any same-user process can read
-   `/proc/<codex pid>/environ`: candidate C running in the evaluator, and in
-   either mode a model shell whose hook was skipped. This is the same exposure
-   as the previously copied `auth.json`. Use a dedicated, spend-capped key and
-   revoke it if it may have leaked.
+   boundary for arbitrary future Codex tools or CLI versions. The shared ChatGPT
+   login cache is readable by same-user code, including candidate C under
+   either mutator and a model shell whose hook was skipped. Linking that
+   already-readable cache adds no new exposure; the Codex process environment
+   no longer holds an API key. Task policy does not protect the shared login
+   from same-user code. Refresh through the symlink and continued shared-login
+   usability require the smoke check described above.
 3. The trusted hook performs only allowlisted engine/control operations outside
    the shell sandbox. Candidate C still compiles and runs in the existing host
    evaluator workers. It has the host user's filesystem/network access and can

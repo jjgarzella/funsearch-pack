@@ -17,23 +17,28 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures/codex-0.160-config-read.js
 
 class CodexLaunchTests(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(prefix="codex launch ")
+        temp = tempfile.TemporaryDirectory(prefix="codex launch ", dir="/var/tmp")
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
         self.home = self.root / "slot"
         self.etc = self.root / "etc-codex"
         self.etc.mkdir()
+        self.shared = self.root / "shared-codex"
+        self.shared.mkdir()
+        self.auth = self.shared / "auth.json"
+        self.auth.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "fake-token"}}))
         policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK=ACK,
                             FS_CODEX_LOCK_DIR=str(self.root / "locks"), GC_SESSION_ID="session-1",
-                            OPENAI_API_KEY="sk-test-key")
+                            CODEX_HOME=str(self.shared))
         policy.start()
         self.addCleanup(policy.stop)
         os.environ.pop("CODEX_API_KEY", None)
+        os.environ.pop("OPENAI_API_KEY", None)
         setup(self.home, PACK)
         self.config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
 
     def layers(self):
-        # A real 0.160 config/read response for a pack-generated private home.
+        # A 0.160 config/read response adapted to require ChatGPT login.
         text = FIXTURE.read_text().replace("@HOME@", str(self.home))
         text = text.replace('"/etc/codex/config.toml"', json.dumps(str(self.etc / "config.toml")))
         return json.loads(text)["response"]["result"]
@@ -68,15 +73,14 @@ class CodexLaunchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hooks"):
             check_layers(dict(result, layers=[user, layer]), self.home)
 
-    def test_fixture_effective_config_passes_with_api_login(self):
+    def test_fixture_effective_config_passes_with_chatgpt_login(self):
         config = self.layers()["config"]
-        with self.assertRaisesRegex(ValueError, "API-key"):
-            validate_effective(config, self.home)
-        validate_effective(dict(config, forced_login_method="api"), self.home)
+        self.assertEqual(config["forced_login_method"], "chatgpt")
+        validate_effective(config, self.home)
 
     def test_effective_config_refuses_code_running_and_redirecting_settings(self):
         validate_effective(self.config, self.home)
-        for key, value in (("forced_login_method", "chatgpt"), ("forced_login_method", None),
+        for key, value in (("forced_login_method", "api"), ("forced_login_method", None),
                            ("hooks", {"PreToolUse": []}), ("notify", ["sh"]), ("model_provider", "proxy"),
                            ("model_providers", {"proxy": {}}), ("openai_base_url", "https://x.invalid"),
                            ("otel", {"exporter": "otlp"}), ("profile", "other")):
@@ -85,19 +89,66 @@ class CodexLaunchTests(unittest.TestCase):
         # config/read reports these explicitly as null/empty when unset.
         validate_effective(dict(self.config, hooks=None, notify=None, model_provider=None,
                                 model_providers={}, openai_base_url=None, otel=None, profile=None), self.home)
+        missing = dict(self.config)
+        del missing["forced_login_method"]
+        with self.assertRaisesRegex(ValueError, "ChatGPT"):
+            validate_effective(missing, self.home)
 
-    def test_launch_requires_api_key_before_claiming(self):
-        for value in (None, "", "  "):
-            env = {"OPENAI_API_KEY": value} if value is not None else {}
-            with self.subTest(value=value), patch.dict(os.environ, env), \
+    def test_launch_requires_shared_chatgpt_auth_before_claiming(self):
+        for label, value in (("missing", None), ("malformed", "{fake-secret"),
+                             ("api", '{"auth_mode":"api","tokens":{"access_token":"fake-secret"}}'),
+                             ("empty tokens", '{"auth_mode":"chatgpt","tokens":{}}'),
+                             ("wrong tokens type", '{"auth_mode":"chatgpt","tokens":["fake-secret"]}'),
+                             ("not an object", "[]"), ("no tokens", '{"auth_mode":"chatgpt"}')):
+            self.auth.unlink(missing_ok=True)
+            if value is not None:
+                self.auth.write_text(value)
+            with self.subTest(label=label), \
                     patch("scripts.gc_lifecycle.gc") as gc, \
                     patch("scripts.codex_mutator_launch.subprocess.run") as run, \
-                    self.assertRaisesRegex(ValueError, "secrets.env"):
-                if value is None:
-                    os.environ.pop("OPENAI_API_KEY")
+                    self.assertRaisesRegex(ValueError, "run codex login with the shared account") as caught:
                 launch(self.home, PACK)
+            self.assertNotIn("fake-secret", str(caught.exception))
             gc.assert_not_called()
             run.assert_not_called()
+        self.auth.unlink()
+        self.auth.mkdir()
+        with patch("scripts.gc_lifecycle.gc") as gc, self.assertRaisesRegex(ValueError, "codex login"):
+            launch(self.home, PACK)
+        gc.assert_not_called()
+
+    def test_launch_without_api_key_symlinks_resolved_shared_login(self):
+        alias = self.root / "shared-alias"
+        alias.symlink_to(self.shared, target_is_directory=True)
+        private_auth = self.home / ".funsearch-codex-home/auth.json"
+        for stale in ("absent", "file", "symlink"):
+            private_auth.unlink(missing_ok=True)
+            if stale == "file":
+                private_auth.write_text("stale")
+            elif stale == "symlink":
+                private_auth.symlink_to(self.root / "missing-auth")
+            with self.subTest(stale=stale), patch.dict(os.environ, CODEX_HOME=str(alias)):
+                self.launch_with(json.dumps({"action": "work", "bead_id": "fs-slot.1"}),
+                                 self.slot(**{"fs.provider": "codex"}))
+            self.execute.assert_called_once()
+            self.assertTrue(private_auth.is_symlink())
+            self.assertEqual(private_auth.readlink(), self.auth.resolve())
+            env = self.execute.call_args.args[2]
+            self.assertEqual({key for key in env if key.startswith(("CODEX_", "OPENAI_"))}, {"CODEX_HOME"})
+            self.assertEqual(env["CODEX_HOME"], str(private_auth.parent))
+
+    def test_shared_login_defaults_to_user_home_when_codex_home_unset_or_empty(self):
+        from scripts.codex_mutator_launch import shared_auth_file
+        user_home = self.root / "user"
+        user_home.mkdir()
+        (user_home / ".codex").symlink_to(self.shared, target_is_directory=True)
+        for value in (None, ""):
+            with self.subTest(value=value), patch.dict(os.environ), patch("pathlib.Path.home", return_value=user_home):
+                if value is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = value
+                self.assertEqual(shared_auth_file(), self.auth.resolve())
 
     def launch_with(self, *responses, effective=None, exec_error=None):
         self.addCleanup(os.chdir, os.getcwd())
