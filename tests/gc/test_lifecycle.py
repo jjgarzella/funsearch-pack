@@ -75,6 +75,32 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         (root / "engine.pid").write_text(str(pid or os.getpid()))
         return root
 
+    def test_codex_slots_route_to_codex_pool_with_model(self):
+        root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["config"]["mutator"] = {"provider": "codex", "model": "gpt-6-luna"}
+        (root / "run.json").write_text(json.dumps(metadata))
+        self.hook("on-start", root)
+        slots = [row for row in self.beads().values() if "funsearch-slot" in row.get("labels", [])]
+        self.assertEqual(len(slots), 3)
+        for row in slots:
+            self.assertEqual(row["metadata"]["opt_model"], "gpt-6-luna")
+            self.assertEqual(row["metadata"]["fs.provider"], "codex")
+        slings = [args for args in self.calls() if args[0] == "sling"]
+        self.assertEqual(len(slings), 3)
+        self.assertTrue(all(args[1] == "example/funsearch.mutator-codex" for args in slings))
+
+    def test_unknown_provider_is_refused_before_any_bead_or_registry(self):
+        root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["config"]["mutator"] = {"provider": "bogus", "model": "m"}
+        (root / "run.json").write_text(json.dumps(metadata))
+        result = self.hook("on-start", root, code=1)
+        self.assertIn("unknown mutator provider", result.stderr)
+        beads = self.shim_state / "beads.json"
+        self.assertFalse(beads.exists() and self.beads())
+        self.assertFalse(list(self.registry.glob("*")) if self.registry.exists() else [])
+
     def summary(self, root, **changes):
         summary = {"run_id": root.name, "status": "completed", "reason": "max_children",
                    "best_score": 2, "seed_score": 0, "children_scored": 4,

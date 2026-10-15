@@ -54,6 +54,7 @@ class Stop:
 
 @dataclass
 class Mutator:
+    provider: str = "claude"
     model: str = "claude-haiku-4-5-20251001"
 
 
@@ -120,6 +121,8 @@ def validate(cfg: Config, problem_dir) -> None:
                 disabled_allowed = key == "stop.plateau_children"
                 if value < 0 or (value == 0 and not disabled_allowed):
                     raise ConfigError(f"{key}: must be {'non-negative' if disabled_allowed else 'positive'}")
+    if cfg.mutator.provider not in ("claude", "codex"):
+        raise ConfigError("mutator.provider: expected claude or codex")
     if not cfg.candidate.exports:
         raise ConfigError("candidate.exports: must contain at least one symbol")
     for key, value in (("candidate.language", cfg.candidate.language),
@@ -150,6 +153,17 @@ def load_config(problem_dir, overrides=(), *, instance=None) -> Config:
                 raise ConfigError(f"unknown configuration key: {section}.{name}")
             _check_type(f"{section}.{name}", value, getattr(target, name))
             setattr(target, name, value)
+    # Select the provider default only when model was omitted, preserving an
+    # explicit model (including an invalid empty value for validation).
+    overrides = tuple(overrides)
+    if ("model" not in data.get("mutator", {})
+            and not any(item.startswith("mutator.model=") for item in overrides)):
+        provider = cfg.mutator.provider
+        for item in overrides:
+            if item.startswith("mutator.provider="):
+                provider = item.partition("=")[2]
+        if provider == "codex":
+            cfg.mutator.model = "gpt-6-luna"
     cfg = apply_overrides(cfg, overrides)
     if instance is not None:
         cfg.problem.instance = instance
