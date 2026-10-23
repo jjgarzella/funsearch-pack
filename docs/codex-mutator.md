@@ -1,4 +1,4 @@
-# Codex mutator (trusted local v1)
+# Codex mutator
 
 Set the following in `problem.toml` to route slots to
 `<rig>/funsearch.mutator-codex`:
@@ -73,68 +73,53 @@ See [official credential storage documentation](https://learn.chatgpt.com/docs/a
 for the storage modes and automatic refresh; it does not specify symlink write
 semantics.
 
-## Containment and task policy
+## Native containment and task policy
 
-The default native shell sandbox is `workspace-write`, with network disabled,
-approval `never`, no additional writable roots, and both implicit `/tmp` and
-`TMPDIR` writes disabled. A configuration-only app-server preflight checks the
-installed CLI's effective settings before any model request or slot claim.
-It refuses inherited MCP/plugin configuration, permission-profile overrides,
-and changes to the required capability/sandbox settings. The effective config
-must also have ChatGPT login and no inline hooks, `notify`, telemetry (`otel`),
-profile, model provider or `openai_base_url` override. The layer list must
-contain only known 0.160 layer types, exactly one user layer (the private
-`config.toml`, no profile), no project layer, and only empty non-user layers.
-Codex loads `hooks.json` beside each layer's `config.toml` and hook JSON is not
-reported by config/read, so a `hooks.json` beside any non-user layer is
-refused, and the private one must still match what setup wrote. Project discovery
-stops at the private slot's marker. The CLI runs with strict configuration
-checking and without its shared daemon. The launcher pins CLI 0.160.0, the version used for the local
-configuration check, so upgrades require policy review; live launch/hook loading must still pass the next bead's
-smoke test before production use. Linux native mode needs bubblewrap and working
-user namespaces. A sandbox failure never automatically selects container mode.
+The launcher pins `codex-cli 0.164.0` and selects Codex's host-native backend:
+macOS Seatbelt or Linux `workspace-write`. On macOS, the private
+`funsearch_native` permission profile extends `:workspace`, denies reads from
+`~/.ssh`, keeps `:tmpdir` and `:slash_tmp` read-only, and disables command
+networking. On Linux, the existing `sandbox_mode = "workspace-write"` policy
+remains in place with network access disabled, no additional writable roots,
+and writes to implicit `/tmp` and `TMPDIR` excluded.
 
-### Explicit container boundary
+The launcher reads the installed CLI's effective configuration before any
+model request or slot claim. It refuses inherited MCP/plugin configuration,
+unexpected permission profiles, and changes to the required capability or
+sandbox settings. The effective config must also have ChatGPT login and no
+inline hooks, `notify`, telemetry (`otel`), profile, model provider or
+`openai_base_url` override. The layer list must contain only known 0.164 layer
+types, exactly one user layer (the private `config.toml`, no profile), no
+project layer, and only empty non-user layers. Codex loads `hooks.json` beside
+each layer's `config.toml` and hook JSON is not reported by config/read, so a
+`hooks.json` beside any non-user layer is refused, and the private one must
+still match what setup wrote. Project discovery stops at the private slot's
+marker. The CLI runs with strict configuration checking and without its shared
+daemon. Before claiming, a harmless `/usr/bin/true` is run through the selected
+Codex sandbox; failure stops the launch.
 
-For a city already running inside an operator-managed Docker container, set
-**both** variables in the Codex agent environment:
+On 0.164, `codex sandbox --help` documents `--permission-profile` and a command
+argument. `codex sandbox macos` is not a backend selector: `macos` is treated
+as the executable name. Codex selects Seatbelt from the host OS. Linux still
+depends on its native sandbox prerequisites, including bubblewrap and working
+user namespaces. The optional `FS_CODEX_SANDBOX` setting accepts only
+`workspace-write`; other values are refused. There is no container or
+no-native-sandbox fallback. A sandbox failure never proceeds to a slot claim.
+
+On the Darwin arm64 host, a 0.164 CLI probe ran a temporary Python script:
 
 ```sh
-FS_CODEX_SANDBOX=container
-FS_CODEX_POLICY_ACK=trusted-local-v1
+codex sandbox -C "$slot" --permission-profile funsearch_native \
+  /usr/bin/python3 "$slot/seatbelt_probe.py"
 ```
 
-The default when `FS_CODEX_SANDBOX` is absent is `workspace-write`; that value
-can also be set explicitly. All other values (including `danger-full-access`,
-empty strings, aliases and whitespace variants) are refused. Container mode
-requires the exact acknowledgment above during setup and effective-config
-preflight, before claiming a slot or requesting a model. The launcher sets
-`sandbox_mode = "danger-full-access"` and passes `-s danger-full-access` with
-approval `never`. Native mode continues to require its existing acknowledgment
-at launch. Configuration cannot opt into full access by itself.
+It exited 0 and printed `INSIDE_WRITE=ALLOWED`,
+`OUTSIDE_WRITE=REFUSED errno=1 Operation not permitted`,
+`SSH_FILE_READ=REFUSED errno=1 Operation not permitted`, and
+`NETWORK=REFUSED errno=1 Operation not permitted`. A separate real `codex exec`
+probe with the same private profile produced the same four policy results.
 
-This implements the overseer's **2026-10-13 decision on `mc-kfbz1.4`, option
-(1)**: the city's Docker container is the containment boundary, with no native
-OS sandbox, for trusted local experiments. Docker's default seccomp policy on
-this host blocks the namespaces bubblewrap needs. The overseer accepted the
-listed gaps and overrode the earlier requirement to fix that host refusal
-before live acceptance. Container mode neither creates a container nor verifies
-Docker isolation; selecting it on a host runs with that host user's access.
-
-**Container mode removes OS-level filesystem and network enforcement by Codex.**
-The task guard remains mandatory with exactly the same task/command scope.
-Web search and the other hosted capabilities remain disabled, and preflight
-still refuses MCP/plugins, permission profiles and capability overrides.
-The generated `sandbox_workspace_write.network_access = false` and restricted
-writable-root settings are retained and checked, but are **inactive** in
-`danger-full-access`. There is no separate network-off enforcement in this
-mode: shell networking depends on the task policy and any external Docker or
-host restrictions. Model API traffic still needs connectivity. A skipped guard
-can allow filesystem and network access throughout the container, including
-mounted host paths accessible to its user. Native sandboxing can be restored
-by removing `FS_CODEX_SANDBOX` or setting it to `workspace-write`.
-
-### Task guard (both modes)
+### Task guard
 
 The generated `PreToolUse` hook matches every local tool. It delegates to
 `scripts/mutator_guard.py` for session ownership, retirement, task selection,
@@ -180,9 +165,8 @@ that reads a private output receipt and returns the original exit status
 (including RUN_OVER=3 and rejection=4) and then deletes the receipt; setup
 removes any receipts left by an interrupted session. This avoids granting broad write roots
 or broad model commands to make the shared engine work. The receipt is
-not another model-accessible file operation. In native mode the same sandbox
-applies to the receipt-reading shell and local candidate patch; in container
-mode these run without a native sandbox.
+not another model-accessible file operation. The selected native sandbox
+applies to the receipt-reading shell and local candidate patch.
 
 ### Per-slot hook lock
 
@@ -201,15 +185,15 @@ task and is denied), concurrent try/submit staging copies and slot-show
 restores. It does **not** cover Codex's own `apply_patch` write, which happens
 after the hook returns: a try/submit issued in parallel with a patch may stage
 an older or partly written `child.c`. The engine records exactly what it
-evaluated, and the effect is limited to that model's own task. CLI 0.160 has no
+evaluated, and the effect is limited to that model's own task. CLI 0.164 has no
 switch found to disable parallel tool calls, so the prompt tells the model to
 make one tool call at a time and wait for the patch result before try/submit.
 
-## Gaps requiring overseer sign-off
+## Known limitations and smoke requirements
 
-This implementation must not be described as equivalent fail-closed OS
-isolation. Before enabling the role, the overseer must explicitly accept all
-of the following for trusted local experiments:
+This implementation combines a host-native OS sandbox with a task/tool policy;
+it does not make Codex hooks a fail-closed OS boundary. The known limitations
+are:
 
 1. Codex native hooks can fail open when the hook process cannot start, times
    out, crashes, or returns malformed output. The Python guard converts caught
@@ -218,49 +202,44 @@ of the following for trusted local experiments:
    automation trust of the pack-authored hook reduce configuration mistakes;
    they do not change that runtime behavior. The wrapper uses
    `--dangerously-bypass-hook-trust` **only** for these vetted automation hooks;
-   it does not select the sandbox mode. Only the explicit acknowledged container
-   mode removes that sandbox. The pinned native hook integration has no supported
-   switch to turn callback failure into a denial. A Python supervisor could catch
-   a child guard's crash, but its own launch failure, SIGKILL or hook timeout
-   would still fail open. Fully fail-closed enforcement therefore requires a
-   Codex runtime change or an independent external boundary; this pack cannot
-   guarantee it with a hook. Caught guard errors still return an explicit deny
-   in both modes; a broker overrun instead returns the exit-75 `OUTCOME
-   UNKNOWN` receipt described above, because the command already started.
-2. Workspace-write limits writes and shell networking, but permits filesystem
-   reads outside the slot. Task-only reads and child-only edits rely on the
-   native tool hook. A skipped hook therefore weakens those task/tool
-   restrictions. Container mode also removes the native write/network limits,
-   so a skipped hook can permit arbitrary commands and edits as the container
-   user. Hosted tools are not all covered by PreToolUse, so their
-   supported switches are disabled; the hook is not a complete enforcement
-   boundary for arbitrary future Codex tools or CLI versions. The shared ChatGPT
-   login cache is readable by same-user code, including candidate C under
-   either mutator and a model shell whose hook was skipped. Linking that
-   already-readable cache adds no new exposure; the Codex process environment
-   no longer holds an API key. Task policy does not protect the shared login
-   from same-user code. Refresh through the symlink and continued shared-login
-   usability require the smoke check described above.
+   it does not select or disable the sandbox. The pinned native hook integration
+   has no supported switch to turn callback failure into a denial. A Python
+   supervisor could catch a child guard's crash, but its own launch failure,
+   SIGKILL or hook timeout would still fail open. Fully fail-closed enforcement
+   therefore requires a Codex runtime change or an independent external
+   boundary; this pack cannot guarantee it with a hook. Caught guard errors
+   still return an explicit deny under either native backend; a broker overrun
+   instead returns the exit-75 `OUTCOME UNKNOWN` receipt described above,
+   because the command already started.
+2. Linux `workspace-write` limits writes and shell networking, but permits
+   filesystem reads outside the slot. On macOS, the Seatbelt profile confines
+   writes to the workspace and explicitly denies `~/.ssh` reads. In both
+   backends, task-only reads and child-only edits rely on the native tool hook;
+   a skipped hook weakens those task/tool restrictions. Hosted tools are not all
+   covered by PreToolUse, so their supported switches are disabled; the hook is
+   not a complete enforcement boundary for arbitrary future Codex tools or CLI
+   versions. The shared ChatGPT login cache is readable by same-user code,
+   including candidate C under either mutator and a model shell whose hook was
+   skipped. Linking that already-readable cache adds no new exposure; the
+   Codex process environment no longer holds an API key. Task policy does not
+   protect the shared login from same-user code. Refresh through the symlink
+   and continued shared-login usability require the smoke check described above.
 3. The trusted hook performs only allowlisted engine/control operations outside
    the shell sandbox. Candidate C still compiles and runs in the existing host
    evaluator workers. It has the host user's filesystem/network access and can
    tamper with guard state or settings. The engine's lint/env/reply hygiene is
-   unchanged; untrusted/adversarial candidates are unsupported. OS isolation is
-   still backlog `mc-v8f3.5`.
-4. Native CLI/model behavior and actual hook loading have not been validated by
-   a live model in this implementation bead. The separate resource-window smoke
-   test must verify claim, read, local patch, try/submit, retirement and drain,
-   plus deliberate denied calls and no inherited tools. Do not infer live
-   acceptance from unit tests or a config preflight.
+   unchanged; untrusted/adversarial candidates are unsupported. Broader
+   evaluator isolation remains backlog `mc-v8f3.5`.
+4. Real CLI probes verified the 0.164 Seatbelt command path, but native hook
+   loading and a live model session remain unverified. The separate
+   resource-window smoke test must verify claim, read, local patch, try/submit,
+   retirement and drain, plus deliberate denied calls and no inherited tools.
+   Do not infer live acceptance from unit tests, containment probes or a config
+   preflight.
 
-The overseer recorded acceptance for this trusted local container policy on
-`mc-kfbz1.4` as described above. The launcher still requires the acknowledgment.
-Set `FS_CODEX_POLICY_ACK=trusted-local-v1` in the Codex agent environment (for
-example the city's agent patch), preserving the generated safety settings.
-This acknowledgment is an operational gate, not proof of isolation or a way to
-skip the review/smoke-test gates. Container mode also requires its explicit
-`FS_CODEX_SANDBOX=container` opt-in. Changing the policy or CLI semantics requires
-renewed review. Do not enable the role merely to make a failing launch pass.
+No acknowledgment variable or no-native-sandbox fallback is part of this
+policy. Changing the policy or CLI semantics requires review. Do not enable the
+role merely to make a failing launch pass.
 
 References: [official hook contracts and coverage](https://learn.chatgpt.com/docs/hooks),
 [official sandbox modes](https://learn.chatgpt.com/docs/sandboxing),

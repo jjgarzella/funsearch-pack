@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import patch
 
 from scripts.codex_mutator_launch import check_layers, launch, validate_effective
-from scripts.codex_mutator_setup import ACK, setup
+from scripts.codex_mutator_setup import PERMISSION_PROFILE, setup
 
 PACK = Path(__file__).resolve().parents[2]
-FIXTURE = Path(__file__).resolve().parent / "fixtures/codex-0.160-config-read.json"
+FIXTURE = Path(__file__).resolve().parent / "fixtures/codex-0.164-config-read.json"
 
 
 class CodexLaunchTests(unittest.TestCase):
@@ -27,20 +27,20 @@ class CodexLaunchTests(unittest.TestCase):
         self.shared.mkdir()
         self.auth = self.shared / "auth.json"
         self.auth.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "fake-token"}}))
-        policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write", FS_CODEX_POLICY_ACK=ACK,
+        policy = patch.dict(os.environ, FS_CODEX_SANDBOX="workspace-write",
                             FS_CODEX_LOCK_DIR=str(self.root / "locks"), GC_SESSION_ID="session-1",
                             CODEX_HOME=str(self.shared))
         policy.start()
         self.addCleanup(policy.stop)
         os.environ.pop("CODEX_API_KEY", None)
         os.environ.pop("OPENAI_API_KEY", None)
-        setup(self.home, PACK)
+        setup(self.home, PACK, backend="seatbelt")
         self.config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
 
     def layers(self):
-        # A 0.160 config/read response adapted to require ChatGPT login.
+        # A raw 0.164 config/read response from the generated native profile.
         text = FIXTURE.read_text().replace("@HOME@", str(self.home))
-        text = text.replace('"/etc/codex/config.toml"', json.dumps(str(self.etc / "config.toml")))
+        text = text.replace('"@ETC@/config.toml"', json.dumps(str(self.etc / "config.toml")))
         return json.loads(text)["response"]["result"]
 
     def test_fixture_layers_pass_and_unexpected_layers_are_refused(self):
@@ -76,23 +76,49 @@ class CodexLaunchTests(unittest.TestCase):
     def test_fixture_effective_config_passes_with_chatgpt_login(self):
         config = self.layers()["config"]
         self.assertEqual(config["forced_login_method"], "chatgpt")
-        validate_effective(config, self.home)
+        self.assertEqual(config["default_permissions"], PERMISSION_PROFILE)
+        validate_effective(config, self.home, backend="seatbelt")
 
     def test_effective_config_refuses_code_running_and_redirecting_settings(self):
-        validate_effective(self.config, self.home)
+        validate_effective(self.config, self.home, backend="seatbelt")
         for key, value in (("forced_login_method", "api"), ("forced_login_method", None),
+                           ("sandbox_mode", "workspace-write"),
+                           ("default_permissions", "broad"),
                            ("hooks", {"PreToolUse": []}), ("notify", ["sh"]), ("model_provider", "proxy"),
                            ("model_providers", {"proxy": {}}), ("openai_base_url", "https://x.invalid"),
                            ("otel", {"exporter": "otlp"}), ("profile", "other")):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
-                validate_effective(dict(self.config, **{key: value}), self.home)
+                validate_effective(dict(self.config, **{key: value}), self.home, backend="seatbelt")
         # config/read reports these explicitly as null/empty when unset.
         validate_effective(dict(self.config, hooks=None, notify=None, model_provider=None,
-                                model_providers={}, openai_base_url=None, otel=None, profile=None), self.home)
+                                model_providers={}, openai_base_url=None, otel=None, profile=None),
+                           self.home, backend="seatbelt")
         missing = dict(self.config)
         del missing["forced_login_method"]
         with self.assertRaisesRegex(ValueError, "ChatGPT"):
-            validate_effective(missing, self.home)
+            validate_effective(missing, self.home, backend="seatbelt")
+
+    def test_native_profile_requires_workspace_boundary_ssh_deny_and_no_network(self):
+        cases = []
+        for key, value in (("~/.ssh", "read"), ("/tmp", "write"), (":slash_tmp", "write")):
+            changed = copy.deepcopy(self.config)
+            changed["permissions"][PERMISSION_PROFILE]["filesystem"][key] = value
+            cases.append((key, changed))
+        changed = copy.deepcopy(self.config)
+        changed["permissions"][PERMISSION_PROFILE]["network"]["enabled"] = True
+        cases.append(("network", changed))
+        changed = copy.deepcopy(self.config)
+        changed["permissions"][PERMISSION_PROFILE]["extends"] = ":danger-full-access"
+        cases.append(("extends", changed))
+        changed = copy.deepcopy(self.config)
+        changed["permissions"]["extra"] = {"extends": ":workspace"}
+        cases.append(("extra profile", changed))
+        changed = copy.deepcopy(self.config)
+        changed["permissions"][PERMISSION_PROFILE]["tools"] = {"shell": "unrestricted"}
+        cases.append(("extra profile capability", changed))
+        for label, config in cases:
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_effective(config, self.home, backend="seatbelt")
 
     def test_launch_requires_shared_chatgpt_auth_before_claiming(self):
         for label, value in (("missing", None), ("malformed", "{fake-secret"),
@@ -154,8 +180,9 @@ class CodexLaunchTests(unittest.TestCase):
         self.addCleanup(os.chdir, os.getcwd())
         with patch("scripts.codex_mutator_launch.read_effective",
                    side_effect=effective or (lambda home, env: self.config)), \
+                patch("scripts.codex_mutator_launch.sandbox_backend", return_value="seatbelt"), \
                 patch("scripts.codex_mutator_launch.subprocess.run",
-                      return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.160.0\n")), \
+                      return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.164.0\n")), \
                 patch("scripts.gc_lifecycle.gc", side_effect=list(responses)) as gc, \
                 patch("scripts.codex_mutator_launch.os.execvpe", side_effect=exec_error) as execute:
             try:

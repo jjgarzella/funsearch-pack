@@ -1,7 +1,6 @@
 """Native Codex-only launch with no shared daemon/config and fixed policy.
 
-No model request is made during config preflight. The operator acknowledgment
-is required because Codex's native hooks are not a fail-closed boundary.
+No model request is made during config or sandbox preflight.
 """
 
 import json
@@ -14,43 +13,75 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.codex_mutator_setup import ACK, hooks_document, selected_sandbox, setup
+from scripts.codex_mutator_setup import PERMISSION_PROFILE, hooks_document, sandbox_backend, setup
 
 
-TESTED_CODEX_VERSION = "codex-cli 0.160.0"
+TESTED_CODEX_VERSION = "codex-cli 0.164.0"
 
 
 DISABLED = ("unified_exec", "shell_snapshot", "apps", "plugins", "multi_agent",
             "browser_use", "computer_use", "image_generation", "view_image",
             "skill_search", "skill_mcp_dependency_install", "memories",
             "code_mode", "code_mode_host", "remote_plugin", "workspace_dependencies",
-            "tool_suggest", "recommended_plugins")
+            "tool_suggest", "recommended_plugins", "api_key_cyber_access_programs",
+            "api_key_model_discovery")
 
 
-# ConfigLayerSource variants in the 0.160 app-server schema.
+# ConfigLayerSource variants returned by the 0.164 app-server schema.
 LAYER_TYPES = ("packagedDefaults", "mdm", "system", "enterpriseManaged", "user", "project",
                "sessionFlags", "legacyManagedConfigTomlFromFile", "legacyManagedConfigTomlFromMdm")
 
 
-def validate_effective(config, home):
+def validate_effective(config, home, backend=None):
     """Reject inherited capability/sandbox overrides before a model is loaded."""
-    expected_sandbox = selected_sandbox(os.environ)
-    if config.get("approval_policy") != "never" or config.get("sandbox_mode") != expected_sandbox:
-        raise ValueError(f"Codex must use {expected_sandbox} and approval never")
-    sandbox = config.get("sandbox_workspace_write", {})
-    if (sandbox.get("network_access") is not False or sandbox.get("writable_roots")
-            or sandbox.get("exclude_slash_tmp") is not True
-            or sandbox.get("exclude_tmpdir_env_var") is not True):
-        # In container mode these settings are retained but inactive; they do
-        # not provide filesystem/network enforcement with danger-full-access.
-        raise ValueError("Codex workspace-write settings must remain slot-only with no network")
+    backend = sandbox_backend() if backend is None else backend
+    if config.get("approval_policy") != "never":
+        raise ValueError("Codex must use approval never")
+    if backend == "seatbelt":
+        if config.get("sandbox_mode") is not None or config.get("sandbox_workspace_write") not in (None, {}):
+            raise ValueError("macOS must use the native permission profile, not legacy sandbox settings")
+        if config.get("default_permissions") != PERMISSION_PROFILE:
+            raise ValueError(f"Codex must select permission profile {PERMISSION_PROFILE}")
+        profiles = config.get("permissions", {})
+        if not isinstance(profiles, dict) or set(profiles) != {PERMISSION_PROFILE}:
+            raise ValueError("Codex must load only the private native permission profile")
+        profile = profiles[PERMISSION_PROFILE]
+        if (not isinstance(profile, dict) or profile.get("extends") != ":workspace"
+                or profile.get("workspace_roots") not in (None, {})):
+            raise ValueError("Codex native profile must extend only the current workspace")
+        profile_keys = {"description", "extends", "workspace_roots", "filesystem", "network"}
+        if set(profile) - profile_keys:
+            raise ValueError("Codex native profile contains unsupported permission settings")
+        filesystem = profile.get("filesystem", {})
+        required_filesystem = {"~/.ssh": "deny", ":tmpdir": "read", ":slash_tmp": "read"}
+        if (not isinstance(filesystem, dict)
+                or any(filesystem.get(key) != value for key, value in required_filesystem.items())
+                or set(filesystem) - (set(required_filesystem) | {"glob_scan_max_depth"})
+                or filesystem.get("glob_scan_max_depth") is not None):
+            raise ValueError("Codex native filesystem profile must deny SSH reads and keep temp paths read-only")
+        network = profile.get("network", {})
+        if (not isinstance(network, dict) or network.get("enabled") is not False
+                or any(value is not None for key, value in network.items() if key != "enabled")):
+            raise ValueError("Codex native permission profile must disable command networking")
+    elif backend == "linux":
+        if config.get("sandbox_mode") != "workspace-write":
+            raise ValueError("Linux Codex must retain workspace-write sandbox mode")
+        sandbox = config.get("sandbox_workspace_write", {})
+        if (sandbox.get("network_access") is not False or sandbox.get("writable_roots")
+                or sandbox.get("exclude_slash_tmp") is not True
+                or sandbox.get("exclude_tmpdir_env_var") is not True):
+            raise ValueError("Linux workspace-write settings must remain slot-only with no network")
+        if config.get("default_permissions") is not None or config.get("permissions") not in (None, {}):
+            raise ValueError("Linux must retain the existing native workspace-write policy")
+    else:
+        raise ValueError(f"unsupported Codex sandbox backend {backend!r}")
     features = config.get("features", {})
     if (features.get("hooks") is not True or features.get("shell_tool") is not True
             or features.get("skip_host_skill_discovery") is not True
             or any(features.get(key) is not False for key in DISABLED)):
         raise ValueError("Codex capability overrides are not permitted")
-    if config.get("mcp_servers") or config.get("plugins") or config.get("default_permissions"):
-        raise ValueError("Codex MCP servers, plugins and permission profiles are forbidden")
+    if config.get("mcp_servers") or config.get("plugins"):
+        raise ValueError("Codex MCP servers and plugins are forbidden")
     if config.get("web_search") != "disabled" or config.get("allow_login_shell") is not False:
         raise ValueError("Codex web search and login shells are forbidden")
     if (config.get("project_root_markers") != [".funsearch-codex-root"]
@@ -126,7 +157,7 @@ def read_effective(home, env):
                 break
             chunk = os.read(process.stdout.fileno(), 65536)
             if not chunk:
-                raise ValueError("Codex config preflight exited; CLI 0.160.0 is required")
+                raise ValueError("Codex config preflight exited; CLI 0.164.0 is required")
             pending += chunk
         raise ValueError("Codex config preflight timed out")
     try:
@@ -175,11 +206,23 @@ def shared_auth_file():
     return path
 
 
+def verify_sandbox_runtime(home, env, backend):
+    """Run a harmless command through the selected host-native Codex sandbox."""
+    command = ["codex", "sandbox", "-C", str(home)]
+    if backend == "seatbelt":
+        command.extend(["--permission-profile", PERMISSION_PROFILE])
+    command.append("/usr/bin/true")
+    try:
+        subprocess.run(command, cwd=home, env=env, capture_output=True, text=True,
+                       check=True, timeout=15)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise ValueError(f"Codex {backend} sandbox preflight failed: {detail.strip()}") from exc
+
+
 def launch(home, pack):
-    if os.environ.get("FS_CODEX_POLICY_ACK") != ACK:
-        raise ValueError("Codex mutators require overseer sign-off on docs/codex-mutator.md; "
-                         f"then set FS_CODEX_POLICY_ACK={ACK} in the agent environment")
-    sandbox = selected_sandbox(os.environ)
+    home, pack = Path(home).resolve(), Path(pack).resolve()
+    backend = sandbox_backend()
     # Resolve the shared login before replacing CODEX_HOME with our private home.
     auth = shared_auth_file()
     version = subprocess.run(["codex", "--version"], capture_output=True, text=True,
@@ -190,18 +233,20 @@ def launch(home, pack):
     # project-local hook file (hook JSON does not appear in config/read).
     if (home / ".codex").exists() or (home / ".agents").exists():
         raise ValueError("Codex slot workspace must not contain project config, hooks or skills")
-    setup(home, pack)
+    setup(home, pack, backend=backend)
     private = home / ".funsearch-codex-home"
     # Share refreshes with the existing login; a copied cache can diverge.
     (private / "auth.json").unlink(missing_ok=True)
     (private / "auth.json").symlink_to(auth)
     # Drop OPENAI_BASE_URL and every other inherited OPENAI_*/CODEX_* setting.
     env = {name: value for name, value in os.environ.items()
-           if not name.startswith(("OPENAI_", "CODEX_"))}
+           if not name.startswith(("OPENAI_", "CODEX_"))
+           and name not in ("FS_CODEX_POLICY_ACK", "FS_CODEX_SANDBOX")}
     env["CODEX_HOME"] = str(private)
-    validate_effective(read_effective(home, env), home)
+    validate_effective(read_effective(home, env), home, backend=backend)
     if (private / "hooks.json").read_text() != hooks_document(home, pack):
         raise ValueError("private Codex hooks.json changed after setup")
+    verify_sandbox_runtime(home, env, backend)
     # slot helpers write their context/retirement files in the working directory.
     os.chdir(home)
     # Claim via the required protocol and read opt_model from that exact bead.
@@ -226,9 +271,10 @@ def launch(home, pack):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("slot opt_model must be a nonempty string")
         prompt = (pack / "agents/mutator-codex/prompt.template.md").read_text().replace("{{.ConfigDir}}", str(pack))
-        command = ["codex", "--no-daemon", "--strict-config", "--dangerously-bypass-hook-trust",
-                   "-a", "never", "-s", sandbox, "-C", str(home),
-                   "exec", "--skip-git-repo-check", "-m", model, prompt]
+        command = ["codex", "--no-daemon", "--strict-config", "--dangerously-bypass-hook-trust"]
+        if backend == "linux":
+            command.extend(["-s", "workspace-write"])
+        command.extend(["-C", str(home), "exec", "--skip-git-repo-check", "-m", model, prompt])
         os.execvpe(command[0], command, env)
     except Exception as error:
         release_after_refusal(bead, error)

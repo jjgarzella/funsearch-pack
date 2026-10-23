@@ -3,7 +3,7 @@
 Only the staging child.c may be edited under the task policy. Approved
 engine/lifecycle commands run here, outside the native sandbox, because their DB and
 Gas City control operations cannot be granted to arbitrary model shell code.
-Container mode removes the native sandbox, retaining the same task policy.
+The host-native Seatbelt or Linux workspace-write sandbox remains active.
 The shell receives only a trusted receipt-reading command, never the original
 command. Codex hook runtime failures can fail open; see docs/codex-mutator.md.
 """

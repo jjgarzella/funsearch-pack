@@ -1,0 +1,597 @@
+{
+ "codex_version": "codex-cli 0.164.0",
+ "home": "@HOME@",
+ "response": {
+  "id": 2,
+  "result": {
+   "config": {
+    "model": "gpt-6-luna",
+    "review_model": null,
+    "model_context_window": null,
+    "model_auto_compact_token_limit": null,
+    "model_auto_compact_token_limit_scope": null,
+    "model_provider": null,
+    "approval_policy": "never",
+    "approvals_reviewer": null,
+    "sandbox_mode": null,
+    "sandbox_workspace_write": null,
+    "forced_chatgpt_workspace_id": null,
+    "forced_login_method": "chatgpt",
+    "web_search": "disabled",
+    "tools": null,
+    "instructions": null,
+    "developer_instructions": null,
+    "compact_prompt": null,
+    "model_reasoning_effort": null,
+    "model_reasoning_summary": null,
+    "model_verbosity": null,
+    "service_tier": null,
+    "analytics": null,
+    "apps": null,
+    "browser_use": null,
+    "computer_use": null,
+    "desktop": null,
+    "model_post_turn_compact_threshold_percent": null,
+    "apps_mcp_product_sku": null,
+    "model_providers": {},
+    "mcp_enterprise_managed_auth": null,
+    "mcp_oauth_callback_url": null,
+    "project_root_markers": [
+     ".funsearch-codex-root"
+    ],
+    "check_for_update_on_startup": null,
+    "default_permissions": "funsearch_native",
+    "plan_mode_reasoning_effort": null,
+    "experimental_realtime_ws_startup_context": null,
+    "notice": null,
+    "otel": null,
+    "tool_output_token_limit": null,
+    "daybreak": null,
+    "experimental_use_unified_exec_tool": null,
+    "orchestrator": null,
+    "experimental_realtime_webrtc_call_base_url": null,
+    "shell_environment_policy": {
+     "inherit": "none",
+     "ignore_default_excludes": null,
+     "exclude": null,
+     "set": {
+      "PATH": "/usr/bin:/bin"
+     },
+     "include_only": null,
+     "filters": null,
+     "experimental_use_profile": null
+    },
+    "include_permissions_instructions": true,
+    "cli_auth_credentials_store": "file",
+    "model_catalog_json": null,
+    "notify": null,
+    "thread_unload_delay_secs": null,
+    "mcp_servers": {},
+    "allow_login_shell": false,
+    "mcp_oauth_callback_port": null,
+    "include_apps_instructions": true,
+    "mcp_optional_startup_grace_ms": null,
+    "permissions": {
+     "funsearch_native": {
+      "description": "Native workspace access with SSH reads denied",
+      "extends": ":workspace",
+      "workspace_roots": null,
+      "filesystem": {
+       "glob_scan_max_depth": null,
+       ":slash_tmp": "read",
+       ":tmpdir": "read",
+       "~/.ssh": "deny"
+      },
+      "network": {
+       "enabled": false,
+       "proxy_url": null,
+       "enable_socks5": null,
+       "socks_url": null,
+       "enable_socks5_udp": null,
+       "allow_upstream_proxy": null,
+       "dangerously_allow_non_loopback_proxy": null,
+       "dangerously_allow_all_unix_sockets": null,
+       "mode": null,
+       "domains": null,
+       "unix_sockets": null,
+       "allow_local_binding": null,
+       "mitm": null
+      }
+     }
+    },
+    "log_dir": null,
+    "personality": null,
+    "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+    "profile": null,
+    "experimental_realtime_ws_model": null,
+    "experimental_realtime_start_instructions": null,
+    "features": {
+     "code_mode": false,
+     "code_mode_host": false,
+     "network_proxy": null,
+     "api_key_cyber_access_programs": false,
+     "api_key_model_discovery": false,
+     "apps": false,
+     "browser_use": false,
+     "computer_use": false,
+     "hooks": true,
+     "image_generation": false,
+     "memories": false,
+     "multi_agent": false,
+     "plugins": false,
+     "recommended_plugins": false,
+     "remote_plugin": false,
+     "shell_snapshot": false,
+     "shell_tool": true,
+     "skill_mcp_dependency_install": false,
+     "skill_search": false,
+     "skip_host_skill_discovery": true,
+     "tool_suggest": false,
+     "unified_exec": false,
+     "view_image": false,
+     "workspace_dependencies": false,
+     "auth_elicitation": true,
+     "background_paginated_rollout_migration": false,
+     "codex_apps_mcp_2026_07_28": false,
+     "mcp_2026_07_28": false,
+     "mentions_v2": true,
+     "remote_control": false,
+     "windows_sandbox_service": false
+    },
+    "ghost_snapshot": null,
+    "oss_provider": null,
+    "background_terminal_max_timeout": 300000,
+    "profiles": {},
+    "experimental_thread_store": null,
+    "hooks": null,
+    "include_environment_context_time": true,
+    "allow_symlinked_codex_home": null,
+    "realtime": null,
+    "agents": null,
+    "show_raw_agent_reasoning": null,
+    "windows": null,
+    "mcp_oauth_credentials_store": "auto",
+    "cloud": null,
+    "experimental_thread_store_endpoint": null,
+    "experimental_compact_prompt_file": null,
+    "model_instructions_file": null,
+    "js_repl_node_module_dirs": null,
+    "history": {
+     "persistence": "save-all",
+     "max_bytes": null
+    },
+    "responses_api_metadata": null,
+    "file_opener": "vscode",
+    "hide_agent_reasoning": false,
+    "skills": null,
+    "project_doc_fallback_filenames": [],
+    "js_repl_node_path": null,
+    "experimental_realtime_ws_base_url": null,
+    "audio": null,
+    "projects": {
+     "@HOME@": {
+      "trust_level": "trusted"
+     }
+    },
+    "tool_suggest": null,
+    "memories": null,
+    "plugins": {},
+    "marketplaces": {},
+    "disable_paste_burst": null,
+    "include_collaboration_mode_instructions": true,
+    "sqlite_home": null,
+    "include_environment_context": true,
+    "goals": null,
+    "suppress_unstable_features_warning": null,
+    "feedback": null,
+    "tui": null,
+    "openai_base_url": null,
+    "project_doc_max_bytes": 0,
+    "experimental_realtime_ws_backend_prompt": null,
+    "auto_review": null
+   },
+   "origins": {
+    "features.remote_plugin": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.description": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.computer_use": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.recommended_plugins": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.plugins": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.code_mode_host": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.tool_suggest": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.extends": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.image_generation": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.skip_host_skill_discovery": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "projects.@HOME@.trust_level": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.workspace_dependencies": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "web_search": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.skill_mcp_dependency_install": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.skill_search": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "forced_login_method": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.unified_exec": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.network.enabled": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "shell_environment_policy.set.PATH": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.filesystem.:tmpdir": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.browser_use": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "allow_login_shell": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.apps": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.multi_agent": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "project_root_markers.0": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "approval_policy": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.api_key_cyber_access_programs": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.code_mode.enabled": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "model": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.shell_snapshot": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "default_permissions": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.filesystem.:slash_tmp": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "project_doc_max_bytes": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.view_image": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.api_key_model_discovery": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "shell_environment_policy.inherit": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "permissions.funsearch_native.filesystem.~/.ssh": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.memories": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.shell_tool": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    },
+    "features.hooks": {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e"
+    }
+   },
+   "layers": [
+    {
+     "name": {
+      "type": "user",
+      "file": "@HOME@/.funsearch-codex-home/config.toml",
+      "profile": null
+     },
+     "version": "sha256:8d18b3c62dd2ffd90af6e09d77eddf38264c2a72433007726d18039402c1f17e",
+     "config": {
+      "model": "gpt-6-luna",
+      "forced_login_method": "chatgpt",
+      "approval_policy": "never",
+      "web_search": "disabled",
+      "allow_login_shell": false,
+      "project_root_markers": [
+       ".funsearch-codex-root"
+      ],
+      "project_doc_max_bytes": 0,
+      "default_permissions": "funsearch_native",
+      "permissions": {
+       "funsearch_native": {
+        "description": "Native workspace access with SSH reads denied",
+        "extends": ":workspace",
+        "filesystem": {
+         "~/.ssh": "deny",
+         ":tmpdir": "read",
+         ":slash_tmp": "read"
+        },
+        "network": {
+         "enabled": false
+        }
+       }
+      },
+      "shell_environment_policy": {
+       "inherit": "none",
+       "set": {
+        "PATH": "/usr/bin:/bin"
+       }
+      },
+      "features": {
+       "hooks": true,
+       "skip_host_skill_discovery": true,
+       "shell_tool": true,
+       "unified_exec": false,
+       "shell_snapshot": false,
+       "apps": false,
+       "plugins": false,
+       "multi_agent": false,
+       "browser_use": false,
+       "computer_use": false,
+       "image_generation": false,
+       "view_image": false,
+       "skill_search": false,
+       "skill_mcp_dependency_install": false,
+       "api_key_cyber_access_programs": false,
+       "api_key_model_discovery": false,
+       "memories": false,
+       "code_mode": false,
+       "code_mode_host": false,
+       "remote_plugin": false,
+       "workspace_dependencies": false,
+       "tool_suggest": false,
+       "recommended_plugins": false
+      },
+      "projects": {
+       "@HOME@": {
+        "trust_level": "trusted"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "type": "system",
+      "file": "@ETC@/config.toml"
+     },
+     "version": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "config": {}
+    }
+   ]
+  }
+ }
+}

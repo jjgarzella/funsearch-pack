@@ -4,28 +4,31 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shlex
 import stat
 import sys
 
 
-ACK = "trusted-local-v1"
+PERMISSION_PROFILE = "funsearch_native"
 LOCK_DIR = "/var/tmp/funsearch-codex-locks"
 # Exit status of the probe child when the parent's lock correctly blocks it.
 PROBE_BLOCKED = 75
 
 
-def selected_sandbox(env):
-    """Only the acknowledged container policy may remove the native sandbox."""
-    mode = env.get("FS_CODEX_SANDBOX", "workspace-write")
-    if mode == "workspace-write":
-        return "workspace-write"
-    if mode != "container":
-        raise ValueError("FS_CODEX_SANDBOX must be workspace-write or container")
-    if env.get("FS_CODEX_POLICY_ACK") != ACK:
-        raise ValueError(f"container mode requires FS_CODEX_POLICY_ACK={ACK}")
-    return "danger-full-access"
+def sandbox_backend(env=None, system=None):
+    """Select only Codex's host-native sandbox; reject the old container bypass."""
+    env = os.environ if env is None else env
+    mode = env.get("FS_CODEX_SANDBOX")
+    if mode not in (None, "workspace-write"):
+        raise ValueError("FS_CODEX_SANDBOX must be unset or workspace-write; native sandboxing is required")
+    system = platform.system() if system is None else system
+    if system == "Darwin":
+        return "seatbelt"
+    if system == "Linux":
+        return "linux"
+    raise ValueError(f"native Codex sandbox is unsupported on {system}")
 
 
 def lock_directory(env):
@@ -94,8 +97,10 @@ def hooks_document(home, pack):
         {"type": "command", "command": guard, "timeout": 310}]}]}}, indent=2) + "\n"
 
 
-def setup(work_dir, pack_dir):
-    sandbox = selected_sandbox(os.environ)
+def setup(work_dir, pack_dir, backend=None):
+    backend = sandbox_backend() if backend is None else backend
+    if backend not in ("seatbelt", "linux"):
+        raise ValueError(f"unknown native Codex sandbox backend {backend!r}")
     home, pack = Path(work_dir).resolve(), Path(pack_dir).resolve()
     home.mkdir(parents=True, exist_ok=True)
     home.chmod(0o700)
@@ -108,19 +113,33 @@ def setup(work_dir, pack_dir):
         receipt.unlink()
     # Keep the user config separate from project config and all shared homes.
     # The wrapper also checks effective config before making a model request.
-    settings = '''model = "gpt-6-luna"
-forced_login_method = "chatgpt"
-approval_policy = "never"
-sandbox_mode = SANDBOX
-web_search = "disabled"
-allow_login_shell = false
-project_root_markers = [".funsearch-codex-root"]
-project_doc_max_bytes = 0
+    if backend == "seatbelt":
+        sandbox_settings = f'''default_permissions = "{PERMISSION_PROFILE}"
+[permissions.{PERMISSION_PROFILE}]
+description = "Native workspace access with SSH reads denied"
+extends = ":workspace"
+[permissions.{PERMISSION_PROFILE}.filesystem]
+"~/.ssh" = "deny"
+":tmpdir" = "read"
+":slash_tmp" = "read"
+[permissions.{PERMISSION_PROFILE}.network]
+enabled = false
+'''
+    else:
+        sandbox_settings = '''sandbox_mode = "workspace-write"
 [sandbox_workspace_write]
 network_access = false
 writable_roots = []
 exclude_slash_tmp = true
 exclude_tmpdir_env_var = true
+'''
+    settings = '''model = "gpt-6-luna"
+forced_login_method = "chatgpt"
+approval_policy = "never"
+web_search = "disabled"
+allow_login_shell = false
+project_root_markers = [".funsearch-codex-root"]
+project_doc_max_bytes = 0
 [shell_environment_policy]
 inherit = "none"
 [shell_environment_policy.set]
@@ -140,6 +159,8 @@ image_generation = false
 view_image = false
 skill_search = false
 skill_mcp_dependency_install = false
+api_key_cyber_access_programs = false
+api_key_model_discovery = false
 memories = false
 code_mode = false
 code_mode_host = false
@@ -149,7 +170,9 @@ tool_suggest = false
 recommended_plugins = false
 [projects.HOME]
 trust_level = "trusted"
-'''.replace('SANDBOX', json.dumps(sandbox)).replace('[projects.HOME]', f'[projects.{json.dumps(str(home))}]')
+'''
+    settings = (settings.replace('[shell_environment_policy]', sandbox_settings + '[shell_environment_policy]')
+                .replace('[projects.HOME]', f'[projects.{json.dumps(str(home))}]'))
     config = directory / "config.toml"
     config.write_text(settings)
     hooks = directory / "hooks.json"
