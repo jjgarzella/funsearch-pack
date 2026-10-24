@@ -138,6 +138,31 @@ class WorkerWatchdogTests(unittest.TestCase):
         self.assertEqual(result["status"], "ERROR")
         self.assertEqual(result["msg"], failure)
 
+    def test_query_failure_overrides_score_timeout(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=TimeoutError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
     def test_idle_watchdog_wake_does_not_inspect_worker(self):
         worker = Worker.__new__(Worker)
 
