@@ -829,6 +829,40 @@ double f(void) {
 
         self.assertEqual(read.call_count, 17)
 
+    def test_post_exit_protocol_drain_returns_while_descendant_holds_stdout_open(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        worker = Worker.__new__(Worker)
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+        writer.write(b"late output\n")
+
+        errors = []
+
+        def drain():
+            try:
+                worker._drain_protocol_after_exit()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=drain, daemon=True)
+        thread.start()
+        thread.join(timeout=2)
+        returned_before_eof = not thread.is_alive()
+        if thread.is_alive():
+            writer.close()
+            thread.join(timeout=1)
+
+        self.assertTrue(
+            returned_before_eof,
+            "post-exit protocol drain waited for EOF while a descendant held stdout open",
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(worker._buffer, b"late output\n")
+
     def test_forged_reply_with_the_request_token_is_detected(self):
         # The token is not in any request buffer, but a candidate sharing the
         # process can still find the worker's copy. The SYNC barrier then sees
