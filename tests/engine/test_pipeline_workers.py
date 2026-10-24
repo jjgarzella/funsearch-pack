@@ -353,9 +353,14 @@ void fs_fini(void) {
         self.assertTrue(ok, log)
         result = pool.score(library, 20)
         self.assertEqual(result["status"], "ERROR")
-        # On Darwin, the native Mach watchdog and the parent process monitor
-        # enforce the same cap; either can observe the overage first.
-        self.assertIn("resident-set limit exceeded", result["msg"])
+        if sys.platform == "darwin":
+            # The native Mach watchdog and parent monitor enforce the same
+            # cap; either can observe the overage first.
+            self.assertIn("resident-set limit exceeded", result["msg"])
+        else:
+            # ASan enforces hard_rss_limit_mb on Linux.
+            self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
+                            result["msg"][:200])
         self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
 
     def test_oversized_reply_without_newline_fails_promptly(self):
