@@ -716,6 +716,68 @@ double f(void) {
         self.assertEqual(result["msg"], "worker protocol error: reply does not answer this request")
         self.assertGreaterEqual(process.wait.call_count, 1)
 
+    def test_late_score_reply_after_deadline_remains_a_timeout(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._send = Mock()
+        worker._line = Mock(side_effect=TimeoutError)
+        worker._exit_snapshot = Mock(return_value=(0, True))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "timeout after 1s")
+        self.assertNotIn("protocol error", result["msg"])
+
+    def test_sync_timeout_with_pending_bytes_remains_a_protocol_error(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._send = Mock()
+        worker._line = Mock(return_value="{}")
+        worker._sync = Mock(side_effect=TimeoutError)
+        worker._exit_snapshot = Mock(return_value=(0, True))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers._checked_reply", return_value={"status": "OK"}):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(
+            result["msg"],
+            "worker protocol error: unexpected output after worker exit",
+        )
+
+    def test_post_exit_protocol_drain_rejects_oversized_pending_response(self):
+        worker = Worker.__new__(Worker)
+        stdout = Mock()
+        stdout.fileno.return_value = 123
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+        chunks = [b"x" * 4096 for _ in range(16)] + [b"x"]
+
+        with patch("engine.funsearch.workers.select.select",
+                   return_value=([stdout], [], [])), \
+                patch("engine.funsearch.workers.os.read", side_effect=chunks) as read:
+            with self.assertRaisesRegex(WorkerError, "worker response exceeds 64 KiB"):
+                worker._drain_protocol_after_exit()
+
+        self.assertEqual(read.call_count, 17)
+
     def test_forged_reply_with_the_request_token_is_detected(self):
         # The token is not in any request buffer, but a candidate sharing the
         # process can still find the worker's copy. The SYNC barrier then sees

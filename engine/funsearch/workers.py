@@ -542,9 +542,11 @@ class Worker:
                 raise WorkerError("worker is closed")
         deadline = time.monotonic() + timeout_s
         nonce = secrets.token_hex(16)
+        awaiting_reply = True
         try:
             self._send(f"SCORE #{nonce} {path}")
             reply = _checked_reply(json.loads(self._line(deadline)), nonce)
+            awaiting_reply = False
             self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
         except TimeoutError:
             try:
@@ -552,8 +554,17 @@ class Worker:
             except (OSError, WorkerError) as exc:
                 result = _error(f"worker protocol error: {exc}")
             else:
-                if pending:
+                if pending and not awaiting_reply:
                     result = _error("worker protocol error: unexpected output after worker exit")
+                elif awaiting_reply and pending:
+                    # The response may have arrived just after the score
+                    # deadline. It was still the awaited reply, not unsolicited
+                    # output; keep timeout/watchdog classification primary.
+                    reason = self._pool_termination_reason or self._rss_watchdog_error
+                    if reason is None:
+                        reason = f"timeout after {timeout_s:g}s"
+                    reason = self._record_pool_termination(reason)
+                    result = _error(reason)
                 elif exit_code is not None:
                     result = _error(self._exit_message(exit_code))
                 else:
