@@ -343,6 +343,36 @@ class WorkerWatchdogTests(unittest.TestCase):
         self.assertEqual(result["status"], "ERROR")
         self.assertEqual(result["msg"], failure)
 
+    def test_pool_watchdog_reason_is_returned_from_score_after_worker_exit(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated proc_pidinfo failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+                worker._record_pool_termination(failure)
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=EOFError), \
+                patch.object(worker, "_exit_snapshot",
+                             return_value=(-signal.SIGKILL, False)) as exit_snapshot, \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+        exit_snapshot.assert_called_once_with()
+
     def test_idle_watchdog_wake_does_not_inspect_worker(self):
         worker = Worker.__new__(Worker)
 
