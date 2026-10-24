@@ -1,5 +1,6 @@
 """Persistent worker processes and a blocking, thread-safe scoring pool."""
 
+import errno
 import fcntl
 import json
 import math
@@ -247,6 +248,13 @@ class Worker:
             try:
                 resident_bytes = process_resident_bytes(process.pid)
             except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    # proc_pidinfo reports ESRCH after the worker exits. Stop
+                    # watching this process and let the scoring path reap it
+                    # and classify its exit or signal.
+                    if self.process is process:
+                        self._set_rss_watchdog_active(False)
+                    continue
                 if process.poll() is not None:
                     continue
                 failure = f"worker resident-set query failed: {exc}"
