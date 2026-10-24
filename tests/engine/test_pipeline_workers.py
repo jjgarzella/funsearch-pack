@@ -645,6 +645,29 @@ double f(void) {
         self.assertIn("worker resident-set limit exceeded", result["msg"])
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_query_failure_aborts_live_worker(self):
+        self.cfg.evaluator.memory_mb = 64
+        should_fail = False
+        failed_once = False
+
+        def resident_bytes(pid):
+            nonlocal failed_once
+            if should_fail and pid != os.getpid() and not failed_once:
+                failed_once = True
+                raise OSError("simulated proc_pidinfo failure")
+            return 0
+
+        with patch("engine.funsearch.workers.process_resident_bytes", side_effect=resident_bytes):
+            pool = self.pool()
+            should_fail = True
+            result = pool.score(self.candidate("loop"), 5)
+            self.assertTrue(failed_once)
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("worker resident-set query failed: simulated proc_pidinfo failure",
+                          result["msg"])
+            self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
     def test_startup_failures_include_evaluator_stderr(self):
         init = self.source("#!/bin/sh\necho 'julia: no depot' >&2\nexit 3\n", "init-fail")
         crash = self.source("#!/bin/sh\necho 'cannot dup' >&2\nexit 1\n", "crash")

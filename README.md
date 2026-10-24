@@ -339,8 +339,8 @@ Best-effort hygiene for trusted local experiments:
   plus the patterns in the problem's `evaluator.env`.
   Gas City identity, store scope, agent sockets and credentials are not passed
   on unless a pattern names them.
-- When macOS cannot apply `RLIMIT_AS` or an Apple ASan trial requests an RSS
-  limit, the worker uses a Mach resident-set watchdog. It disables subprocess
+- On macOS, the worker uses a Mach resident-set watchdog when `RLIMIT_AS` fails
+  with `EINVAL` or an Apple ASan trial requests an RSS limit. It disables subprocess
   creation in that worker so children cannot escape the worker-local memory
   cap. The watchdog samples every 20 ms while evaluator or candidate code runs
   and once per second while idle; a failed Mach sample aborts the worker, and

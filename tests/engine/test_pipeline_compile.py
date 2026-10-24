@@ -261,11 +261,13 @@ class CompileTests(PipelineTestCase):
             self.assertFalse(ok)
             self.assertEqual(message, "missing required exports: g")
 
-    def test_darwin_shared_compilation_allows_plugin_undefined_symbols(self):
-        source = self.source("extern double dependency(void); double f(void) { return dependency(); }")
+    def test_darwin_shared_compilation_ignores_flag_text_in_paths(self):
+        source = self.source(
+            "extern double dependency(void); double f(void) { return dependency(); }",
+            "candidate-undefined.c")
         with patch("engine.funsearch.compile.sys.platform", "darwin"), \
                 patch("engine.funsearch.compile.run_command", return_value=(False, "compile failed")) as run:
-            compile_candidate(self.cfg, source, self.root / "darwin", "final")
+            compile_candidate(self.cfg, source, self.root / "darwin-undefined", "final")
         self.assertIn("-Wl,-undefined,dynamic_lookup", run.call_args.args[0])
 
     def test_try_compilation_uses_sanitizers(self):

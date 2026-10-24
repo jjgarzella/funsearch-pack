@@ -308,11 +308,16 @@ def compile_candidate(cfg, src_path, out_dir, mode):
     template = cfg.candidate.compile_try if mode == "try" else cfg.candidate.compile
     substitutions = {"{src}": shlex.quote(str(source)), "{out}": shlex.quote(str(library))}
     command = re.sub(r"\{src\}|\{out\}", lambda match: substitutions[match[0]], template)
-    if sys.platform == "darwin" and re.search(r"(?<!\S)-shared(?!\S)", command) \
-            and "-undefined" not in command:
-        # Linux permits unresolved references in a shared object by default.
-        # ld64 needs this explicit mode for the same plugin-style contract.
-        command += " -Wl,-undefined,dynamic_lookup"
+    if sys.platform == "darwin" and re.search(r"(?<!\S)-shared(?!\S)", command):
+        command_args = shlex.split(command)
+        has_undefined_mode = any(
+            arg == "-undefined" or
+            (arg.startswith("-Wl,") and "-undefined" in arg.split(","))
+            for arg in command_args)
+        if not has_undefined_mode:
+            # Linux permits unresolved references in a shared object by default.
+            # ld64 needs this explicit mode for the same plugin-style contract.
+            command += " -Wl,-undefined,dynamic_lookup"
     ok, log = run_command(command, directory, COMPILE_TIMEOUT_S)
     if ok and not library.is_file():
         ok, message = False, f"compiler did not produce {library}"
