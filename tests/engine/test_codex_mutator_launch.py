@@ -241,6 +241,28 @@ class CodexLaunchTests(unittest.TestCase):
             self.launch_with(effective=tamper)
         self.assertEqual(self.gc_calls, [])
 
+    def test_sandbox_probe_failures_refuse_before_claim(self):
+        failures = (
+            ("spawn", OSError("sandbox unavailable")),
+            ("nonzero exit", subprocess.CalledProcessError(
+                1, ["codex", "sandbox"], stderr="sandbox denied")),
+            ("timeout", subprocess.TimeoutExpired(["codex", "sandbox"], timeout=15)),
+        )
+        version = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.164.0\n")
+        for label, failure in failures:
+            with self.subTest(label=label), \
+                    patch("scripts.codex_mutator_launch.sandbox_backend", return_value="seatbelt"), \
+                    patch("scripts.codex_mutator_launch.subprocess.run",
+                          side_effect=[version, failure]) as run, \
+                    patch("scripts.codex_mutator_launch.read_effective", return_value=self.config), \
+                    patch("scripts.gc_lifecycle.gc") as gc, \
+                    patch("scripts.codex_mutator_launch.os.chdir") as chdir, \
+                    self.assertRaisesRegex(ValueError, "seatbelt sandbox preflight failed"):
+                launch(self.home, PACK)
+            self.assertEqual(run.call_count, 2)
+            gc.assert_not_called()
+            chdir.assert_not_called()
+
     def test_drain_needs_no_release(self):
         self.assertEqual(self.launch_with(json.dumps({"action": "drain"})), 0)
         self.assertEqual(self.gc_calls, [("hook", "--claim", "--drain-ack", "--json")])
