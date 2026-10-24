@@ -172,8 +172,13 @@ def broker(operation, argv, home, pack):
         if child != Path(argv[4]):
             raise ValueError("task changed before staging")
         child.write_bytes(source.read_bytes())
+    command = argv
+    if argv[:1] == [str(pack / "bin/funsearch")]:
+        # Its `#!/usr/bin/env python3` finds the supervisor's PATH python3,
+        # the system 3.9 on macOS; use this pinned interpreter (fs-python).
+        command = [sys.executable, *argv]
     try:
-        code, output = run_command(argv, home)
+        code, output = run_command(command, home)
     except BrokerTimeout as exc:
         # The command was started, so a denial would misreport its outcome.
         try:

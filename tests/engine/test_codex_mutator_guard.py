@@ -326,6 +326,21 @@ class CodexGuardTests(unittest.TestCase):
             handle(event, self.home, PACK)
         self.assertEqual(source.read_text(), "pending candidate")
 
+    def test_brokered_funsearch_uses_the_guard_interpreter(self):
+        # The supervisor's PATH python3 is the system 3.9 on macOS, and
+        # bin/funsearch's env shebang would pick it (attempt 5 tomllib error).
+        script = str(PACK / "bin/funsearch")
+        event = self.event(shlex.join([script, "next-task", str(self.run), "--slot", "1"]))
+        self.db.close_task(self.task.id)
+        with patch("scripts.codex_mutator_guard.run_command") as run:
+            run.return_value = (0, "TASK 3 path\n")
+            handle(event, self.home, PACK)
+        self.assertEqual(run.call_args.args[0], [sys.executable, script, "next-task", str(self.run), "--slot", "1"])
+        with patch("scripts.codex_mutator_guard.run_command") as run:
+            run.return_value = (0, "{}\n")
+            handle(self.event("gc hook --claim --drain-ack --json"), self.home, PACK)
+        self.assertEqual(run.call_args.args[0], ["gc", "hook", "--claim", "--drain-ack", "--json"])
+
     def test_native_config_excludes_projected_parent_mcp(self):
         import shutil
         if shutil.which("codex") is None:
