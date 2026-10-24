@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import random
+import select
 import signal
 import subprocess
 import sys
@@ -614,6 +615,51 @@ double f(void) {
         self.assertEqual(result["status"], "ERROR")
         self.assertIn("does not answer this request", result["msg"])
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    def test_pending_protocol_output_wins_a_race_with_clean_worker_exit(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        process = Mock(stdout=stdout, stdin=Mock(), poll=Mock(return_value=0),
+                       wait=Mock(return_value=0))
+        worker = Worker.__new__(Worker)
+        worker.process = process
+        worker._buffer = bytearray()
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._closed = False
+        worker._failure = None
+        worker._scores = 0
+        worker._send = Mock()
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        real_select = select.select
+        calls = 0
+
+        def miss_the_final_wakeup(readers, writers, exceptional, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # The child writes and exits just after select checks the pipe.
+                # The next pass must collect these bytes before classifying
+                # the already-observed clean exit.
+                writer.write(b'{"status":"OK","score":1e300,"sig":[],"msg":""}\n')
+                writer.close()
+                return [], [], []
+            return real_select(readers, writers, exceptional, 0)
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers.select.select",
+                      side_effect=miss_the_final_wakeup):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "worker protocol error: reply does not answer this request")
+        self.assertGreaterEqual(process.wait.call_count, 1)
 
     def test_forged_reply_with_the_request_token_is_detected(self):
         # The token is not in any request buffer, but a candidate sharing the

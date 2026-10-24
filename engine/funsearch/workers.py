@@ -140,8 +140,15 @@ class _StderrTail:
             return bytes(self.buffer[-STDERR_TAIL_BYTES:]).decode('utf-8', errors='replace').strip()
 
     def close(self):
-        self.stop.set()
-        self.thread.join()
+        # Disposal normally kills the worker process group first, so the
+        # reader can drain through EOF and retain the final diagnostics. An
+        # escaped descendant may keep the pipe open; bound that wait, then
+        # stop the reader (which checks the event at most one select interval
+        # after it is set).
+        self.thread.join(timeout=0.25)
+        if self.thread.is_alive():
+            self.stop.set()
+            self.thread.join()
 
 
 def _finite_number(value):
@@ -285,27 +292,91 @@ class Worker:
                 except OSError:
                     pass
 
+    def _pop_line(self):
+        newline = self._buffer.find(b"\n")
+        if newline < 0:
+            return None
+        line = bytes(self._buffer[:newline])
+        del self._buffer[:newline + 1]
+        return line.decode("utf-8")
+
+    def _drain_protocol_after_exit(self):
+        """Read protocol bytes already pending after the worker exits.
+
+        Do not wait for EOF: a descendant may have escaped the worker group
+        and still hold the pipe open. The response buffer remains capped at
+        the same 64 KiB limit as the normal line reader.
+        """
+        while True:
+            if len(self._buffer) > 65536:
+                raise WorkerError("worker response exceeds 64 KiB")
+            readable, _, _ = select.select([self.process.stdout], [], [], 0)
+            if not readable:
+                return
+            chunk = os.read(self.process.stdout.fileno(), 4096)
+            if not chunk:
+                return
+            self._buffer.extend(chunk)
+            if len(self._buffer) > 65536:
+                raise WorkerError("worker response exceeds 64 KiB")
+
+    def _line_after_eof(self):
+        if self.process.poll() is not None:
+            # poll() observed the exit; wait() collects the status before we
+            # interpret any bytes that were still queued in the pipe.
+            self.process.wait()
+            self._drain_protocol_after_exit()
+        line = self._pop_line()
+        if line is not None:
+            return line
+        if self._buffer:
+            raise WorkerError("worker response ended before newline")
+        raise EOFError
+
+    def _exit_snapshot(self):
+        """Reap an exited worker and collect its currently pending protocol bytes."""
+        process = getattr(self, "process", None)
+        if process is None:
+            return None, False
+        code = process.poll()
+        if code is None:
+            return None, False
+        code = process.wait()
+        self._drain_protocol_after_exit()
+        return code, bool(self._buffer)
+
+    def _exit_message(self, code):
+        watchdog_error = self._rss_watchdog_error
+        if watchdog_error and watchdog_error.startswith("worker resident-set limit exceeded"):
+            return watchdog_error
+        if code < 0:
+            return f"worker crashed: signal {-code}"
+        if code > 0:
+            return f"worker crashed: exit code {code}"
+        return watchdog_error or "worker crashed: exit code 0"
+
     def _line(self, deadline):
         while True:
-            newline = self._buffer.find(b"\n")
-            if newline >= 0:
-                line = bytes(self._buffer[:newline])
-                del self._buffer[:newline + 1]
-                return line.decode("utf-8")
+            line = self._pop_line()
+            if line is not None:
+                return line
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if self.process.poll() is not None:
+                    return self._line_after_eof()
                 raise TimeoutError
             readable, _, _ = select.select([self.process.stdout], [], [], min(remaining, 0.1))
             if readable:
                 chunk = os.read(self.process.stdout.fileno(), 4096)
                 if not chunk:
-                    raise EOFError
+                    return self._line_after_eof()
                 self._buffer.extend(chunk)
                 if len(self._buffer) > 65536:
                     raise WorkerError("worker response exceeds 64 KiB")
             elif self.process.poll() is not None:
-                # Descendants may keep stdout open after the worker crashes.
-                raise EOFError
+                # select() can observe an empty pipe just before the writer
+                # exits. Reap it and make one bounded pass for its last bytes.
+                return self._line_after_eof()
 
     def _send(self, request):
         self.process.stdin.write((request + "\n").encode("utf-8"))
@@ -454,17 +525,54 @@ class Worker:
             reply = _checked_reply(json.loads(self._line(deadline)), nonce)
             self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
         except TimeoutError:
-            result = _error(self._rss_watchdog_error or f"timeout after {timeout_s:g}s")
+            try:
+                exit_code, pending = self._exit_snapshot()
+            except (OSError, WorkerError) as exc:
+                result = _error(f"worker protocol error: {exc}")
+            else:
+                if pending:
+                    result = _error("worker protocol error: unexpected output after worker exit")
+                elif exit_code is not None:
+                    result = _error(self._exit_message(exit_code))
+                else:
+                    result = _error(self._rss_watchdog_error or f"timeout after {timeout_s:g}s")
         except (EOFError, BrokenPipeError):
-            result = _error(self._rss_watchdog_error or self._crash_message())
+            try:
+                exit_code, pending = self._exit_snapshot()
+            except (OSError, WorkerError) as exc:
+                result = _error(f"worker protocol error: {exc}")
+            else:
+                if pending:
+                    result = _error("worker protocol error: unexpected output after worker exit")
+                elif exit_code is not None:
+                    result = _error(self._exit_message(exit_code))
+                else:
+                    result = _error(self._rss_watchdog_error or self._crash_message())
         except (OSError, ValueError, WorkerError) as exc:
+            # If the protocol violation coincided with worker exit, collect
+            # the final bytes and reap before reporting it. The violation
+            # remains the primary classification.
+            try:
+                self._exit_snapshot()
+            except (OSError, WorkerError):
+                pass
             result = _error(f"worker protocol error: {exc}")
         else:
-            self._scores += 1
-            # Replace a leaking worker before the next request, not while
-            # this caller waits for the reply already in hand.
-            self._recycle_due = self._scores >= RECYCLE_SCORES
-            return reply
+            try:
+                exit_code, pending = self._exit_snapshot()
+            except (OSError, WorkerError) as exc:
+                result = _error(f"worker protocol error: {exc}")
+            else:
+                if pending:
+                    result = _error("worker protocol error: unexpected output after worker exit")
+                elif exit_code is not None:
+                    result = _error(self._exit_message(exit_code))
+                else:
+                    self._scores += 1
+                    # Replace a leaking worker before the next request, not
+                    # while this caller waits for the reply already in hand.
+                    self._recycle_due = self._scores >= RECYCLE_SCORES
+                    return reply
         self._dispose()
         result["msg"] = self._with_stderr(result["msg"])
         if self._closed:
