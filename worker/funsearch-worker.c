@@ -305,11 +305,7 @@ static int memory_limit(void)
         fatal(strerror(errno));
         return -1;
     }
-#if defined(__APPLE__)
-    return start_rss_watchdog(mb);
-#else
     return 0;
-#endif
 }
 
 int main(int argc, char **argv)

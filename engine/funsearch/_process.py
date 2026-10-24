@@ -50,14 +50,19 @@ def kill_group(process):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    except PermissionError:
+    except PermissionError as exc:
         # Darwin may refuse a process-group signal after the group leader has
-        # exited. Still reap the worker itself if it is alive.
+        # exited. Reap the worker if possible, then surface that descendants
+        # may remain because the process group was not signaled.
         if process.poll() is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
+        process.wait()
+        raise PermissionError(
+            f"could not signal process group {process.pid}; descendants may remain"
+        ) from exc
     process.wait()
 
 

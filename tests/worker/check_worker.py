@@ -220,6 +220,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("resident-set limit exceeded", stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin RLIMIT_AS fallback is macOS-only")
+    def test_memory_limit_falls_back_to_resident_set_limit(self):
+        process = self.start(evaluator="rss_eval", env={"FS_MEMORY_MB": "64"})
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libgood.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("using resident-set watchdog", stderr)
+        self.assertIn("resident-set limit exceeded", stderr)
+
     @unittest.skipUnless(sys.platform == "darwin", "Mach resident-set watchdog is macOS-only")
     def test_invalid_resident_memory_limit(self):
         process = self.start(env={"FS_MEMORY_RSS_MB": "bad"})
