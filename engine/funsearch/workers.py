@@ -233,11 +233,21 @@ class Worker:
         condition = getattr(self, "_rss_watchdog_condition", None)
         if condition is None:  # Worker.__new__ test doubles need no shared state.
             self.process = process
+            if process is not None:
+                self._rss_watchdog_error = None
+                with self._pool_termination_guard():
+                    self._pool_termination_reason = None
             return
         with condition:
             self.process = process
-            if process is not None and getattr(self, "_rss_watchdog_thread", None) is not None:
-                self._rss_watchdog_active = True
+            if process is not None:
+                # Watchdog diagnostics belong to one process incarnation; a
+                # replacement must not inherit its predecessor's failure.
+                self._rss_watchdog_error = None
+                with self._pool_termination_guard():
+                    self._pool_termination_reason = None
+                if getattr(self, "_rss_watchdog_thread", None) is not None:
+                    self._rss_watchdog_active = True
             condition.notify_all()
 
     def _deactivate_rss_watchdog_for(self, process):
@@ -316,6 +326,8 @@ class Worker:
             with self._rss_watchdog_condition:
                 if self._rss_watchdog_stop:
                     return
+                if self.process is not process or process.poll() is not None:
+                    continue
                 self._rss_watchdog_error = failure
                 self._record_pool_termination(failure)
             try:

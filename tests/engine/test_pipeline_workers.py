@@ -292,17 +292,74 @@ class WorkerWatchdogTests(unittest.TestCase):
         )
         set_active.assert_not_called()
 
+    def test_watchdog_failure_for_replaced_worker_is_discarded(self):
+        worker = Worker.__new__(Worker)
+        old_process = Mock(pid=123, poll=Mock(return_value=None))
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
+
+        class ReplaceBeforeTerminationCheck:
+            def __init__(self):
+                self.lock = threading.Condition()
+                self.enters = 0
+                self.waits = 0
+
+            def __enter__(self):
+                self.enters += 1
+                if self.enters == 2:
+                    # The old process passes the watchdog's pre-lock identity
+                    # check, then a replacement wins the condition lock.
+                    with self.lock:
+                        worker.process = replacement
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self.lock.release()
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits >= 2:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        worker._rss_watchdog_condition = ReplaceBeforeTerminationCheck()
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_lock = threading.Lock()
+        worker._pool_termination_reason = None
+        worker._rss_limit_bytes = 1024
+        worker.process = old_process
+
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=OSError(errno.EIO, "simulated proc_pidinfo failure")), \
+                patch("engine.funsearch.workers.kill_group") as kill_group:
+            worker._watch_worker_rss()
+
+        self.assertIs(worker.process, replacement)
+        self.assertIsNone(worker._rss_watchdog_error)
+        self.assertIsNone(worker._pool_termination_reason)
+        kill_group.assert_not_called()
+
     def test_starting_replacement_reactivates_watchdog(self):
         worker = Worker.__new__(Worker)
         worker._rss_watchdog_condition = threading.Condition()
         worker._rss_watchdog_thread = object()
         worker._rss_watchdog_active = False
+        worker._rss_watchdog_error = "stale worker failure"
+        worker._pool_termination_lock = threading.Lock()
+        worker._pool_termination_reason = "stale worker failure"
         replacement = Mock(pid=456, poll=Mock(return_value=None))
 
         worker._set_process(replacement)
 
         self.assertIs(worker.process, replacement)
         self.assertTrue(worker._rss_watchdog_active)
+        self.assertIsNone(worker._rss_watchdog_error)
+        self.assertIsNone(worker._pool_termination_reason)
 
     def test_query_failure_during_activation_is_preserved(self):
         worker = Worker.__new__(Worker)
