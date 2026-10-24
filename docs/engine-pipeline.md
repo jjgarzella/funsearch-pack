@@ -74,9 +74,12 @@ creation with `RLIMIT_NPROC=0`, so descendants cannot bypass the worker-local
 RSS cap; startup fails if that restriction cannot be installed. The watchdog
 samples every 20 ms while evaluator or candidate code runs, waits efficiently
 between requests, and samples once per second while idle. A failed Mach query
-aborts the worker instead of silently disabling enforcement. Linux continues
-to enforce `RLIMIT_AS`. Apple ASan trials use this same RSS path because Apple's
-runtime does not enforce `hard_rss_limit_mb`.
+aborts the worker instead of silently disabling enforcement. The engine also
+samples the worker PID through Darwin `libproc` at the same cadence, so an
+`exec` that replaces the worker image cannot discard the RSS cap; a failed
+process query or overage kills the worker group. Linux continues to enforce
+`RLIMIT_AS`. Apple ASan trials use this same RSS path because Apple's runtime
+does not enforce `hard_rss_limit_mb`.
 The engine sends a blank request and reads its `bad request` response to ensure
 `fs_init` has finished; the C protocol has no spontaneous ready response.
 A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup

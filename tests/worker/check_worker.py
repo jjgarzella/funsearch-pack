@@ -245,6 +245,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(process.returncode, 3)
         self.assertEqual(json.loads(stdout), {"fatal": "invalid FS_MEMORY_RSS_MB"})
 
+    @unittest.skipUnless(sys.platform == "darwin", "Mach RSS watchdog is macOS-only")
+    @unittest.skipIf(sys.platform == "darwin" and os.geteuid() == 0,
+                     "RSS fallback requires a nonprivileged worker")
+    def test_mach_task_info_failure_aborts_worker(self):
+        worker = BUILD / "funsearch-worker-task-info-failure"
+        subprocess.run([
+            *shlex.split(os.environ.get("CC", "cc")),
+            "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-DFUNSEARCH_TEST_TASK_INFO_FAILURE",
+            "-I", str(ROOT / "include"),
+            "-o", str(worker), str(ROOT / "worker" / "funsearch-worker.c"),
+        ], check=True, capture_output=True)
+        process = subprocess.Popen(
+            [str(worker), str(BUILD / "libtoy_eval.so"), "query-failure"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "FS_MEMORY_RSS_MB": "64"},
+        )
+        self.addCleanup(self.cleanup, process)
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libloop.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("resident-set watchdog failed: task_info returned", stderr)
+
     def test_required_symbol_and_evaluator_load_failure(self):
         for evaluator in ("nosym", "nonexistent"):
             process = self.start(evaluator=evaluator)

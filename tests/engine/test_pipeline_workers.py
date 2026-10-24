@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import json
 import os
 from pathlib import Path
 import random
 import signal
 import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -615,6 +617,33 @@ double f(void) {
         self.assertLessEqual(public.items(), env.items())
         self.assertEqual(env["KEEP_ME"], "1")
         self.assertIn("PATH", env)
+
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_limit_survives_candidate_direct_exec(self):
+        self.cfg.evaluator.memory_mb = 64
+        python = json.dumps(sys.executable)
+        script = json.dumps(
+            "import mmap,time\n"
+            "size=256*1024*1024\n"
+            "memory=mmap.mmap(-1,size)\n"
+            "for i in range(0,size,4096): memory[i]=1\n"
+            "time.sleep(10)\n"
+        )
+        source = self.source(
+            "#include <unistd.h>\n"
+            "extern char **environ;\n"
+            f"double f(void) {{ char *const args[] = {{{python}, \"-c\", {script}, NULL}};\n"
+            f"    execve({python}, args, environ);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "exec-rss", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        result = pool.score(library, 10)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("worker resident-set limit exceeded", result["msg"])
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
     def test_startup_failures_include_evaluator_stderr(self):
         init = self.source("#!/bin/sh\necho 'julia: no depot' >&2\nexit 3\n", "init-fail")

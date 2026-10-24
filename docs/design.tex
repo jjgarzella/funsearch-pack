@@ -334,8 +334,10 @@ watchdog. That fallback sets \code{RLIMIT\_NPROC} to zero to prevent
 subprocesses from escaping the worker-local cap, and fails startup if the
 restriction cannot be installed. The watchdog samples every 20 ms while
 evaluator or candidate code runs and once per second while idle; a failed Mach
-query aborts the worker. It must not install SIGSEGV handlers: embedded Julia
-uses its own.
+query aborts the worker. The Python engine also samples the worker PID through
+Darwin \code{libproc} at the same cadence, so an \code{exec} cannot discard the
+RSS cap; a failed process query or overage kills the worker group. It must not
+install SIGSEGV handlers: embedded Julia uses its own.
 The daemon creates separate final and sanitizer
 pools, each with \code{search.workers} processes started eagerly and kept for
 the whole run, so a run holds twice that many resident evaluators and an idle

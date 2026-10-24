@@ -293,6 +293,19 @@ static void rss_watchdog_set_active(int active)
         rss_watchdog_abort("cannot unlock watchdog state");
 }
 
+static kern_return_t rss_watchdog_task_info(mach_task_basic_info_data_t *info,
+                                            mach_msg_type_number_t *count)
+{
+#if defined(FUNSEARCH_TEST_TASK_INFO_FAILURE)
+    (void)info;
+    (void)count;
+    return KERN_FAILURE;
+#else
+    return task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                     (task_info_t)info, count);
+#endif
+}
+
 static int prevent_subprocesses(void)
 {
     /* Child tasks would otherwise escape this worker's Mach RSS accounting. */
@@ -316,11 +329,10 @@ static void *rss_watchdog(void *unused)
     unsigned long seen_generation = 0;
     (void)unused;
     for (;;) {
-        mach_task_basic_info_data_t info;
+        mach_task_basic_info_data_t info = {0};
         mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
         int active = rss_watchdog_wait_state(&seen_generation);
-        kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                                         (task_info_t)&info, &count);
+        kern_return_t result = rss_watchdog_task_info(&info, &count);
         if (result != KERN_SUCCESS) {
             char message[96];
             snprintf(message, sizeof(message), "task_info returned %d", result);

@@ -1,14 +1,80 @@
 """Bounded shell commands shared by the compilation pipeline."""
 
+import ctypes
 from fnmatch import fnmatchcase
 import os
 import select
 import signal
 import subprocess
+import sys
 import threading
 
 
 LOG_BYTES = 4096
+_PROC_PIDTASKINFO = 4
+
+
+class _DarwinProcTaskInfo(ctypes.Structure):
+    """Public libproc task counters; the first two fields include resident bytes."""
+
+    _fields_ = [
+        ("pti_virtual_size", ctypes.c_uint64),
+        ("pti_resident_size", ctypes.c_uint64),
+        ("pti_total_user", ctypes.c_uint64),
+        ("pti_total_system", ctypes.c_uint64),
+        ("pti_threads_user", ctypes.c_uint64),
+        ("pti_threads_system", ctypes.c_uint64),
+        ("pti_policy", ctypes.c_int32),
+        ("pti_faults", ctypes.c_int32),
+        ("pti_pageins", ctypes.c_int32),
+        ("pti_cow_faults", ctypes.c_int32),
+        ("pti_messages_sent", ctypes.c_int32),
+        ("pti_messages_received", ctypes.c_int32),
+        ("pti_syscalls_mach", ctypes.c_int32),
+        ("pti_syscalls_unix", ctypes.c_int32),
+        ("pti_csw", ctypes.c_int32),
+        ("pti_threadnum", ctypes.c_int32),
+        ("pti_numrunning", ctypes.c_int32),
+        ("pti_priority", ctypes.c_int32),
+    ]
+
+
+_proc_pidinfo = None
+_proc_pidinfo_library = None
+_proc_pidinfo_error = None
+_proc_pidinfo_lock = threading.Lock()
+
+
+def process_resident_bytes(pid):
+    """Return a Darwin process's resident size, including after it execs."""
+    global _proc_pidinfo, _proc_pidinfo_library, _proc_pidinfo_error
+    if sys.platform != "darwin":
+        raise OSError("process resident-size queries are only available on macOS")
+    if _proc_pidinfo is None and _proc_pidinfo_error is None:
+        with _proc_pidinfo_lock:
+            if _proc_pidinfo is None and _proc_pidinfo_error is None:
+                try:
+                    _proc_pidinfo_library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+                    _proc_pidinfo = _proc_pidinfo_library.proc_pidinfo
+                    _proc_pidinfo.argtypes = (
+                        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                        ctypes.POINTER(_DarwinProcTaskInfo), ctypes.c_int,
+                    )
+                    _proc_pidinfo.restype = ctypes.c_int
+                except (OSError, AttributeError) as exc:
+                    _proc_pidinfo_error = str(exc)
+    if _proc_pidinfo is None:
+        raise OSError(f"cannot load libproc proc_pidinfo: {_proc_pidinfo_error}")
+
+    info = _DarwinProcTaskInfo()
+    ctypes.set_errno(0)
+    written = _proc_pidinfo(
+        pid, _PROC_PIDTASKINFO, 0, ctypes.byref(info), ctypes.sizeof(_DarwinProcTaskInfo))
+    if written != ctypes.sizeof(_DarwinProcTaskInfo):
+        error = ctypes.get_errno()
+        detail = os.strerror(error) if error else f"returned {written} bytes"
+        raise OSError(error, f"proc_pidinfo(PROC_PIDTASKINFO) failed: {detail}")
+    return int(info.pti_resident_size)
 
 
 # Candidate and evaluator code runs as the host user, in evaluator workers and

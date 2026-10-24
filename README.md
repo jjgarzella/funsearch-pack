@@ -344,7 +344,9 @@ Best-effort hygiene for trusted local experiments:
   creation in that worker so children cannot escape the worker-local memory
   cap. The watchdog samples every 20 ms while evaluator or candidate code runs
   and once per second while idle; a failed Mach sample aborts the worker, and
-  startup fails if subprocess creation cannot be disabled.
+  startup fails if subprocess creation cannot be disabled. The engine also
+  samples the worker PID through `libproc`, so replacing the worker with `exec`
+  cannot discard the RSS cap; a failed query or overage kills the worker.
 - Each scoring request carries a random token that a reply must echo, and
   the worker never keeps the request in a stdio buffer. After each reply the
   engine sends a `SYNC` barrier; any extra line before its echo (such as the
