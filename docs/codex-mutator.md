@@ -164,8 +164,12 @@ wait + 280 s + margin). They need host access
 to the engine DB and Gas City; that access is **outside the model shell
 sandbox**. The hook replaces the model shell command with a trusted command
 that reads a private output receipt and returns the original exit status
-(including RUN_OVER=3 and rejection=4) and then deletes the receipt; setup
-removes any receipts left by an interrupted session. This avoids granting broad write roots
+(including RUN_OVER=3 and rejection=4). The relay must not delete the
+receipt: Codex 0.164 rejects any command containing `rm -f` ("rm -f style
+commands are not permitted") after the hook has already run the brokered
+command, so the model would lose its output. Instead each hook call deletes
+receipts older than 300 s under the slot lock, and setup removes any receipts
+left by an earlier session. This avoids granting broad write roots
 or broad model commands to make the shared engine work. The receipt is
 not another model-accessible file operation. The selected native sandbox
 applies to the receipt-reading shell and local candidate patch.

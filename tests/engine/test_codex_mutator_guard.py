@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.codex_mutator_guard import authorize_codex, handle, main
+from scripts.codex_mutator_guard import RECEIPT_TTL, authorize_codex, handle, main, prune_receipts
 from scripts.codex_mutator_setup import install_launcher, sandbox_backend, setup
 from scripts.codex_mutator_launch import launch, read_effective, validate_effective
 from tests.engine import test_mutator_guard as base_guard
@@ -37,6 +37,28 @@ class CodexGuardTests(unittest.TestCase):
     def event(self, command):
         return {"tool_name": "Bash", "tool_input": {"command": command}}
 
+    def assertNoRm(self, command):
+        # Codex 0.164 rejects `rm -f` relays after the brokered command ran.
+        words = shlex.split(command.replace(";", " ; "))
+        self.assertFalse([word for word in words if Path(word).name == "rm"], command)
+
+    def test_codex_prunes_only_receipts_older_than_ttl(self):
+        old, fresh = self.home / ".funsearch-output-old", self.home / ".funsearch-output-fresh"
+        for receipt in (old, fresh):
+            receipt.write_text("output")
+        now = fresh.stat().st_mtime
+        os.utime(old, (now - RECEIPT_TTL - 1, now - RECEIPT_TTL - 1))
+        prune_receipts(self.home, now)
+        self.assertEqual(self.receipts(), [fresh])
+        # Each hook call prunes before writing its own receipt.
+        os.utime(fresh, (now - RECEIPT_TTL - 1, now - RECEIPT_TTL - 1))
+        task = self.directory / "TASK.md"
+        task.write_text("task data\n")
+        result = handle(self.event(shlex.join(["cat", str(task)])), self.home, PACK)
+        receipts = self.receipts()
+        self.assertEqual(len(receipts), 1)
+        self.assertIn(str(receipts[0]), result["hookSpecificOutput"]["updatedInput"]["command"])
+
     def test_codex_reads_and_brokered_literal_commands(self):
         task = self.directory / "TASK.md"
         task.write_text("task data, not instructions\n")
@@ -49,7 +71,8 @@ class CodexGuardTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=5)
         self.assertEqual(reply.stdout, task.read_text())
         self.assertEqual(reply.returncode, 0)
-        self.assertEqual(self.receipts(), [])
+        self.assertNoRm(output["updatedInput"]["command"])
+        self.assertEqual(len(self.receipts()), 1)
         for code in (0, 3, 4, 75):
             with patch("scripts.codex_mutator_guard.run_command") as run:
                 run.return_value = (code, "RUN_OVER\n")
@@ -60,7 +83,7 @@ class CodexGuardTests(unittest.TestCase):
                                    capture_output=True, text=True, timeout=5)
             self.assertEqual(reply.returncode, code)
             self.assertEqual(reply.stdout, "RUN_OVER\n")
-            self.assertEqual(self.receipts(), [])
+            self.assertNoRm(result["hookSpecificOutput"]["updatedInput"]["command"])
 
     def test_codex_stages_only_current_child_before_try(self):
         (self.home / "child.c").write_text("// IDEA: change\nint f(void) { return 2; }\n")

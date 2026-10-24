@@ -31,6 +31,9 @@ from scripts.mutator_guard import authorize, context, literal_command, open_task
 LOCK_WAIT = 5
 BROKER_TIMEOUT = 280
 OUTCOME_UNKNOWN = 75
+# Codex runs the relay right after the hook returns. A parallel call in the
+# same slot must not delete a receipt before its relay has read it.
+RECEIPT_TTL = 300
 # Credentials are for the model process only; the brokered CLI compiles
 # candidate C in-process for try/submit.
 CREDENTIALS = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
@@ -212,11 +215,22 @@ def slot_lock(home, wait=LOCK_WAIT):
         os.close(fd)
 
 
+def prune_receipts(home, now=None):
+    now = time.time() if now is None else now
+    for receipt in home.glob(".funsearch-output-*"):
+        try:
+            if now - receipt.lstat().st_mtime > RECEIPT_TTL:
+                receipt.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def handle(event, home, pack):
     # The lock covers authorization, the brokered command and its receipt.
     # Codex applies a permitted patch only after this hook returns, so a
     # parallel try/submit can still stage an older child.c (see docs).
     with slot_lock(home):
+        prune_receipts(home)
         operation, argv = authorize_codex(event, home, pack)
         if operation == "patch":
             # INFERENCE from the 0.160 binary: a bare "allow" without
@@ -228,10 +242,13 @@ def handle(event, home, pack):
         receipt.write_text(body)
         receipt.chmod(0o600)
     path = shlex.quote(str(receipt))
+    # Codex 0.164 rejects any relay containing `rm -f` ("rm -f style commands
+    # are not permitted") after the brokered command already ran, so the
+    # relay only reads; prune_receipts and setup delete receipts.
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "allow",
         "permissionDecisionReason": "FunSearch Codex task policy",
-        "updatedInput": {"command": f"/bin/cat {path}; /bin/rm -f {path}; exit {code}"}}}
+        "updatedInput": {"command": f"/bin/cat {path}; exit {code}"}}}
 
 
 def main():
