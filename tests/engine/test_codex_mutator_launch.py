@@ -120,6 +120,31 @@ class CodexLaunchTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 validate_effective(config, self.home, backend="seatbelt")
 
+    def test_linux_workspace_write_preflight_rejects_tampered_settings(self):
+        setup(self.home, PACK, backend="linux")
+        config = tomllib.loads((self.home / ".funsearch-codex-home/config.toml").read_text())
+        validate_effective(config, self.home, backend="linux")
+
+        cases = []
+        for key, value in (("network_access", True), ("writable_roots", ["/"]),
+                           ("exclude_slash_tmp", False), ("exclude_tmpdir_env_var", False)):
+            changed = copy.deepcopy(config)
+            changed["sandbox_workspace_write"][key] = value
+            cases.append((key, changed))
+        changed = copy.deepcopy(config)
+        changed["sandbox_mode"] = "danger-full-access"
+        cases.append(("sandbox_mode", changed))
+        changed = copy.deepcopy(config)
+        changed["default_permissions"] = PERMISSION_PROFILE
+        cases.append(("default_permissions", changed))
+        changed = copy.deepcopy(config)
+        changed["permissions"] = {PERMISSION_PROFILE: {"extends": ":workspace"}}
+        cases.append(("permissions", changed))
+
+        for label, changed in cases:
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_effective(changed, self.home, backend="linux")
+
     def test_launch_requires_shared_chatgpt_auth_before_claiming(self):
         for label, value in (("missing", None), ("malformed", "{fake-secret"),
                              ("api", '{"auth_mode":"api","tokens":{"access_token":"fake-secret"}}'),

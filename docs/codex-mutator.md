@@ -57,18 +57,20 @@ Never put credentials in the problem or prompt, and never print them. Private
 receipts/config remain sensitive host files and should follow the city's
 work-directory retention policy.
 
-**Refresh and symlink behavior remain unverified.** Static inspection of the
-0.160 binary strings found `login/src/auth/storage.rs`, file/keyring storage
-messages, and the `allow_symlinked_codex_home` configuration key. No
-`auth.json`-specific symlink refusal or refresh replacement was found. Strings
+**Refresh and symlink replacement semantics remain unverified.** Static
+inspection of the 0.160 binary strings found `login/src/auth/storage.rs`,
+file/keyring storage messages, and the `allow_symlinked_codex_home`
+configuration key. This does not establish 0.164 behavior. A one-session
+0.164 smoke in a temporary private home authenticated through the symlink and
+left it pointing at the shared file; the shared file's modification time did
+not change, so the session did not exercise refresh. Strings and this session
 do not establish whether refresh writes through the symlink in place or
 replaces it (for example, with a temporary file and rename), nor the exact
 scope of the home-symlink setting. The private home itself remains a real
-directory; only `auth.json` is linked. Confidence is high that the listed
-strings exist, but low on refresh semantics or absence of refusal from this
-evidence alone. The separate smoke test must check that the private auth file
-remains linked and that the shared login still works after a mutator session;
-unit/config tests do not establish this. There is no copy-based fallback.
+directory; only `auth.json` is linked. Before production, the separate smoke
+test must verify the link and shared login after a mutator session that
+exercises refresh. Unit/config tests do not establish this. There is no
+copy-based fallback.
 See [official credential storage documentation](https://learn.chatgpt.com/docs/auth)
 for the storage modes and automatic refresh; it does not specify symlink write
 semantics.
