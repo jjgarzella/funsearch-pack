@@ -102,7 +102,18 @@ selects the correct rig even from another cwd. Direct hook launches require
 The engine needs Python 3.11 or later, a C compiler, the ASan runtime,
 `make`, and `flock`; its Python modules use only the standard library.
 Every run initializes an ASan trial pool, even if no `try` calls are planned.
-Check that `${CC:-cc} -print-file-name=libasan.so` resolves to an existing file.
+Check that the compiler can locate the platform's ASan runtime:
+
+```sh
+if [ "$(uname -s)" = Darwin ]; then
+  asan_runtime=libclang_rt.asan_osx_dynamic.dylib
+else
+  asan_runtime=libasan.so
+fi
+asan_path=$(${CC:-cc} "-print-file-name=$asan_runtime")
+test -f "$asan_path"
+```
+
 `CC` selects this runtime discovery compiler independently of
 `candidate.compile_try`. It also works without Gas City:
 
