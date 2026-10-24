@@ -238,6 +238,8 @@ class Worker:
                 self._rss_watchdog_condition.wait(timeout=interval)
                 if self._rss_watchdog_stop:
                     return
+                if not self._rss_watchdog_active:
+                    continue
 
             process = self.process
             if process is None or process.poll() is not None:
@@ -416,6 +418,10 @@ class Worker:
                 raise WorkerError("worker is closed")
             if self._failure is not None:
                 raise self._failure
+            # Clear the previous request's result before waking the watchdog.
+            # Otherwise a fast query failure can set this field just before
+            # _score_locked clears it, losing the failure and timing out.
+            self._rss_watchdog_error = None
             self._set_rss_watchdog_active(True)
             try:
                 return self._score_locked(path, timeout_s)
@@ -423,7 +429,6 @@ class Worker:
                 self._set_rss_watchdog_active(False)
 
     def _score_locked(self, path, timeout_s):
-        self._rss_watchdog_error = None
         if self._recycle_due or self._stale_output():
             # Outside the deadline: the replacement's fs_init is not
             # charged to this candidate's timeout. Late output (an earlier
@@ -441,7 +446,7 @@ class Worker:
             reply = _checked_reply(json.loads(self._line(deadline)), nonce)
             self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
         except TimeoutError:
-            result = _error(f"timeout after {timeout_s:g}s")
+            result = _error(self._rss_watchdog_error or f"timeout after {timeout_s:g}s")
         except (EOFError, BrokenPipeError):
             result = _error(self._rss_watchdog_error or self._crash_message())
         except (OSError, ValueError, WorkerError) as exc:

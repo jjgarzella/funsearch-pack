@@ -24,8 +24,9 @@ class ProcessGroupTests(unittest.TestCase):
         for leader_status, should_kill in ((None, True), (-signal.SIGKILL, False)):
             with self.subTest(leader_status=leader_status):
                 process = Mock(pid=123, poll=Mock(return_value=leader_status))
-                with patch("engine.funsearch._process.os.killpg",
-                           side_effect=PermissionError("permission denied")) as killpg:
+                with patch("engine.funsearch._process.sys.platform", "linux"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=PermissionError("permission denied")) as killpg:
                     with self.assertRaisesRegex(
                             PermissionError,
                             r"could not signal process group 123; descendants may remain"):
@@ -38,6 +39,48 @@ class ProcessGroupTests(unittest.TestCase):
                 else:
                     process.kill.assert_not_called()
                 process.wait.assert_called_once_with()
+
+    def test_darwin_permission_error_for_zombie_only_group_is_ignored(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=False) as has_live_members:
+            kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        self.assertTrue(all(call.args == (123, signal.SIGKILL) for call in killpg.call_args_list))
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_permission_error_for_live_group_is_reported(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=True) as has_live_members:
+            with self.assertRaisesRegex(
+                    PermissionError,
+                    r"could not signal process group 123; descendants may remain"):
+                kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_group_inspection_distinguishes_zombies_from_live_members(self):
+        from engine.funsearch._process import _darwin_group_has_live_members
+
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 Z+\n 456 S\n")):
+            self.assertFalse(_darwin_group_has_live_members(123))
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 S+\n")):
+            self.assertTrue(_darwin_group_has_live_members(123))
 
 
 PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
@@ -310,9 +353,9 @@ void fs_fini(void) {
         self.assertTrue(ok, log)
         result = pool.score(library, 20)
         self.assertEqual(result["status"], "ERROR")
-        # ASan aborts at hard_rss_limit_mb rather than letting RSS grow.
-        self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
-                        result["msg"][:200])
+        # On Darwin, the native Mach watchdog and the parent process monitor
+        # enforce the same cap; either can observe the overage first.
+        self.assertIn("resident-set limit exceeded", result["msg"])
         self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
 
     def test_oversized_reply_without_newline_fails_promptly(self):
@@ -459,6 +502,8 @@ double f(void) {
         result = self.pool().score(library, 5)
         self.assertNotEqual(result["status"], "OK", result)
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_late_protocol_output_is_not_charged_to_the_next_request(self):
         source = self.source(r"""#define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -704,6 +749,8 @@ double f(void) {
                 with self.assertRaisesRegex(WorkerError, "after 3 attempts.*startup timeout"):
                     self.pool()
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_timeout_kills_process_group(self):
         marker = self.root / "child-pid"
         source = self.source('''#include <unistd.h>

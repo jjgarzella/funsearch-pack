@@ -110,6 +110,32 @@ def worker_environment(cfg, extra_env=None):
                                  cfg.evaluator.env)
 
 
+def _darwin_group_has_live_members(pgid):
+    """Return whether ``ps`` sees a non-zombie process in a Darwin group.
+
+    macOS can report EPERM for a process group containing only zombies. A
+    failed query is unknown rather than evidence that the group is gone.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pgid=,stat="], capture_output=True, text=True,
+            timeout=1, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            return None
+        try:
+            group_id = int(fields[0])
+        except ValueError:
+            return None
+        if group_id == pgid and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
 def kill_group(process):
     """Kill descendants too, including when the group leader already exited."""
     try:
@@ -117,15 +143,24 @@ def kill_group(process):
     except ProcessLookupError:
         pass
     except PermissionError as exc:
-        # Darwin may refuse a process-group signal after the group leader has
-        # exited. Reap the worker if possible, then surface that descendants
-        # may remain because the process group was not signaled.
+        # Reap the group leader before checking again. On Darwin, killpg may
+        # return EPERM when the only remaining group members are zombies.
         if process.poll() is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
         process.wait()
+        if sys.platform == "darwin":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                if _darwin_group_has_live_members(process.pid) is False:
+                    return
+            else:
+                return
         raise PermissionError(
             f"could not signal process group {process.pid}; descendants may remain"
         ) from exc
