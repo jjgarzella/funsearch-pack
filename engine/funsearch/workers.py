@@ -228,6 +228,28 @@ class Worker:
             self._rss_watchdog_active = active
             self._rss_watchdog_condition.notify_all()
 
+    def _set_process(self, process):
+        """Publish a worker process and start watching it during startup."""
+        condition = getattr(self, "_rss_watchdog_condition", None)
+        if condition is None:  # Worker.__new__ test doubles need no shared state.
+            self.process = process
+            return
+        with condition:
+            self.process = process
+            if process is not None and getattr(self, "_rss_watchdog_thread", None) is not None:
+                self._rss_watchdog_active = True
+            condition.notify_all()
+
+    def _deactivate_rss_watchdog_for(self, process):
+        """Stop watching an exited process only while it is still current."""
+        if getattr(self, "_rss_watchdog_thread", None) is None:
+            return
+        with self._rss_watchdog_condition:
+            if self.process is not process:
+                return
+            self._rss_watchdog_active = False
+            self._rss_watchdog_condition.notify_all()
+
     def _pool_termination_guard(self):
         lock = getattr(self, "_pool_termination_lock", None)
         if lock is None:  # Worker.__new__ test doubles need no shared state.
@@ -274,9 +296,9 @@ class Worker:
                 if exc.errno == errno.ESRCH:
                     # proc_pidinfo reports ESRCH after the worker exits. Stop
                     # watching this process and let the scoring path reap it
-                    # and classify its exit or signal.
-                    if self.process is process:
-                        self._set_rss_watchdog_active(False)
+                    # and classify its exit or signal. The identity check and
+                    # deactivation share a lock with process replacement.
+                    self._deactivate_rss_watchdog_for(process)
                     continue
                 if process.poll() is not None:
                     continue
@@ -440,7 +462,7 @@ class Worker:
                 kill_group(self.process)
                 self.process.stdin.close()
                 self.process.stdout.close()
-                self.process = None
+                self._set_process(None)
         if self._stderr is not None:
             self._stderr.close()
         self._buffer.clear()
@@ -468,11 +490,12 @@ class Worker:
                 raise WorkerError("worker is closed")
             try:
                 self._stderr = None
-                self.process = subprocess.Popen(
+                process = subprocess.Popen(
                     [str(self.binary), str(self.evaluator_so), self.instance],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     env=self.env, start_new_session=True, bufsize=0)
-                self._stderr = _StderrTail(self.process.stderr)
+                self._set_process(process)
+                self._stderr = _StderrTail(process.stderr)
                 if self._closed:
                     self._dispose()
                     raise WorkerError("worker is closed")

@@ -274,7 +274,7 @@ class WorkerWatchdogTests(unittest.TestCase):
 
         def query_resident_bytes(pid):
             if pid == old_process.pid:
-                worker.process = replacement
+                worker._set_process(replacement)
                 raise OSError(errno.ESRCH, "No such process")
             return 512
 
@@ -291,6 +291,18 @@ class WorkerWatchdogTests(unittest.TestCase):
             [old_process.pid, replacement.pid],
         )
         set_active.assert_not_called()
+
+    def test_starting_replacement_reactivates_watchdog(self):
+        worker = Worker.__new__(Worker)
+        worker._rss_watchdog_condition = threading.Condition()
+        worker._rss_watchdog_thread = object()
+        worker._rss_watchdog_active = False
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
+
+        worker._set_process(replacement)
+
+        self.assertIs(worker.process, replacement)
+        self.assertTrue(worker._rss_watchdog_active)
 
     def test_query_failure_during_activation_is_preserved(self):
         worker = Worker.__new__(Worker)
@@ -852,6 +864,28 @@ double f(void) {
         self.assertEqual(result["status"], "ERROR")
         self.assertEqual(result["msg"], "timeout after 1s")
         self.assertNotIn("protocol error", result["msg"])
+
+    def test_line_leaves_readable_reply_pending_at_deadline(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        reply = b'{"status":"OK","score":1,"sig":[],"msg":""}\n'
+        writer.write(reply)
+
+        worker = Worker.__new__(Worker)
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+
+        with patch("engine.funsearch.workers.time.monotonic", side_effect=[1.0, 2.0]), \
+                patch("engine.funsearch.workers.select.select",
+                      return_value=([stdout], [], [])):
+            with self.assertRaises(TimeoutError):
+                worker._line(2.0)
+
+        self.assertEqual(worker._buffer, bytearray())
+        self.assertEqual(os.read(stdout.fileno(), len(reply)), reply)
 
     def test_sync_timeout_with_pending_bytes_remains_a_protocol_error(self):
         worker = Worker.__new__(Worker)
