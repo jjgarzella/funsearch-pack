@@ -268,8 +268,8 @@ class WorkerWatchdogTests(unittest.TestCase):
         worker._rss_watchdog_stop = False
         worker._rss_watchdog_error = None
         worker._rss_limit_bytes = 1024
-        old_process = Mock(pid=123)
-        replacement = Mock(pid=456)
+        old_process = Mock(pid=123, poll=Mock(return_value=None))
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
         worker.process = old_process
 
         def query_resident_bytes(pid):
@@ -766,6 +766,41 @@ double f(void) {
         self.assertEqual(result["status"], "ERROR")
         self.assertEqual(result["msg"], "worker protocol error: reply does not answer this request")
         self.assertGreaterEqual(process.wait.call_count, 1)
+
+    def test_valid_score_reply_is_rejected_when_worker_exits_cleanly(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._scores = 0
+        worker._send = Mock()
+        worker._line = Mock(return_value=json.dumps({
+            "nonce": "score-nonce",
+            "status": "OK",
+            "score": 1.5,
+            "sig": [],
+            "msg": "",
+        }))
+        worker._sync = Mock()
+        worker._exit_snapshot = Mock(return_value=(0, False))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers.secrets.token_hex",
+                      return_value="score-nonce"):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "worker crashed: exit code 0")
+        self.assertEqual(worker._scores, 0)
+        worker._send.assert_called_once_with("SCORE #score-nonce candidate.so")
+        worker._sync.assert_called_once()
+        worker._dispose.assert_called_once_with()
+        worker._start.assert_called_once_with()
 
     def test_late_score_reply_after_deadline_remains_a_timeout(self):
         worker = Worker.__new__(Worker)
