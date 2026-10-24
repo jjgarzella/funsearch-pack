@@ -140,9 +140,10 @@ and reaping each process and cleaning up its pipes and stderr reader.
 Try workers need the ASan runtime before loading sanitized candidate libraries.
 `try_worker_env(cfg)` asks the configured compiler for its ASan runtime and
 preloads it (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS). It sets
-`ASAN_OPTIONS` to
-`detect_leaks=0:abort_on_error=1:hard_rss_limit_mb=M:max_allocation_size_mb=M:allocator_may_return_null=1`
-with `M = evaluator.memory_mb`. It also removes `FS_MEMORY_MB`:
+`ASAN_OPTIONS` with `detect_leaks=0`, `abort_on_error=1`,
+`max_allocation_size_mb=M`, and `allocator_may_return_null=1`, with
+`M = evaluator.memory_mb`; Linux also sets `hard_rss_limit_mb=M`. It removes
+`FS_MEMORY_MB`:
 ASan reserves a large virtual shadow address range, so the normal `RLIMIT_AS`
 limit makes sanitizer workers abort with `Failed to mmap` before evaluation.
 The normal pool retains the configured address-space limit where supported.
