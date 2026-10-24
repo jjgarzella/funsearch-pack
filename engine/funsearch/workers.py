@@ -377,15 +377,17 @@ class Worker:
 
     def _line(self, deadline):
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
             line = self._pop_line()
             if line is not None:
                 return line
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if self.process.poll() is not None:
-                    return self._line_after_eof()
-                raise TimeoutError
             readable, _, _ = select.select([self.process.stdout], [], [], min(remaining, 0.1))
+            if time.monotonic() >= deadline:
+                # A reply first observed at or after the deadline must remain
+                # pending for the caller's timeout path to classify.
+                raise TimeoutError
             if readable:
                 chunk = os.read(self.process.stdout.fileno(), 4096)
                 if not chunk:
