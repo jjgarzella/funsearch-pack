@@ -7,6 +7,7 @@ import random
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -81,6 +82,93 @@ class ProcessGroupTests(unittest.TestCase):
         with patch("engine.funsearch._process.subprocess.run",
                    return_value=Mock(stdout=" 123 Z\n 123 S+\n")):
             self.assertTrue(_darwin_group_has_live_members(123))
+
+    def test_darwin_unknown_group_inspection_preserves_permission_error(self):
+        unknown_queries = (
+            ("ps unavailable", OSError("ps unavailable")),
+            ("ps timeout", subprocess.TimeoutExpired(["ps"], 1)),
+            ("malformed output", Mock(stdout="not a ps row\n")),
+        )
+        for label, query_result in unknown_queries:
+            with self.subTest(query_result=label):
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                permission_error = PermissionError("permission denied")
+                is_error = isinstance(query_result, BaseException)
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=permission_error) as killpg, \
+                        patch("engine.funsearch._process.subprocess.run",
+                              side_effect=query_result if is_error else None,
+                              return_value=None if is_error else query_result) as ps:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain") as caught:
+                        kill_group(process)
+
+                self.assertIs(caught.exception.__cause__, permission_error)
+                self.assertEqual(killpg.call_count, 2)
+                ps.assert_called_once()
+                process.wait.assert_called_once_with()
+
+
+class WorkerWatchdogTests(unittest.TestCase):
+    def test_query_failure_during_activation_is_preserved(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=EOFError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_crash_message", return_value="worker crashed"), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
+    def test_idle_watchdog_wake_does_not_inspect_worker(self):
+        worker = Worker.__new__(Worker)
+
+        class WakeTwiceThenStop:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits == 2:
+                    worker._rss_watchdog_stop = True
+
+        condition = WakeTwiceThenStop()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = False
+        worker._rss_watchdog_stop = False
+        worker.process = Mock(pid=123, poll=Mock(return_value=None))
+        worker._rss_limit_bytes = 1024
+
+        with patch("engine.funsearch.workers.process_resident_bytes", return_value=0) as resident_bytes:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        worker.process.poll.assert_not_called()
+        resident_bytes.assert_not_called()
 
 
 PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
