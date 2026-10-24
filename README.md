@@ -102,7 +102,18 @@ selects the correct rig even from another cwd. Direct hook launches require
 The engine needs Python 3.11 or later, a C compiler, the ASan runtime,
 `make`, and `flock`; its Python modules use only the standard library.
 Every run initializes an ASan trial pool, even if no `try` calls are planned.
-Check that `${CC:-cc} -print-file-name=libasan.so` resolves to an existing file.
+Check that the compiler can locate the platform's ASan runtime:
+
+```sh
+if [ "$(uname -s)" = Darwin ]; then
+  asan_runtime=libclang_rt.asan_osx_dynamic.dylib
+else
+  asan_runtime=libasan.so
+fi
+asan_path=$(${CC:-cc} "-print-file-name=$asan_runtime")
+test -f "$asan_path"
+```
+
 `CC` selects this runtime discovery compiler independently of
 `candidate.compile_try`. It also works without Gas City:
 
@@ -343,9 +354,18 @@ Best-effort hygiene for trusted local experiments:
   compilation or prevent arbitrary filesystem reads or diagnostic disclosure.
 - Candidate code (evaluator workers and the export check's library load)
   gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
-  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
-  the problem's `evaluator.env`. Gas City identity, store scope, agent sockets
-  and credentials are not passed on unless a pattern names them.
+  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`,
+  plus the patterns in the problem's `evaluator.env`.
+  Gas City identity, store scope, agent sockets and credentials are not passed
+  on unless a pattern names them.
+- On macOS, the worker uses a Mach resident-set watchdog when `RLIMIT_AS` fails
+  with `EINVAL` or an Apple ASan trial requests an RSS limit. It disables subprocess
+  creation in that worker so children cannot escape the worker-local memory
+  cap. The watchdog samples every 20 ms while evaluator or candidate code runs
+  and once per second while idle; a failed Mach sample aborts the worker, and
+  startup fails if subprocess creation cannot be disabled. The engine also
+  samples the worker PID through `libproc`, so replacing the worker with `exec`
+  cannot discard the RSS cap; a failed query or overage kills the worker.
 - Each scoring request carries a random token that a reply must echo, and
   the worker never keeps the request in a stdio buffer. After each reply the
   engine sends a `SYNC` barrier; any extra line before its echo (such as the

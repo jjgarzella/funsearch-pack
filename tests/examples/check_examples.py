@@ -5,14 +5,18 @@ from pathlib import Path
 import re
 import resource
 import select
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from engine.funsearch.compile import try_worker_env
+from engine.funsearch.config import load_config
+
 WORKER = ROOT / "build/funsearch-worker"
 EVALUATOR = ROOT / "examples/cap-set/evaluator/libcapset.so"
 BUILD = ROOT / "build/examples"
@@ -85,7 +89,7 @@ class CapSetTests(unittest.TestCase):
             self.assertEqual(seed, repeated)  # A Julia exception must be recoverable.
             files = sorted(Path(directory).glob("*.txt"))
             self.assertEqual(len(files), 9)
-            checked = subprocess.run(["python3", str(CHECKER), directory],
+            checked = subprocess.run([sys.executable, str(CHECKER), directory],
                                      text=True, capture_output=True, timeout=10)
             self.assertEqual(checked.returncode, 0, checked.stderr)
             init_times = re.findall(r"capset fs_init ([0-9.]+) s", process.stderr)
@@ -102,15 +106,9 @@ class CapSetTests(unittest.TestCase):
         self.assertEqual(process.stdout, "")
 
     def test_asan_trial_worker_can_initialize_julia(self):
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        runtime = subprocess.check_output([*compiler, "-print-file-name=libasan.so"],
-                                          text=True, timeout=10).strip()
-        self.assertTrue(Path(runtime).is_file())
-        preload = runtime + (" " + os.environ["LD_PRELOAD"] if os.environ.get("LD_PRELOAD") else "")
-        process = self.run_worker(["seed-asan"], env={
-            "LD_PRELOAD": preload, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1",
-            "FS_MEMORY_MB": None, "LBT_USE_RTLD_DEEPBIND": None,
-        })
+        extra_env = try_worker_env(load_config(ROOT / "examples/cap-set"))
+        extra_env["LBT_USE_RTLD_DEEPBIND"] = None
+        process = self.run_worker(["seed-asan"], env=extra_env)
         self.assertEqual(process.returncode, 0, process.stderr)
         result = json.loads(process.stdout)
         self.assertEqual(result["status"], "OK")
@@ -174,13 +172,13 @@ class CapSetTests(unittest.TestCase):
                 with self.subTest(name=name):
                     path = root / name
                     path.write_text(content)
-                    process = subprocess.run(["python3", str(CHECKER), str(path)],
+                    process = subprocess.run([sys.executable, str(CHECKER), str(path)],
                                              text=True, capture_output=True, timeout=5)
                     self.assertEqual(process.returncode, 1)
                     self.assertIn("INVALID", process.stderr)
             empty = root / "empty-directory"
             empty.mkdir()
-            process = subprocess.run(["python3", str(CHECKER), str(empty)],
+            process = subprocess.run([sys.executable, str(CHECKER), str(empty)],
                                      text=True, capture_output=True, timeout=5)
             self.assertEqual(process.returncode, 1)
 

@@ -14,7 +14,7 @@ class SlotTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         self.store = self.home / "bead.json"
         self.calls = self.home / "calls.jsonl"
         self.row = {"id": "fs-slot.1", "status": "in_progress", "assignee": "session-1",

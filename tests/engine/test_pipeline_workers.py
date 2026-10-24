@@ -1,19 +1,315 @@
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import json
 import os
 from pathlib import Path
 import random
 import signal
 import subprocess
+import sys
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from engine.funsearch._process import kill_group
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
     RECYCLE_SCORES, STDERR_LIMIT_BYTES, STDERR_TAIL_BYTES, EvaluatorInitError, Worker,
     WorkerError, WorkerPool, _StderrTail, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_permission_error_reaps_worker_and_reports_possible_descendants(self):
+        for leader_status, should_kill in ((None, True), (-signal.SIGKILL, False)):
+            with self.subTest(leader_status=leader_status):
+                process = Mock(pid=123, poll=Mock(return_value=leader_status))
+                with patch("engine.funsearch._process.sys.platform", "linux"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=PermissionError("permission denied")) as killpg:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain"):
+                        kill_group(process)
+
+                killpg.assert_called_once_with(123, signal.SIGKILL)
+                process.poll.assert_called_once_with()
+                if should_kill:
+                    process.kill.assert_called_once_with()
+                else:
+                    process.kill.assert_not_called()
+                process.wait.assert_called_once_with()
+
+    def test_darwin_permission_error_for_zombie_only_group_is_ignored(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=False) as has_live_members:
+            kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        self.assertTrue(all(call.args == (123, signal.SIGKILL) for call in killpg.call_args_list))
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_retries_group_signal_after_reaping(self):
+        for retry_error in (None, ProcessLookupError("group no longer exists")):
+            with self.subTest(retry_error=retry_error):
+                events = []
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                process.wait.side_effect = lambda: events.append("wait")
+                attempts = 0
+
+                def killpg(pgid, sig):
+                    nonlocal attempts
+                    self.assertEqual((pgid, sig), (123, signal.SIGKILL))
+                    attempts += 1
+                    if attempts == 1:
+                        events.append("initial")
+                        raise PermissionError("permission denied")
+                    events.append("retry")
+                    if retry_error is not None:
+                        raise retry_error
+
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg", side_effect=killpg):
+                    kill_group(process)
+
+                self.assertEqual(events, ["initial", "wait", "retry"])
+                self.assertEqual(attempts, 2)
+                process.poll.assert_called_once_with()
+                process.wait.assert_called_once_with()
+
+    def test_darwin_permission_error_for_live_group_is_reported(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=True) as has_live_members:
+            with self.assertRaisesRegex(
+                    PermissionError,
+                    r"could not signal process group 123; descendants may remain"):
+                kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_group_inspection_distinguishes_zombies_from_live_members(self):
+        from engine.funsearch._process import _darwin_group_has_live_members
+
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 Z+\n 456 S\n")):
+            self.assertFalse(_darwin_group_has_live_members(123))
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 S+\n")):
+            self.assertTrue(_darwin_group_has_live_members(123))
+
+    def test_darwin_unknown_group_inspection_preserves_permission_error(self):
+        unknown_queries = (
+            ("ps unavailable", OSError("ps unavailable")),
+            ("ps timeout", subprocess.TimeoutExpired(["ps"], 1)),
+            ("malformed output", Mock(stdout="not a ps row\n")),
+        )
+        for label, query_result in unknown_queries:
+            with self.subTest(query_result=label):
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                permission_error = PermissionError("permission denied")
+                is_error = isinstance(query_result, BaseException)
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=permission_error) as killpg, \
+                        patch("engine.funsearch._process.subprocess.run",
+                              side_effect=query_result if is_error else None,
+                              return_value=None if is_error else query_result) as ps:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain") as caught:
+                        kill_group(process)
+
+                self.assertIs(caught.exception.__cause__, permission_error)
+                self.assertEqual(killpg.call_count, 2)
+                ps.assert_called_once()
+                process.wait.assert_called_once_with()
+
+
+class WorkerWatchdogTests(unittest.TestCase):
+    def test_query_failure_during_activation_is_preserved(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=EOFError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_crash_message", return_value="worker crashed"), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
+    def test_query_failure_overrides_score_timeout(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=TimeoutError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
+    def test_idle_watchdog_wake_does_not_inspect_worker(self):
+        worker = Worker.__new__(Worker)
+
+        class WakeTwiceThenStop:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits == 2:
+                    worker._rss_watchdog_stop = True
+
+        condition = WakeTwiceThenStop()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = False
+        worker._rss_watchdog_stop = False
+        worker.process = Mock(pid=123, poll=Mock(return_value=None))
+        worker._rss_limit_bytes = 1024
+
+        with patch("engine.funsearch.workers.process_resident_bytes", return_value=0) as resident_bytes:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        worker.process.poll.assert_not_called()
+        resident_bytes.assert_not_called()
+
+
+PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    const struct mach_header *raw = _dyld_get_image_header(0);
+    if (!raw || raw->magic != MH_MAGIC_64) return 0;
+    const struct mach_header_64 *header = (const struct mach_header_64 *)raw;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    const struct load_command *command = (const struct load_command *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if (command->cmdsize < sizeof(*command)) return 0;
+        if (command->cmd == LC_SEGMENT_64 &&
+            command->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if ((segment->initprot & (VM_PROT_READ | VM_PROT_WRITE)) ==
+                (VM_PROT_READ | VM_PROT_WRITE)) {
+                const unsigned char *base = (const unsigned char *)
+                    ((uintptr_t)segment->vmaddr + (uintptr_t)slide);
+                if (scan(base, (size_t)segment->vmsize, context)) return 1;
+            }
+        }
+        command = (const struct load_command *)((const char *)command + command->cmdsize);
+    }
+    return 0;
+}
+#else
+#include <link.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+struct main_data_scan_request { main_data_scan_fn scan; void *context; };
+static int scan_main_image(struct dl_phdr_info *image, size_t info_size, void *opaque) {
+    (void)info_size;
+    if (image->dlpi_name[0]) return 0;
+    struct main_data_scan_request *request = (struct main_data_scan_request *)opaque;
+    for (int i = 0; i < image->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *segment = &image->dlpi_phdr[i];
+        if (segment->p_type != PT_LOAD ||
+            (segment->p_flags & (PF_R | PF_W)) != (PF_R | PF_W)) continue;
+        const unsigned char *base = (const unsigned char *)
+            ((uintptr_t)image->dlpi_addr + (uintptr_t)segment->p_vaddr);
+        if (request->scan(base, (size_t)segment->p_memsz, request->context)) return 1;
+    }
+    return 0;
+}
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    struct main_data_scan_request request = {scan, context};
+    return dl_iterate_phdr(scan_main_image, &request);
+}
+#endif
+static int nonce_region(const unsigned char *bytes, size_t size, void *opaque) {
+    char *token = (char *)opaque;
+    for (size_t i = 1; i + 33 <= size; ++i) {
+        if (!bytes[i - 1] && !bytes[i + 32] &&
+            strspn((const char *)bytes + i, "0123456789abcdef") == 32) {
+            memcpy(token, bytes + i, 32);
+            token[32] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+static int find_main_nonce(char token[33]) {
+    token[0] = '\0';
+    return scan_main_data(nonce_region, token);
+}
+struct byte_search { const unsigned char *needle; size_t length; };
+static int bytes_region(const unsigned char *bytes, size_t size, void *opaque) {
+    const struct byte_search *search = (const struct byte_search *)opaque;
+    if (search->length > size) return 0;
+    for (size_t i = 0; i + search->length <= size; ++i)
+        if (!memcmp(bytes + i, search->needle, search->length)) return 1;
+    return 0;
+}
+static int main_data_contains(const void *needle, size_t length) {
+    struct byte_search search = {(const unsigned char *)needle, length};
+    return scan_main_data(bytes_region, &search);
+}
+"""
 
 
 class StderrTailTests(unittest.TestCase):
@@ -190,16 +486,22 @@ void fs_fini(void) {
         cfg.evaluator.memory_mb = 256
         pool = WorkerPool(cfg, self.evaluator(), "n=1", 1, try_worker_env(cfg))
         self.addCleanup(pool.close)
-        source = self.source("#include <stdlib.h>\n#include <string.h>\n"
+        source = self.source("#include <stdlib.h>\n"
                              "double f(void) { for (;;) { char *p = malloc(32 << 20);"
-                             " if (!p) return -1; memset(p, 1, 32 << 20); } }")
+                             " if (!p) return -1; volatile char *pages = p;"
+                             " for (size_t i = 0; i < (32u << 20); i += 4096) pages[i] = 1; } }")
         ok, library, log = compile_candidate(cfg, source, self.root / "hog", "try")
         self.assertTrue(ok, log)
         result = pool.score(library, 20)
         self.assertEqual(result["status"], "ERROR")
-        # ASan aborts at hard_rss_limit_mb rather than letting RSS grow.
-        self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
-                        result["msg"][:200])
+        if sys.platform == "darwin":
+            # The native Mach watchdog and parent monitor enforce the same
+            # cap; either can observe the overage first.
+            self.assertIn("resident-set limit exceeded", result["msg"])
+        else:
+            # ASan enforces hard_rss_limit_mb on Linux.
+            self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
+                            result["msg"][:200])
         self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
 
     def test_oversized_reply_without_newline_fails_promptly(self):
@@ -272,28 +574,11 @@ double f(void) {
         # The token is not in any request buffer, but a candidate sharing the
         # process can still find the worker's copy. The SYNC barrier then sees
         # the worker's own reply as a second line.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <stdio.h>
-#include <string.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 double f(void) {
-    if (!dl_iterate_phdr(scan, NULL)) return -1;
+    if (!find_main_nonce(token)) return -1;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     return 0;
@@ -313,24 +598,13 @@ double f(void) {
         # dlopen runs constructors, so the request buffer must no longer hold
         # "SCORE #<token>" by then. The needle is built at run time so the
         # candidate's own read-only literal cannot match.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
-#include <string.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 static int found = -1;
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+__attribute__((constructor)) static void probe(void) {
     char needle[8] = "SCORE ";
-    (void)size; (void)data;
     needle[6] = '#';
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        if (memmem((const char *)(info->dlpi_addr + ph->p_vaddr), ph->p_memsz, needle, 7))
-            return 1;
-    }
-    return 0;
+    found = main_data_contains(needle, 7);
 }
-__attribute__((constructor)) static void probe(void) { found = dl_iterate_phdr(scan, NULL); }
 double f(void) { return found == 0 ? 2 : found; }
 """)
         ok, library, log = compile_candidate(self.cfg, source, self.root / "ctor-scan", "final")
@@ -343,33 +617,16 @@ double f(void) { return found == 0 ? 2 : found; }
     # isolation tracked as mc-v8f3.5; drop expectedFailure when that lands.
     @unittest.expectedFailure
     def test_candidate_reading_stdin_cannot_answer_the_barrier(self):
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <pthread.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 static void *steal(void *unused) {
     char line[128];
     size_t n = 0;
     (void)unused;
-    if (!dl_iterate_phdr(scan, NULL)) return NULL;
+    if (!find_main_nonce(token)) return NULL;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     while (n + 1 < sizeof(line) && read(0, line + n, 1) == 1 && line[n] != '\n')
@@ -391,6 +648,8 @@ double f(void) {
         result = self.pool().score(library, 5)
         self.assertNotEqual(result["status"], "OK", result)
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_late_protocol_output_is_not_charged_to_the_next_request(self):
         source = self.source(r"""#define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -539,7 +798,8 @@ double f(void) {
         private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
                    "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent", "FS_STORE": "/x",
                    "SOLVER_LICENSE": "l"}
-        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "SOLVER_LICENSE_FILE": "/opt/l"}
+        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "DYLD_LIBRARY_PATH": "/opt/dyld",
+                  "SOLVER_LICENSE_FILE": "/opt/l"}
         self.cfg.evaluator.env = ["SOLVER_*_FILE"]
         with patch.dict(os.environ, {**private, **public}):
             pool = self.pool(extra_env={"KEEP_ME": "1"})
@@ -548,6 +808,56 @@ double f(void) {
         self.assertLessEqual(public.items(), env.items())
         self.assertEqual(env["KEEP_ME"], "1")
         self.assertIn("PATH", env)
+
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_limit_survives_candidate_direct_exec(self):
+        self.cfg.evaluator.memory_mb = 64
+        python = json.dumps(sys.executable)
+        script = json.dumps(
+            "import mmap,time\n"
+            "size=256*1024*1024\n"
+            "memory=mmap.mmap(-1,size)\n"
+            "for i in range(0,size,4096): memory[i]=1\n"
+            "time.sleep(10)\n"
+        )
+        source = self.source(
+            "#include <unistd.h>\n"
+            "extern char **environ;\n"
+            f"double f(void) {{ char *const args[] = {{{python}, \"-c\", {script}, NULL}};\n"
+            f"    execve({python}, args, environ);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "exec-rss", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        result = pool.score(library, 10)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("worker resident-set limit exceeded", result["msg"])
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_query_failure_aborts_live_worker(self):
+        self.cfg.evaluator.memory_mb = 64
+        should_fail = False
+        failed_once = False
+
+        def resident_bytes(pid):
+            nonlocal failed_once
+            if should_fail and pid != os.getpid() and not failed_once:
+                failed_once = True
+                raise OSError("simulated proc_pidinfo failure")
+            return 0
+
+        with patch("engine.funsearch.workers.process_resident_bytes", side_effect=resident_bytes):
+            pool = self.pool()
+            should_fail = True
+            result = pool.score(self.candidate("loop"), 5)
+            self.assertTrue(failed_once)
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("worker resident-set query failed: simulated proc_pidinfo failure",
+                          result["msg"])
+            self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
     def test_startup_failures_include_evaluator_stderr(self):
         init = self.source("#!/bin/sh\necho 'julia: no depot' >&2\nexit 3\n", "init-fail")
@@ -585,6 +895,8 @@ double f(void) {
                 with self.assertRaisesRegex(WorkerError, "after 3 attempts.*startup timeout"):
                     self.pool()
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_timeout_kills_process_group(self):
         marker = self.root / "child-pid"
         source = self.source('''#include <unistd.h>

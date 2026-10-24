@@ -14,7 +14,7 @@ library = "evaluator/libcapset.so"
 timeout_s = 30
 memory_mb = 4096
 # Workers get an allowlisted environment; keep Julia's and this evaluator's.
-env = ["JULIA_*", "FS_CAPSET_*"]
+env = ["JULIA_*", "FS_CAPSET_*", "DYLD_LIBRARY_PATH"]
 
 [search]
 islands = 4

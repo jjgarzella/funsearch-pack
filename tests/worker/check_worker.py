@@ -6,6 +6,7 @@ import resource
 import selectors
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -111,7 +112,9 @@ class WorkerTests(unittest.TestCase):
                 source.write_text(f"double f(void) {{ return {value}; }}\n")
                 subprocess.run([
                     *shlex.split(os.environ.get("CC", "cc")),
-                    "-shared", "-fPIC", "-o", str(library), str(source),
+                    "-shared", "-fPIC",
+                    *( ["-Wl,-undefined,dynamic_lookup"] if sys.platform == "darwin" else [] ),
+                    "-o", str(library), str(source),
                 ], check=True, capture_output=True)
                 self.assertEqual(self.receive(process, f"SCORE {library}")["score"], value)
 
@@ -194,15 +197,77 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.receive(process, "SCORE /" + "a" * 70000)["msg"], "bad request")
         self.assertEqual(self.score(process, "good")["score"], 3.5)
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "macOS shared-cache reservations prevent a stable RLIMIT_AS assertion")
     def test_memory_limit(self):
         process = self.start("limit", "edge_eval", {"FS_MEMORY_MB": "128"})
         result = self.score(process, "good")
         self.assertEqual(result["score"], 128)
         self.assertEqual(result["sig"], [128])
+
+    def test_invalid_memory_limit(self):
         process = self.start(env={"FS_MEMORY_MB": "bad"})
         stdout, _ = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 3)
         self.assertEqual(json.loads(stdout), {"fatal": "invalid FS_MEMORY_MB"})
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach resident-set watchdog is macOS-only")
+    def test_resident_memory_limit(self):
+        process = self.start(evaluator="rss_eval", env={"FS_MEMORY_RSS_MB": "64"})
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libgood.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("resident-set limit exceeded", stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin RSS fallback is macOS-only")
+    def test_resident_memory_fallback_disallows_subprocesses(self):
+        process = self.start(evaluator="spawn_eval", env={"FS_MEMORY_RSS_MB": "64"})
+        result = self.score(process, "good")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["score"], 1)
+        self.assertEqual(result["msg"], "fork denied")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin RLIMIT_AS fallback is macOS-only")
+    def test_memory_limit_falls_back_to_resident_set_limit(self):
+        process = self.start(evaluator="rss_eval", env={"FS_MEMORY_MB": "64"})
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libgood.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("using resident-set watchdog", stderr)
+        self.assertIn("resident-set limit exceeded", stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach resident-set watchdog is macOS-only")
+    def test_invalid_resident_memory_limit(self):
+        process = self.start(env={"FS_MEMORY_RSS_MB": "bad"})
+        stdout, _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 3)
+        self.assertEqual(json.loads(stdout), {"fatal": "invalid FS_MEMORY_RSS_MB"})
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach RSS watchdog is macOS-only")
+    @unittest.skipIf(sys.platform == "darwin" and os.geteuid() == 0,
+                     "RSS fallback requires a nonprivileged worker")
+    def test_mach_task_info_failure_aborts_worker(self):
+        worker = BUILD / "funsearch-worker-task-info-failure"
+        subprocess.run([
+            *shlex.split(os.environ.get("CC", "cc")),
+            "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-DFUNSEARCH_TEST_TASK_INFO_FAILURE",
+            "-I", str(ROOT / "include"),
+            "-o", str(worker), str(ROOT / "worker" / "funsearch-worker.c"),
+        ], check=True, capture_output=True)
+        process = subprocess.Popen(
+            [str(worker), str(BUILD / "libtoy_eval.so"), "query-failure"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "FS_MEMORY_RSS_MB": "64"},
+        )
+        self.addCleanup(self.cleanup, process)
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libloop.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("resident-set watchdog failed: task_info returned", stderr)
 
     def test_required_symbol_and_evaluator_load_failure(self):
         for evaluator in ("nosym", "nonexistent"):

@@ -9,10 +9,11 @@ import secrets
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 
-from ._process import kill_group, run_command, worker_environment
+from ._process import kill_group, process_resident_bytes, run_command, worker_environment
 
 
 START_TIMEOUT_S = 60
@@ -29,6 +30,21 @@ STDERR_TAIL_BYTES = 2048
 # reply that arrives just before the deadline still gets this long for it.
 SYNC_TIMEOUT_S = 5
 _build_lock = threading.Lock()
+
+
+def _darwin_memory_limit_bytes(env):
+    if sys.platform != "darwin":
+        return None
+    value = env.get("FS_MEMORY_RSS_MB")
+    if value is None:
+        value = env.get("FS_MEMORY_MB")
+    try:
+        memory_mb = int(value)
+    except (TypeError, ValueError):
+        return None
+    if memory_mb < 0:
+        return None
+    return memory_mb * 1024 * 1024
 
 
 def start_budget_s():
@@ -174,7 +190,92 @@ class Worker:
         self._failure = None
         self._scores = 0
         self._recycle_due = False
-        self._start()
+        self._rss_limit_bytes = _darwin_memory_limit_bytes(self.env)
+        self._rss_watchdog_condition = threading.Condition()
+        self._rss_watchdog_active = self._rss_limit_bytes is not None
+        self._rss_watchdog_stop = False
+        self._rss_watchdog_error = None
+        self._rss_watchdog_thread = None
+        if self._rss_limit_bytes is not None:
+            try:
+                process_resident_bytes(os.getpid())
+            except OSError as exc:
+                raise WorkerError(f"cannot inspect worker resident set: {exc}") from exc
+            self._rss_watchdog_thread = threading.Thread(
+                target=self._watch_worker_rss, daemon=True)
+            self._rss_watchdog_thread.start()
+        try:
+            self._start()
+        except BaseException:
+            self._stop_rss_watchdog()
+            raise
+        self._set_rss_watchdog_active(False)
+
+    def _set_rss_watchdog_active(self, active):
+        if self._rss_watchdog_thread is None:
+            return
+        with self._rss_watchdog_condition:
+            self._rss_watchdog_active = active
+            self._rss_watchdog_condition.notify_all()
+
+    def _stop_rss_watchdog(self):
+        thread = self._rss_watchdog_thread
+        if thread is None:
+            return
+        with self._rss_watchdog_condition:
+            self._rss_watchdog_stop = True
+            self._rss_watchdog_condition.notify_all()
+        if thread is not threading.current_thread():
+            thread.join()
+        self._rss_watchdog_thread = None
+
+    def _watch_worker_rss(self):
+        while True:
+            with self._rss_watchdog_condition:
+                if self._rss_watchdog_stop:
+                    return
+                interval = 0.02 if self._rss_watchdog_active else 1.0
+                self._rss_watchdog_condition.wait(timeout=interval)
+                if self._rss_watchdog_stop:
+                    return
+                if not self._rss_watchdog_active:
+                    continue
+
+            process = self.process
+            if process is None or process.poll() is not None:
+                continue
+            try:
+                resident_bytes = process_resident_bytes(process.pid)
+            except OSError as exc:
+                if process.poll() is not None:
+                    continue
+                failure = f"worker resident-set query failed: {exc}"
+            else:
+                if resident_bytes <= self._rss_limit_bytes:
+                    continue
+                failure = (
+                    "worker resident-set limit exceeded "
+                    f"({resident_bytes} > {self._rss_limit_bytes} bytes)"
+                )
+
+            if self.process is not process or process.poll() is not None:
+                continue
+            with self._rss_watchdog_condition:
+                if self._rss_watchdog_stop:
+                    return
+                self._rss_watchdog_error = failure
+            try:
+                kill_group(process)
+            except OSError:
+                # kill_group already falls back to killing the leader when a
+                # process-group signal is denied; keep the monitor alive if a
+                # platform-specific error still escapes that path.
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                except OSError:
+                    pass
 
     def _line(self, deadline):
         while True:
@@ -317,46 +418,57 @@ class Worker:
                 raise WorkerError("worker is closed")
             if self._failure is not None:
                 raise self._failure
-            if self._recycle_due or self._stale_output():
-                # Outside the deadline: the replacement's fs_init is not
-                # charged to this candidate's timeout. Late output (an earlier
-                # candidate's leftover thread or child, or a dead worker's EOF)
-                # is never read as this request's reply.
-                self._recycle()
-                if self._failure is not None:
-                    raise self._failure
-                if self.process is None:
-                    raise WorkerError("worker is closed")
-            deadline = time.monotonic() + timeout_s
-            nonce = secrets.token_hex(16)
+            # Clear the previous request's result before waking the watchdog.
+            # Otherwise a fast query failure can set this field just before
+            # _score_locked clears it, losing the failure and timing out.
+            self._rss_watchdog_error = None
+            self._set_rss_watchdog_active(True)
             try:
-                self._send(f"SCORE #{nonce} {path}")
-                reply = _checked_reply(json.loads(self._line(deadline)), nonce)
-                self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
-            except TimeoutError:
-                result = _error(f"timeout after {timeout_s:g}s")
-            except (EOFError, BrokenPipeError):
-                result = _error(self._crash_message())
-            except (OSError, ValueError, WorkerError) as exc:
-                result = _error(f"worker protocol error: {exc}")
-            else:
-                self._scores += 1
-                # Replace a leaking worker before the next request, not while
-                # this caller waits for the reply already in hand.
-                self._recycle_due = self._scores >= RECYCLE_SCORES
-                return reply
-            self._dispose()
-            result["msg"] = self._with_stderr(result["msg"])
+                return self._score_locked(path, timeout_s)
+            finally:
+                self._set_rss_watchdog_active(False)
+
+    def _score_locked(self, path, timeout_s):
+        if self._recycle_due or self._stale_output():
+            # Outside the deadline: the replacement's fs_init is not
+            # charged to this candidate's timeout. Late output (an earlier
+            # candidate's leftover thread or child, or a dead worker's EOF)
+            # is never read as this request's reply.
+            self._recycle()
+            if self._failure is not None:
+                raise self._failure
+            if self.process is None:
+                raise WorkerError("worker is closed")
+        deadline = time.monotonic() + timeout_s
+        nonce = secrets.token_hex(16)
+        try:
+            self._send(f"SCORE #{nonce} {path}")
+            reply = _checked_reply(json.loads(self._line(deadline)), nonce)
+            self._sync(max(deadline, time.monotonic() + SYNC_TIMEOUT_S))
+        except TimeoutError:
+            result = _error(self._rss_watchdog_error or f"timeout after {timeout_s:g}s")
+        except (EOFError, BrokenPipeError):
+            result = _error(self._rss_watchdog_error or self._crash_message())
+        except (OSError, ValueError, WorkerError) as exc:
+            result = _error(f"worker protocol error: {exc}")
+        else:
+            self._scores += 1
+            # Replace a leaking worker before the next request, not while
+            # this caller waits for the reply already in hand.
+            self._recycle_due = self._scores >= RECYCLE_SCORES
+            return reply
+        self._dispose()
+        result["msg"] = self._with_stderr(result["msg"])
+        if self._closed:
+            return _error("evaluation interrupted at shutdown")
+        try:
+            self._start()
+        except WorkerError as exc:
             if self._closed:
                 return _error("evaluation interrupted at shutdown")
-            try:
-                self._start()
-            except WorkerError as exc:
-                if self._closed:
-                    return _error("evaluation interrupted at shutdown")
-                self._failure = exc
-                raise
-            return result
+            self._failure = exc
+            raise
+        return result
 
     def _recycle(self):
         """Replace a healthy worker after its fixed score budget."""
@@ -378,7 +490,10 @@ class Worker:
     def close(self):
         with self._lock:
             self._closed = True
-            self._dispose(graceful=True)
+            try:
+                self._dispose(graceful=True)
+            finally:
+                self._stop_rss_watchdog()
 
     def __enter__(self):
         return self

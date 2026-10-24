@@ -59,8 +59,9 @@ class EndToEndTests(PipelineTestCase):
             script.write_text("import os,sys\nfrom pathlib import Path\n"
                               "assert sys.argv[2] == os.environ['FS_RUN_DIR']\n"
                               "Path(sys.argv[2], sys.argv[1]).touch()\n")
-            args += ["--on-start", f"python3 {shlex.quote(str(script))} started.marker",
-                     "--on-finish", f"python3 {shlex.quote(str(script))} finished.marker"]
+            python = shlex.quote(sys.executable)
+            args += ["--on-start", f"{python} {shlex.quote(str(script))} started.marker",
+                     "--on-finish", f"{python} {shlex.quote(str(script))} finished.marker"]
         output = self.cli(*args)
         self.assertEqual(output, f"{run_id} {root}")
         self.assertTrue((root / "engine.pid").exists())
@@ -479,12 +480,20 @@ class EndToEndTests(PipelineTestCase):
             with db.transaction():
                 evaluation = db.enqueue("submit", source, library, task_id=task_id)
         self.wait_queue(root, 1)
-        # Held past two 5 s busy timeouts: the tick at ~5 s finds the score
-        # done and its store_result fails at ~10 s, so the unstored result
-        # must survive in pending until the lock is released.
         with closing(sqlite3.connect(root / "db.sqlite", isolation_level=None)) as connection:
             connection.execute("BEGIN EXCLUSIVE")
-            time.sleep(11.5)
+            if sys.platform == "darwin":
+                # Keep the lock until the engine has retried twice. Waiting on
+                # the log avoids assuming when its first tick reaches SQLite.
+                deadline = time.monotonic() + 30
+                while (root / "engine.log").read_text().count("database busy, retrying") < 2:
+                    self.assertLess(time.monotonic(), deadline,
+                                    "engine did not retry the database lock twice")
+                    time.sleep(0.05)
+            else:
+                # The tick at ~5 s finds the score done and its store_result
+                # fails at ~10 s, so the unstored result stays pending.
+                time.sleep(11.5)
             connection.execute("COMMIT")
         deadline = time.monotonic() + 10
         with Database(root / "db.sqlite") as db:
@@ -499,7 +508,8 @@ class EndToEndTests(PipelineTestCase):
             # Stored exactly once: neither dropped nor double-counted.
             self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM programs").fetchone()[0],
                              programs + 1)
-        self.assertGreaterEqual((root / "engine.log").read_text().count("database busy, retrying"), 2)
+        retries = (root / "engine.log").read_text().count("database busy, retrying")
+        self.assertGreaterEqual(retries, 1 if sys.platform == "darwin" else 2)
         self.assertFalse(library.exists())
         self.cli("stop", root)
         self.finished(root, "stopped")
@@ -509,7 +519,16 @@ class EndToEndTests(PipelineTestCase):
         root = self.tuned_start("busy", "daemon.BUSY_RETRY_S = 0")
         with closing(sqlite3.connect(root / "db.sqlite", isolation_level=None)) as connection:
             connection.execute("BEGIN EXCLUSIVE")
-            time.sleep(6)
+            if sys.platform == "darwin":
+                # Wait until the daemon observes the lock before releasing it;
+                # startup and the first tick are not tightly coupled.
+                deadline = time.monotonic() + 30
+                while "database busy for 0s:" not in (root / "engine.log").read_text():
+                    self.assertLess(time.monotonic(), deadline,
+                                    "daemon did not observe the database lock")
+                    time.sleep(0.05)
+            else:
+                time.sleep(6)
             connection.execute("COMMIT")
         summary = self.finished(root, "failed")
         self.assertRegex(summary["reason"], r"^database busy for 0s: database is locked")

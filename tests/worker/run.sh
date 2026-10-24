@@ -2,10 +2,14 @@
 set -eu
 cd "$(dirname "$0")/../.."
 mkdir -p build/test
+shared_ldflags=
+if [ "$(uname -s)" = Darwin ]; then
+    shared_ldflags='-Wl,-undefined,dynamic_lookup'
+fi
 for source in tests/worker/*.c; do
     name=$(basename "$source" .c)
-    ${CC:-cc} -O2 -std=c11 -Wall -Wextra -Werror -shared -fPIC -Iinclude \
+    ${CC:-cc} -O2 -std=c11 -Wall -Wextra -Werror -shared -fPIC $shared_ldflags -Iinclude \
         -o "build/test/lib${name}.so" "$source"
 done
 # Run directly so top-level unittest discovery does not run this suite twice.
-python3 tests/worker/check_worker.py
+${PYTHON:-python3} tests/worker/check_worker.py
