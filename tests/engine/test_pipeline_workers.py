@@ -56,6 +56,34 @@ class ProcessGroupTests(unittest.TestCase):
         process.wait.assert_called_once_with()
         has_live_members.assert_called_once_with(123)
 
+    def test_darwin_retries_group_signal_after_reaping(self):
+        for retry_error in (None, ProcessLookupError("group no longer exists")):
+            with self.subTest(retry_error=retry_error):
+                events = []
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                process.wait.side_effect = lambda: events.append("wait")
+                attempts = 0
+
+                def killpg(pgid, sig):
+                    nonlocal attempts
+                    self.assertEqual((pgid, sig), (123, signal.SIGKILL))
+                    attempts += 1
+                    if attempts == 1:
+                        events.append("initial")
+                        raise PermissionError("permission denied")
+                    events.append("retry")
+                    if retry_error is not None:
+                        raise retry_error
+
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg", side_effect=killpg):
+                    kill_group(process)
+
+                self.assertEqual(events, ["initial", "wait", "retry"])
+                self.assertEqual(attempts, 2)
+                process.poll.assert_called_once_with()
+                process.wait.assert_called_once_with()
+
     def test_darwin_permission_error_for_live_group_is_reported(self):
         process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
         with patch("engine.funsearch._process.sys.platform", "darwin"), \
