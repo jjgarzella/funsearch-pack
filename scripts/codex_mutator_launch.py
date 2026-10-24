@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ TESTED_CODEX_VERSION = "codex-cli 0.164.0"
 DISABLED = ("unified_exec", "shell_snapshot", "apps", "plugins", "multi_agent",
             "browser_use", "computer_use", "image_generation", "view_image",
             "skill_search", "skill_mcp_dependency_install", "memories",
-            "code_mode", "code_mode_host", "remote_plugin", "workspace_dependencies",
+            "code_mode", "remote_plugin", "workspace_dependencies",
             "tool_suggest", "recommended_plugins", "api_key_cyber_access_programs",
             "api_key_model_discovery")
 
@@ -78,6 +79,7 @@ def validate_effective(config, home, backend=None):
     features = config.get("features", {})
     if (features.get("hooks") is not True or features.get("shell_tool") is not True
             or features.get("skip_host_skill_discovery") is not True
+            or features.get("code_mode_host") is not True
             or any(features.get(key) is not False for key in DISABLED)):
         raise ValueError("Codex capability overrides are not permitted")
     if config.get("mcp_servers") or config.get("plugins"):
@@ -220,6 +222,20 @@ def verify_sandbox_runtime(home, env, backend):
         raise ValueError(f"Codex {backend} sandbox preflight failed: {detail.strip()}") from exc
 
 
+def verify_code_mode_host(env):
+    """Require the code-mode host that gpt-6-luna's tool calls run through.
+
+    Without it every model tool call fails closed, and the one-shot session
+    ends without working its claimed slot, so refuse before claiming.
+    """
+    codex = shutil.which("codex", path=env.get("PATH"))
+    if codex is None:
+        raise ValueError("codex is not on PATH")
+    host = Path(codex).resolve().with_name("codex-code-mode-host")
+    if not (host.is_file() and os.access(host, os.X_OK)):
+        raise ValueError(f"Codex code-mode host is missing: {host}; the model would have no working tool")
+
+
 def launch(home, pack):
     home, pack = Path(home).resolve(), Path(pack).resolve()
     backend = sandbox_backend()
@@ -247,6 +263,7 @@ def launch(home, pack):
     if (private / "hooks.json").read_text() != hooks_document(home, pack):
         raise ValueError("private Codex hooks.json changed after setup")
     verify_sandbox_runtime(home, env, backend)
+    verify_code_mode_host(env)
     # slot helpers write their context/retirement files in the working directory.
     os.chdir(home)
     # Claim via the required protocol and read opt_model from that exact bead.

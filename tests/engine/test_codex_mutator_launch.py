@@ -8,7 +8,7 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
-from scripts.codex_mutator_launch import check_layers, launch, validate_effective
+from scripts.codex_mutator_launch import check_layers, launch, validate_effective, verify_code_mode_host
 from scripts.codex_mutator_setup import PERMISSION_PROFILE, setup
 
 PACK = Path(__file__).resolve().parents[2]
@@ -208,6 +208,7 @@ class CodexLaunchTests(unittest.TestCase):
                 patch("scripts.codex_mutator_launch.sandbox_backend", return_value="seatbelt"), \
                 patch("scripts.codex_mutator_launch.subprocess.run",
                       return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.164.0\n")), \
+                patch("scripts.codex_mutator_launch.verify_code_mode_host"), \
                 patch("scripts.gc_lifecycle.gc", side_effect=list(responses)) as gc, \
                 patch("scripts.codex_mutator_launch.os.execvpe", side_effect=exec_error) as execute:
             try:
@@ -296,6 +297,38 @@ class CodexLaunchTests(unittest.TestCase):
                 self.assertTrue(run.call_args_list[1].kwargs["check"])
                 gc.assert_not_called()
                 chdir.assert_not_called()
+
+    def test_missing_code_mode_host_refuses_before_claim(self):
+        bin_dir = self.root / "codex-bin"
+        bin_dir.mkdir()
+        codex = bin_dir / "codex"
+        codex.write_text("#!/bin/sh\n")
+        codex.chmod(0o755)
+        env = {"PATH": str(bin_dir)}
+        with self.assertRaisesRegex(ValueError, "code-mode host is missing"):
+            verify_code_mode_host(env)
+        host = bin_dir / "codex-code-mode-host"
+        host.write_text("#!/bin/sh\n")
+        host.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "code-mode host is missing"):
+            verify_code_mode_host(env)
+        host.chmod(0o755)
+        verify_code_mode_host(env)
+        with self.assertRaisesRegex(ValueError, "codex is not on PATH"):
+            verify_code_mode_host({"PATH": str(self.root / "empty")})
+        version = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.164.0\n")
+        sandbox = subprocess.CompletedProcess(["codex", "sandbox"], 0, "")
+        with patch("scripts.codex_mutator_launch.sandbox_backend", return_value="seatbelt"), \
+                patch("scripts.codex_mutator_launch.subprocess.run", side_effect=[version, sandbox]), \
+                patch("scripts.codex_mutator_launch.read_effective", return_value=self.config), \
+                patch("scripts.codex_mutator_launch.verify_code_mode_host",
+                      side_effect=ValueError("Codex code-mode host is missing: x")), \
+                patch("scripts.gc_lifecycle.gc") as gc, \
+                patch("scripts.codex_mutator_launch.os.chdir") as chdir, \
+                self.assertRaisesRegex(ValueError, "code-mode host is missing"):
+            launch(self.home, PACK)
+        gc.assert_not_called()
+        chdir.assert_not_called()
 
     def test_drain_needs_no_release(self):
         self.assertEqual(self.launch_with(json.dumps({"action": "drain"})), 0)

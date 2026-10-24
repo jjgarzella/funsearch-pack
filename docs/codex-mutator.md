@@ -170,6 +170,32 @@ or broad model commands to make the shared engine work. The receipt is
 not another model-accessible file operation. The selected native sandbox
 applies to the receipt-reading shell and local candidate patch.
 
+### Code mode
+
+On 0.164, `gpt-6-luna` is a `code_mode_only` model: Codex exposes its shell
+and `apply_patch` calls only through the code-mode host
+(`codex-code-mode-host`, installed beside the CLI). With
+`code_mode_host = false` every model tool call fails closed ("code-mode host
+is disabled"), the model ends its turn without working its slot, and the
+one-shot session ends. Setup therefore sets `code_mode_host = true` and keeps
+`code_mode = false` and `unified_exec = false`. The launcher requires that
+exact value and refuses before claiming a slot if the host binary is missing.
+
+Live probes on Darwin arm64 (2026-10-24, `codex-cli 0.164.0`, `gpt-6-luna`,
+native Seatbelt profile) established:
+
+- every shell and `apply_patch` call made through code mode reached the
+  `PreToolUse` hook as `{"tool_name": "Bash", "tool_input": {"command": ...}}`
+  or `{"tool_name": "apply_patch", "tool_input": {"command": <patch>}}`, the
+  shapes the guard already parses; hook denials blocked them;
+- code-mode code itself has no file-system module and no `fetch`;
+- with an allow-all hook, Seatbelt still confined the allowed commands:
+  a workspace write succeeded, a write under `$HOME` failed with
+  "Operation not permitted", and network access failed.
+
+The code-mode host is therefore a tool router, not a new execution surface;
+the guard and the native sandbox remain the enforcement layers.
+
 ### Per-slot hook lock
 
 Each hook call holds an exclusive `flock` for its slot (5 s wait, then a

@@ -133,6 +133,11 @@ writable_roots = []
 exclude_slash_tmp = true
 exclude_tmpdir_env_var = true
 '''
+    # gpt-6-luna is a code_mode_only model on 0.164: its shell and apply_patch
+    # calls run through the code-mode host, so the host must be enabled or the
+    # model has no working tool. Code-mode code has no native file or network
+    # access; each nested call still reaches the PreToolUse guard and runs in
+    # the native sandbox. unified_exec stays off (no write_stdin).
     settings = '''model = "gpt-6-luna"
 forced_login_method = "chatgpt"
 approval_policy = "never"
@@ -163,7 +168,7 @@ api_key_cyber_access_programs = false
 api_key_model_discovery = false
 memories = false
 code_mode = false
-code_mode_host = false
+code_mode_host = true
 remote_plugin = false
 workspace_dependencies = false
 tool_suggest = false
