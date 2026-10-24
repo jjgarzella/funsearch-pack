@@ -7,13 +7,35 @@ import signal
 import subprocess
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from engine.funsearch._process import kill_group
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
     RECYCLE_SCORES, STDERR_LIMIT_BYTES, STDERR_TAIL_BYTES, EvaluatorInitError, Worker,
     WorkerError, WorkerPool, _StderrTail, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_permission_error_reaps_worker_and_reports_possible_descendants(self):
+        for leader_status, should_kill in ((None, True), (-signal.SIGKILL, False)):
+            with self.subTest(leader_status=leader_status):
+                process = Mock(pid=123, poll=Mock(return_value=leader_status))
+                with patch("engine.funsearch._process.os.killpg",
+                           side_effect=PermissionError("permission denied")) as killpg:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain"):
+                        kill_group(process)
+
+                killpg.assert_called_once_with(123, signal.SIGKILL)
+                process.poll.assert_called_once_with()
+                if should_kill:
+                    process.kill.assert_called_once_with()
+                else:
+                    process.kill.assert_not_called()
+                process.wait.assert_called_once_with()
 
 
 PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
