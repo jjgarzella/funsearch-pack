@@ -220,6 +220,14 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("resident-set limit exceeded", stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin RSS fallback is macOS-only")
+    def test_resident_memory_fallback_disallows_subprocesses(self):
+        process = self.start(evaluator="spawn_eval", env={"FS_MEMORY_RSS_MB": "64"})
+        result = self.score(process, "good")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["score"], 1)
+        self.assertEqual(result["msg"], "fork denied")
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin RLIMIT_AS fallback is macOS-only")
     def test_memory_limit_falls_back_to_resident_set_limit(self):
         process = self.start(evaluator="rss_eval", env={"FS_MEMORY_MB": "64"})

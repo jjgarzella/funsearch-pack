@@ -605,7 +605,8 @@ double f(void) {
         private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
                    "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent", "FS_STORE": "/x",
                    "SOLVER_LICENSE": "l"}
-        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "SOLVER_LICENSE_FILE": "/opt/l"}
+        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "DYLD_LIBRARY_PATH": "/opt/dyld",
+                  "SOLVER_LICENSE_FILE": "/opt/l"}
         self.cfg.evaluator.env = ["SOLVER_*_FILE"]
         with patch.dict(os.environ, {**private, **public}):
             pool = self.pool(extra_env={"KEEP_ME": "1"})

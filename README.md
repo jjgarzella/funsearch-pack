@@ -335,9 +335,16 @@ Best-effort hygiene for trusted local experiments:
   compilation or prevent arbitrary filesystem reads or diagnostic disclosure.
 - Candidate code (evaluator workers and the export check's library load)
   gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
-  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
-  the problem's `evaluator.env`. Gas City identity, store scope, agent sockets
-  and credentials are not passed on unless a pattern names them.
+  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`,
+  plus the patterns in the problem's `evaluator.env`.
+  Gas City identity, store scope, agent sockets and credentials are not passed
+  on unless a pattern names them.
+- When macOS cannot apply `RLIMIT_AS` or an Apple ASan trial requests an RSS
+  limit, the worker uses a Mach resident-set watchdog. It disables subprocess
+  creation in that worker so children cannot escape the worker-local memory
+  cap. The watchdog samples every 20 ms while evaluator or candidate code runs
+  and once per second while idle; a failed Mach sample aborts the worker, and
+  startup fails if subprocess creation cannot be disabled.
 - Each scoring request carries a random token that a reply must echo, and
   the worker never keeps the request in a stdio buffer. After each reply the
   engine sends a `SYNC` barrier; any extra line before its echo (such as the

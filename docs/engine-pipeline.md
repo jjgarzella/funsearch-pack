@@ -69,8 +69,14 @@ A worker starts in a new process group with `FS_MEMORY_MB` from configuration.
 On macOS, dyld's shared-cache reservations can make the requested `RLIMIT_AS`
 lower than the process's existing virtual-address range. When Darwin rejects
 that limit with `EINVAL`, the worker enforces the same configured size as a
-resident-set limit, sampled every 20 ms through Mach task information. Linux
-continues to enforce `RLIMIT_AS`.
+resident-set limit through Mach task information. The worker disables process
+creation with `RLIMIT_NPROC=0`, so descendants cannot bypass the worker-local
+RSS cap; startup fails if that restriction cannot be installed. The watchdog
+samples every 20 ms while evaluator or candidate code runs, waits efficiently
+between requests, and samples once per second while idle. A failed Mach query
+aborts the worker instead of silently disabling enforcement. Linux continues
+to enforce `RLIMIT_AS`. Apple ASan trials use this same RSS path because Apple's
+runtime does not enforce `hard_rss_limit_mb`.
 The engine sends a blank request and reads its `bad request` response to ensure
 `fs_init` has finished; the C protocol has no spontaneous ready response.
 A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup

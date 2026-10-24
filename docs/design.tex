@@ -330,7 +330,12 @@ starts a replacement worker. If \code{FS\_MEMORY\_MB} is set, the worker applies
 \code{RLIMIT\_AS} memory limit through \code{setrlimit}. On macOS, Darwin can
 reject that limit with \code{EINVAL} when shared-cache reservations already
 exceed it; the worker then enforces the same cap with a Mach resident-set
-watchdog. It must not install SIGSEGV handlers: embedded Julia uses its own.
+watchdog. That fallback sets \code{RLIMIT\_NPROC} to zero to prevent
+subprocesses from escaping the worker-local cap, and fails startup if the
+restriction cannot be installed. The watchdog samples every 20 ms while
+evaluator or candidate code runs and once per second while idle; a failed Mach
+query aborts the worker. It must not install SIGSEGV handlers: embedded Julia
+uses its own.
 The daemon creates separate final and sanitizer
 pools, each with \code{search.workers} processes started eagerly and kept for
 the whole run, so a run holds twice that many resident evaluators and an idle
