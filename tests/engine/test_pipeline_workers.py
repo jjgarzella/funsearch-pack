@@ -241,6 +241,57 @@ class WorkerWatchdogTests(unittest.TestCase):
         resident_bytes.assert_called_once_with(123)
         kill_group.assert_not_called()
 
+    def test_esrch_for_replaced_worker_keeps_watchdog_active(self):
+        worker = Worker.__new__(Worker)
+
+        class StopAfterThreeWaits:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits >= 3:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        condition = StopAfterThreeWaits()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._rss_limit_bytes = 1024
+        old_process = Mock(pid=123)
+        replacement = Mock(pid=456)
+        worker.process = old_process
+
+        def query_resident_bytes(pid):
+            if pid == old_process.pid:
+                worker.process = replacement
+                raise OSError(errno.ESRCH, "No such process")
+            return 512
+
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=query_resident_bytes) as resident_bytes, \
+                patch.object(worker, "_set_rss_watchdog_active") as set_active:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 3)
+        self.assertIs(worker.process, replacement)
+        self.assertTrue(worker._rss_watchdog_active)
+        self.assertEqual(
+            [call.args[0] for call in resident_bytes.call_args_list],
+            [old_process.pid, replacement.pid],
+        )
+        set_active.assert_not_called()
+
     def test_query_failure_during_activation_is_preserved(self):
         worker = Worker.__new__(Worker)
         worker._lock = threading.Lock()
