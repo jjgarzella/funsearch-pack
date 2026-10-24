@@ -16,6 +16,94 @@ from engine.funsearch.workers import (
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
 
 
+PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    const struct mach_header *raw = _dyld_get_image_header(0);
+    if (!raw || raw->magic != MH_MAGIC_64) return 0;
+    const struct mach_header_64 *header = (const struct mach_header_64 *)raw;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    const struct load_command *command = (const struct load_command *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if (command->cmdsize < sizeof(*command)) return 0;
+        if (command->cmd == LC_SEGMENT_64 &&
+            command->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if ((segment->initprot & (VM_PROT_READ | VM_PROT_WRITE)) ==
+                (VM_PROT_READ | VM_PROT_WRITE)) {
+                const unsigned char *base = (const unsigned char *)
+                    ((uintptr_t)segment->vmaddr + (uintptr_t)slide);
+                if (scan(base, (size_t)segment->vmsize, context)) return 1;
+            }
+        }
+        command = (const struct load_command *)((const char *)command + command->cmdsize);
+    }
+    return 0;
+}
+#else
+#include <link.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+struct main_data_scan_request { main_data_scan_fn scan; void *context; };
+static int scan_main_image(struct dl_phdr_info *image, size_t info_size, void *opaque) {
+    (void)info_size;
+    if (image->dlpi_name[0]) return 0;
+    struct main_data_scan_request *request = (struct main_data_scan_request *)opaque;
+    for (int i = 0; i < image->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *segment = &image->dlpi_phdr[i];
+        if (segment->p_type != PT_LOAD ||
+            (segment->p_flags & (PF_R | PF_W)) != (PF_R | PF_W)) continue;
+        const unsigned char *base = (const unsigned char *)
+            ((uintptr_t)image->dlpi_addr + (uintptr_t)segment->p_vaddr);
+        if (request->scan(base, (size_t)segment->p_memsz, request->context)) return 1;
+    }
+    return 0;
+}
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    struct main_data_scan_request request = {scan, context};
+    return dl_iterate_phdr(scan_main_image, &request);
+}
+#endif
+static int nonce_region(const unsigned char *bytes, size_t size, void *opaque) {
+    char *token = (char *)opaque;
+    for (size_t i = 1; i + 33 <= size; ++i) {
+        if (!bytes[i - 1] && !bytes[i + 32] &&
+            strspn((const char *)bytes + i, "0123456789abcdef") == 32) {
+            memcpy(token, bytes + i, 32);
+            token[32] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+static int find_main_nonce(char token[33]) {
+    token[0] = '\0';
+    return scan_main_data(nonce_region, token);
+}
+struct byte_search { const unsigned char *needle; size_t length; };
+static int bytes_region(const unsigned char *bytes, size_t size, void *opaque) {
+    const struct byte_search *search = (const struct byte_search *)opaque;
+    if (search->length > size) return 0;
+    for (size_t i = 0; i + search->length <= size; ++i)
+        if (!memcmp(bytes + i, search->needle, search->length)) return 1;
+    return 0;
+}
+static int main_data_contains(const void *needle, size_t length) {
+    struct byte_search search = {(const unsigned char *)needle, length};
+    return scan_main_data(bytes_region, &search);
+}
+"""
+
+
 class StderrTailTests(unittest.TestCase):
     def test_close_stops_reader_even_when_writer_keeps_pipe_open(self):
         read_fd, write_fd = os.pipe()
@@ -190,9 +278,10 @@ void fs_fini(void) {
         cfg.evaluator.memory_mb = 256
         pool = WorkerPool(cfg, self.evaluator(), "n=1", 1, try_worker_env(cfg))
         self.addCleanup(pool.close)
-        source = self.source("#include <stdlib.h>\n#include <string.h>\n"
+        source = self.source("#include <stdlib.h>\n"
                              "double f(void) { for (;;) { char *p = malloc(32 << 20);"
-                             " if (!p) return -1; memset(p, 1, 32 << 20); } }")
+                             " if (!p) return -1; volatile char *pages = p;"
+                             " for (size_t i = 0; i < (32u << 20); i += 4096) pages[i] = 1; } }")
         ok, library, log = compile_candidate(cfg, source, self.root / "hog", "try")
         self.assertTrue(ok, log)
         result = pool.score(library, 20)
@@ -272,28 +361,11 @@ double f(void) {
         # The token is not in any request buffer, but a candidate sharing the
         # process can still find the worker's copy. The SYNC barrier then sees
         # the worker's own reply as a second line.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <stdio.h>
-#include <string.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 double f(void) {
-    if (!dl_iterate_phdr(scan, NULL)) return -1;
+    if (!find_main_nonce(token)) return -1;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     return 0;
@@ -313,24 +385,13 @@ double f(void) {
         # dlopen runs constructors, so the request buffer must no longer hold
         # "SCORE #<token>" by then. The needle is built at run time so the
         # candidate's own read-only literal cannot match.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
-#include <string.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 static int found = -1;
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+__attribute__((constructor)) static void probe(void) {
     char needle[8] = "SCORE ";
-    (void)size; (void)data;
     needle[6] = '#';
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        if (memmem((const char *)(info->dlpi_addr + ph->p_vaddr), ph->p_memsz, needle, 7))
-            return 1;
-    }
-    return 0;
+    found = main_data_contains(needle, 7);
 }
-__attribute__((constructor)) static void probe(void) { found = dl_iterate_phdr(scan, NULL); }
 double f(void) { return found == 0 ? 2 : found; }
 """)
         ok, library, log = compile_candidate(self.cfg, source, self.root / "ctor-scan", "final")
@@ -343,33 +404,16 @@ double f(void) { return found == 0 ? 2 : found; }
     # isolation tracked as mc-v8f3.5; drop expectedFailure when that lands.
     @unittest.expectedFailure
     def test_candidate_reading_stdin_cannot_answer_the_barrier(self):
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <pthread.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 static void *steal(void *unused) {
     char line[128];
     size_t n = 0;
     (void)unused;
-    if (!dl_iterate_phdr(scan, NULL)) return NULL;
+    if (!find_main_nonce(token)) return NULL;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     while (n + 1 < sizeof(line) && read(0, line + n, 1) == 1 && line[n] != '\n')

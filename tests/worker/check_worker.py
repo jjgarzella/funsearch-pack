@@ -6,6 +6,7 @@ import resource
 import selectors
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -111,7 +112,9 @@ class WorkerTests(unittest.TestCase):
                 source.write_text(f"double f(void) {{ return {value}; }}\n")
                 subprocess.run([
                     *shlex.split(os.environ.get("CC", "cc")),
-                    "-shared", "-fPIC", "-o", str(library), str(source),
+                    "-shared", "-fPIC",
+                    *( ["-Wl,-undefined,dynamic_lookup"] if sys.platform == "darwin" else [] ),
+                    "-o", str(library), str(source),
                 ], check=True, capture_output=True)
                 self.assertEqual(self.receive(process, f"SCORE {library}")["score"], value)
 
@@ -194,15 +197,35 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.receive(process, "SCORE /" + "a" * 70000)["msg"], "bad request")
         self.assertEqual(self.score(process, "good")["score"], 3.5)
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "macOS shared-cache reservations prevent a stable RLIMIT_AS assertion")
     def test_memory_limit(self):
         process = self.start("limit", "edge_eval", {"FS_MEMORY_MB": "128"})
         result = self.score(process, "good")
         self.assertEqual(result["score"], 128)
         self.assertEqual(result["sig"], [128])
+
+    def test_invalid_memory_limit(self):
         process = self.start(env={"FS_MEMORY_MB": "bad"})
         stdout, _ = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 3)
         self.assertEqual(json.loads(stdout), {"fatal": "invalid FS_MEMORY_MB"})
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach resident-set watchdog is macOS-only")
+    def test_resident_memory_limit(self):
+        process = self.start(evaluator="rss_eval", env={"FS_MEMORY_RSS_MB": "64"})
+        stdout, stderr = process.communicate(
+            f"SCORE {BUILD / 'libgood.so'}\n", timeout=5)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("resident-set limit exceeded", stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach resident-set watchdog is macOS-only")
+    def test_invalid_resident_memory_limit(self):
+        process = self.start(env={"FS_MEMORY_RSS_MB": "bad"})
+        stdout, _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 3)
+        self.assertEqual(json.loads(stdout), {"fatal": "invalid FS_MEMORY_RSS_MB"})
 
     def test_required_symbol_and_evaluator_load_failure(self):
         for evaluator in ("nosym", "nonexistent"):

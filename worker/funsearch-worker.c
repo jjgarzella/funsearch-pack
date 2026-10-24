@@ -7,11 +7,17 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 static void *candidate_handle;
 static FILE *proto;
@@ -217,9 +223,54 @@ static ssize_t read_request(void)
     return (ssize_t)length;
 }
 
+#if defined(__APPLE__)
+static unsigned long long rss_limit_bytes;
+
+static void *rss_watchdog(void *unused)
+{
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+    (void)unused;
+    for (;;) {
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) == KERN_SUCCESS &&
+            info.resident_size > rss_limit_bytes) {
+            fprintf(stderr, "worker resident-set limit exceeded\n");
+            fflush(stderr);
+            raise(SIGABRT);
+            _exit(128 + SIGABRT);
+        }
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
+static int start_rss_watchdog(unsigned long long mb)
+{
+    pthread_t thread;
+    int error;
+    rss_limit_bytes = mb * 1024 * 1024;
+    error = pthread_create(&thread, NULL, rss_watchdog, NULL);
+    if (error) {
+        errno = error;
+        fatal("cannot start resident-set watchdog");
+        return -1;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+#endif
+
 static int memory_limit(void)
 {
     const char *value = getenv("FS_MEMORY_MB");
+#if defined(__APPLE__)
+    const char *rss_value = getenv("FS_MEMORY_RSS_MB");
+    int use_rss = rss_value != NULL;
+    if (use_rss)
+        value = rss_value;
+#endif
     char *end;
     unsigned long long mb;
     struct rlimit limit;
@@ -229,15 +280,36 @@ static int memory_limit(void)
     mb = strtoull(value, &end, 10);
     if (errno || end == value || *end || *value == '-' ||
         mb > ((unsigned long long)RLIM_INFINITY - 1) / (1024 * 1024)) {
+#if defined(__APPLE__)
+        fatal(use_rss ? "invalid FS_MEMORY_RSS_MB" : "invalid FS_MEMORY_MB");
+#else
         fatal("invalid FS_MEMORY_MB");
+#endif
         return -1;
     }
+#if defined(__APPLE__)
+    if (use_rss)
+        return start_rss_watchdog(mb);
+#endif
     limit.rlim_cur = limit.rlim_max = (rlim_t)(mb * 1024 * 1024);
     if (setrlimit(RLIMIT_AS, &limit) != 0) {
+#if defined(__APPLE__)
+        /* Darwin reserves a large shared-cache address range in every
+         * process. A cap below that existing reservation is rejected with
+         * EINVAL, so keep the worker usable and enforce the limit by RSS. */
+        if (errno == EINVAL) {
+            fprintf(stderr, "FS_MEMORY_MB cannot be applied with RLIMIT_AS on macOS; using resident-set watchdog\n");
+            return start_rss_watchdog(mb);
+        }
+#endif
         fatal(strerror(errno));
         return -1;
     }
+#if defined(__APPLE__)
+    return start_rss_watchdog(mb);
+#else
     return 0;
+#endif
 }
 
 int main(int argc, char **argv)

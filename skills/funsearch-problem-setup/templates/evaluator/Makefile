@@ -7,6 +7,11 @@ CC = cc
 CFLAGS = -O2 -std=c11 -Wall -Wextra -Werror
 CPPFLAGS =
 LDFLAGS =
+ifeq ($(shell uname -s),Darwin)
+SHARED_LDFLAGS = -Wl,-undefined,dynamic_lookup
+else
+SHARED_LDFLAGS =
+endif
 
 .PHONY: all clean check-pack
 all: libevaluator.so
@@ -18,7 +23,7 @@ check-pack:
 # check-pack is order-only (GNU make): it still runs first, but as a phony
 # target it must not make an up-to-date library look stale.
 libevaluator.so: evaluator.c ../candidate.h | check-pack
-	$(CC) $(CPPFLAGS) -I"$(FS_PACK)/include" $(CFLAGS) -shared -fPIC $(LDFLAGS) -o $@ evaluator.c
+	$(CC) $(CPPFLAGS) -I"$(FS_PACK)/include" $(CFLAGS) -shared -fPIC $(SHARED_LDFLAGS) $(LDFLAGS) -o $@ evaluator.c
 
 clean:
 	rm -f libevaluator.so

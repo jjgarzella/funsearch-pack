@@ -18,7 +18,7 @@ class MutatorGuardTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="mutator test ")
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         self.run = self.home / "problem/runs/one"
         self.run.mkdir(parents=True)
         self.db = Database(self.run / "db.sqlite")

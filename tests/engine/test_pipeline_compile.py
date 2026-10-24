@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 import tracemalloc
+import unittest
 from unittest.mock import patch
 
 from engine.funsearch._process import LOG_BYTES, _StderrPrefix
@@ -246,19 +247,49 @@ class CompileTests(PipelineTestCase):
             self.assertEqual(check_exports(self.root / "not.so", ["f"], {}), (False, "nm failed: nm error"))
             self.assertEqual(run.call_count, 1)
 
+    def test_darwin_nm_uses_defined_external_symbols_and_normalizes_c_names(self):
+        with patch("engine.funsearch.compile.sys.platform", "darwin"), \
+                patch("engine.funsearch.compile.shutil.which", return_value="/usr/bin/nm"), \
+                patch("engine.funsearch.compile.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "0000000100003f80 T _f\n"
+            run.return_value.stderr = ""
+            self.assertEqual(check_exports(self.root / "candidate.dylib", ["f"], {}), (True, ""))
+            self.assertEqual(run.call_args.args[0][:2], ["nm", "-gU"])
+
+            ok, message = check_exports(self.root / "candidate.dylib", ["f", "g"], {})
+            self.assertFalse(ok)
+            self.assertEqual(message, "missing required exports: g")
+
+    def test_darwin_shared_compilation_allows_plugin_undefined_symbols(self):
+        source = self.source("extern double dependency(void); double f(void) { return dependency(); }")
+        with patch("engine.funsearch.compile.sys.platform", "darwin"), \
+                patch("engine.funsearch.compile.run_command", return_value=(False, "compile failed")) as run:
+            compile_candidate(self.cfg, source, self.root / "darwin", "final")
+        self.assertIn("-Wl,-undefined,dynamic_lookup", run.call_args.args[0])
+
     def test_try_compilation_uses_sanitizers(self):
         library = self.candidate("good", "try")
         import subprocess
-        output = subprocess.run(["nm", "-D", str(library)], capture_output=True, text=True, check=True).stdout
-        self.assertIn("__asan", output)
+        nm_flags = ["-g"] if sys.platform == "darwin" else ["-D"]
+        output = subprocess.run(["nm", *nm_flags, str(library)], capture_output=True,
+                                text=True, check=True).stdout
+        self.assertIn("asan", output)
         env = try_worker_env(self.cfg)
-        self.assertTrue(Path(env["LD_PRELOAD"].split()[0]).is_file())
+        preload_name = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+        separator = os.pathsep if sys.platform == "darwin" else " "
+        self.assertTrue(Path(env[preload_name].split(separator)[0]).is_file())
         limit = self.cfg.evaluator.memory_mb
+        hard_rss = "" if sys.platform == "darwin" else f"hard_rss_limit_mb={limit}:"
         self.assertEqual(env["ASAN_OPTIONS"],
-                         f"detect_leaks=0:abort_on_error=1:hard_rss_limit_mb={limit}"
-                         f":max_allocation_size_mb={limit}:allocator_may_return_null=1")
+                         f"detect_leaks=0:abort_on_error=1:{hard_rss}"
+                         f"max_allocation_size_mb={limit}:allocator_may_return_null=1")
         self.assertIsNone(env["FS_MEMORY_MB"])
+        if sys.platform == "darwin":
+            self.assertEqual(env["FS_MEMORY_RSS_MB"], str(limit))
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Apple ASan cannot initialize inside the Python ctypes fallback process")
     def test_sanitized_ctypes_fallback(self):
         with patch("engine.funsearch.compile.shutil.which", return_value=None):
             self.candidate("good", "try")

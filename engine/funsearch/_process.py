@@ -17,7 +17,7 @@ LOG_BYTES = 4096
 # to the engine's environment (by Gas City or anything else) never reach it by
 # default. worker_environment() is the one place that applies the policy.
 CANDIDATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_*", "TZ",
-                 "TMPDIR", "LD_LIBRARY_PATH")
+                 "TMPDIR", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
 
 
 def candidate_environment(extra_env=None, passthrough=()):
@@ -50,6 +50,14 @@ def kill_group(process):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Darwin may refuse a process-group signal after the group leader has
+        # exited. Still reap the worker itself if it is alive.
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
     process.wait()
 
 

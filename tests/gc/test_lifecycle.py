@@ -61,7 +61,7 @@ class LifecycleTests(HookFixture, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="funsearch-gc-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.setup_gc(self.root)
 
     def run_dir(self, name="run-one", pid=None, mutators=3):
@@ -545,7 +545,7 @@ sys.exit(lifecycle.main())
                          "candidate.compile_try=id", "evaluator.library=x.so", "problem.name=x",
                          "mutator.model=x", "instance=n=7", "problem.instance=n=7"):
             with self.subTest(override=override):
-                result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
+                result = subprocess.run([sys.executable, str(SCRIPTS / "gc_lifecycle.py"), "launch",
                                          str(problem), "--notify", "n", "--overrides", override],
                                         env=self.env, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -636,7 +636,7 @@ class ToyHookTests(HookFixture, PipelineTestCase):
         self.assertFalse(list(self.registry.glob("*.json")))
 
     def test_launch_passes_instance_overrides_and_hooks(self):
-        result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
+        result = subprocess.run([sys.executable, str(SCRIPTS / "gc_lifecycle.py"), "launch",
                                  str(self.problem), "--notify", "launch-recipient",
                                  "--instance", "n=7", "--overrides",
                                  "search.workers=1 search.mutators=1 stop.duration_s=60"],

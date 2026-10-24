@@ -16,7 +16,7 @@ if [ -f "$FS_PACK/bin/funsearch" ]; then
     "$FS_PACK/bin/funsearch" check "$problem_dir" >"$scratch/result.json" || exit_status=$?
     # check must fail for an evaluator error, while still printing its result.
     test "$exit_status" -eq 1
-    python3 - "$scratch/result.json" <<'PY'
+    ${PYTHON:-python3} - "$scratch/result.json" <<'PY'
 import json
 import sys
 
