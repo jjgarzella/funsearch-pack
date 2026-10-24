@@ -52,7 +52,7 @@ Omit `instance` and `overrides` to use the problem defaults. `pack` is the
 absolute path of this pack (the directory containing `pack.toml`); the start
 step runs its CLI from there. Overrides may set
 only `search.*` and `stop.*`; use the separate `instance` variable for the
-instance and `problem.toml` for the mutator model. Keys that hold shell
+instance and `problem.toml` for the mutator provider and model. Keys that hold shell
 commands (`candidate.compile*`, `evaluator.build`) come only from the problem's
 `problem.toml`. The seed must score
 `FS_OK`. For the copied evaluator template, set `evaluator.build` to
@@ -102,7 +102,18 @@ selects the correct rig even from another cwd. Direct hook launches require
 The engine needs Python 3.11 or later, a C compiler, the ASan runtime,
 `make`, and `flock`; its Python modules use only the standard library.
 Every run initializes an ASan trial pool, even if no `try` calls are planned.
-Check that `${CC:-cc} -print-file-name=libasan.so` resolves to an existing file.
+Check that the compiler can locate the platform's ASan runtime:
+
+```sh
+if [ "$(uname -s)" = Darwin ]; then
+  asan_runtime=libclang_rt.asan_osx_dynamic.dylib
+else
+  asan_runtime=libasan.so
+fi
+asan_path=$(${CC:-cc} "-print-file-name=$asan_runtime")
+test -f "$asan_path"
+```
+
 `CC` selects this runtime discovery compiler independently of
 `candidate.compile_try`. It also works without Gas City:
 
@@ -292,6 +303,25 @@ permit only `gc runtime drain-ack` for that retiring session. This prevents
 late nudges from reusing its context before the controller completes the drain;
 a new pool session can claim normally.
 
+### Codex variant
+
+Set `[mutator] provider = "codex"` and `model = "gpt-6-luna"` in
+`problem.toml` to route slots to `funsearch.mutator-codex`. The provider defaults
+to Claude, and an omitted model uses that provider's default. Existing problem
+files and old run manifests keep Claude behavior. Each pool has its own cap of
+three sessions, so account for both pools when budgeting concurrent runs.
+
+Codex uses a private CLI session and a mandatory task guard adapting the
+existing policy. On macOS it uses Codex's Seatbelt sandbox with workspace
+writes, `~/.ssh` reads denied, and command networking disabled; Linux retains
+the native `workspace-write` sandbox path. It edits a local `child.c`; trusted
+hook code copies it to the current task for try/submit and performs approved
+engine/control calls outside the model shell sandbox. The launcher pins Codex
+0.164.0 and verifies the effective configuration and native sandbox before it
+claims work. It refuses container or no-native-sandbox settings. Hook runtime
+errors/timeouts can still fail open; caught guard errors deny. Read [the
+implementation, limitations and smoke-test requirements](docs/codex-mutator.md).
+
 ## Security notes
 
 ### Trust model (v1)
@@ -324,9 +354,18 @@ Best-effort hygiene for trusted local experiments:
   compilation or prevent arbitrary filesystem reads or diagnostic disclosure.
 - Candidate code (evaluator workers and the export check's library load)
   gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
-  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, plus the patterns in
-  the problem's `evaluator.env`. Gas City identity, store scope, agent sockets
-  and credentials are not passed on unless a pattern names them.
+  `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`,
+  plus the patterns in the problem's `evaluator.env`.
+  Gas City identity, store scope, agent sockets and credentials are not passed
+  on unless a pattern names them.
+- On macOS, the worker uses a Mach resident-set watchdog when `RLIMIT_AS` fails
+  with `EINVAL` or an Apple ASan trial requests an RSS limit. It disables subprocess
+  creation in that worker so children cannot escape the worker-local memory
+  cap. The watchdog samples every 20 ms while evaluator or candidate code runs
+  and once per second while idle; a failed Mach sample aborts the worker, and
+  startup fails if subprocess creation cannot be disabled. The engine also
+  samples the worker PID through `libproc`, so replacing the worker with `exec`
+  cannot discard the RSS cap; a failed query or overage kills the worker.
 - Each scoring request carries a random token that a reply must echo, and
   the worker never keeps the request in a stdio buffer. After each reply the
   engine sends a `SYNC` barrier; any extra line before its echo (such as the

@@ -13,7 +13,7 @@ def setup(work_dir, pack_dir):
     directory = home / ".claude"
     directory.mkdir(exist_ok=True)
     directory.chmod(0o700)
-    command = shlex.join(["python3", str(pack / "scripts/mutator_guard.py"), str(home), str(pack)])
+    command = shlex.join([sys.executable, str(pack / "scripts/mutator_guard.py"), str(home), str(pack)])
     settings = {
         "permissions": {"defaultMode": "dontAsk", "deny": ["WebFetch", "WebSearch"]},
         "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [

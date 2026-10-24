@@ -80,3 +80,24 @@ class ConfigTests(unittest.TestCase):
             (self.root / "problem.toml").write_text(text)
             with self.subTest(text=text), self.assertRaises(ConfigError):
                 load_config(self.root)
+
+    def test_mutator_provider_and_model_defaults(self):
+        file = self.root / "problem.toml"
+        original = file.read_text()
+        for provider, model in (("claude", "claude-haiku-4-5-20251001"), ("codex", "gpt-6-luna")):
+            file.write_text(original + f'\n[mutator]\nprovider = "{provider}"\n')
+            cfg = load_config(self.root)
+            self.assertEqual((cfg.mutator.provider, cfg.mutator.model), (provider, model))
+            file.write_text(file.read_text() + 'model = "custom-model"\n')
+            self.assertEqual(load_config(self.root).mutator.model, "custom-model")
+        file.write_text(original)
+        self.assertEqual(load_config(self.root, ["mutator.provider=codex"]).mutator.model, "gpt-6-luna")
+        cfg = load_config(self.root, ["mutator.provider=codex", "mutator.model=custom"])
+        self.assertEqual(cfg.mutator.model, "custom")
+        for value in ('"other"', '""', 'false', '1'):
+            file.write_text(original + f"\n[mutator]\nprovider = {value}\n")
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_config(self.root)
+        file.write_text(original + '\n[mutator]\nprovider = "codex"\nmodel = ""\n')
+        with self.assertRaisesRegex(ConfigError, "mutator.model"):
+            load_config(self.root)

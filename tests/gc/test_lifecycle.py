@@ -61,7 +61,7 @@ class LifecycleTests(HookFixture, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="funsearch-gc-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.setup_gc(self.root)
 
     def run_dir(self, name="run-one", pid=None, mutators=3):
@@ -74,6 +74,32 @@ class LifecycleTests(HookFixture, unittest.TestCase):
         (root / "run.json").write_text(json.dumps(metadata))
         (root / "engine.pid").write_text(str(pid or os.getpid()))
         return root
+
+    def test_codex_slots_route_to_codex_pool_with_model(self):
+        root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["config"]["mutator"] = {"provider": "codex", "model": "gpt-6-luna"}
+        (root / "run.json").write_text(json.dumps(metadata))
+        self.hook("on-start", root)
+        slots = [row for row in self.beads().values() if "funsearch-slot" in row.get("labels", [])]
+        self.assertEqual(len(slots), 3)
+        for row in slots:
+            self.assertEqual(row["metadata"]["opt_model"], "gpt-6-luna")
+            self.assertEqual(row["metadata"]["fs.provider"], "codex")
+        slings = [args for args in self.calls() if args[0] == "sling"]
+        self.assertEqual(len(slings), 3)
+        self.assertTrue(all(args[1] == "example/funsearch.mutator-codex" for args in slings))
+
+    def test_unknown_provider_is_refused_before_any_bead_or_registry(self):
+        root = self.run_dir()
+        metadata = json.loads((root / "run.json").read_text())
+        metadata["config"]["mutator"] = {"provider": "bogus", "model": "m"}
+        (root / "run.json").write_text(json.dumps(metadata))
+        result = self.hook("on-start", root, code=1)
+        self.assertIn("unknown mutator provider", result.stderr)
+        beads = self.shim_state / "beads.json"
+        self.assertFalse(beads.exists() and self.beads())
+        self.assertFalse(list(self.registry.glob("*")) if self.registry.exists() else [])
 
     def summary(self, root, **changes):
         summary = {"run_id": root.name, "status": "completed", "reason": "max_children",
@@ -475,8 +501,10 @@ from scripts import gc_lifecycle as lifecycle
 original_run = lifecycle.subprocess.run
 recovery_bootstrap, engine_path = sys.argv[1:3]
 def observed_run(command, **kwargs):
-    if command[1:3] == ['run', 'recover']:
-        command = [sys.executable, '-c', recovery_bootstrap, engine_path, command[3], 'second', 'cli']
+    # The adapter runs bin/funsearch under its own interpreter.
+    args = command[1:] if command[:1] == [sys.executable] else command
+    if args[1:3] == ['run', 'recover']:
+        command = [sys.executable, '-c', recovery_bootstrap, engine_path, args[3], 'second', 'cli']
     return original_run(command, **kwargs)
 lifecycle.subprocess.run = observed_run
 sys.argv = ['gc_lifecycle.py', 'sweep']
@@ -545,7 +573,7 @@ sys.exit(lifecycle.main())
                          "candidate.compile_try=id", "evaluator.library=x.so", "problem.name=x",
                          "mutator.model=x", "instance=n=7", "problem.instance=n=7"):
             with self.subTest(override=override):
-                result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
+                result = subprocess.run([sys.executable, str(SCRIPTS / "gc_lifecycle.py"), "launch",
                                          str(problem), "--notify", "n", "--overrides", override],
                                         env=self.env, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -636,7 +664,7 @@ class ToyHookTests(HookFixture, PipelineTestCase):
         self.assertFalse(list(self.registry.glob("*.json")))
 
     def test_launch_passes_instance_overrides_and_hooks(self):
-        result = subprocess.run(["python3", str(SCRIPTS / "gc_lifecycle.py"), "launch",
+        result = subprocess.run([sys.executable, str(SCRIPTS / "gc_lifecycle.py"), "launch",
                                  str(self.problem), "--notify", "launch-recipient",
                                  "--instance", "n=7", "--overrides",
                                  "search.workers=1 search.mutators=1 stop.duration_s=60"],

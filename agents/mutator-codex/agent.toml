@@ -1,0 +1,16 @@
+# A dedicated native Codex launch; the wrapper enforces fixed safety options.
+# The pack provider funsearch-codex (pack.toml) keeps the codex family for MCP
+# projection; its launcher ignores all provider/city arguments.
+scope = "rig"
+provider = "funsearch-codex"
+wake_mode = "fresh"
+work_dir = ".gc/funsearch/mutators/{{.Rig}}/{{.Agent}}"
+min_active_sessions = 0
+max_active_sessions = 3
+idle_timeout = "30m"
+pre_start = ["sh '{{.ConfigDir}}/scripts/fs-python' '{{.ConfigDir}}/scripts/codex_mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
+prompt_mode = "none"
+lifecycle = "one_shot"
+# codex_mutator_launch.py runs a "funsearch-codex-launch" marker during its
+# preflight, before it execs codex; see LIVENESS_MARKER there.
+process_names = ["codex", "funsearch-codex-launch"]

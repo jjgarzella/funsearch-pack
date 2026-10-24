@@ -19,7 +19,9 @@ class PipelineTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="funsearch pipeline ")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Production APIs resolve file paths. Canonicalize the scratch root too
+        # so tests behave the same when macOS TMPDIR is a /var symlink.
+        self.root = Path(self.temp.name).resolve()
         self.problem = self.root / "problem"
         # CLI check builds the fixture in place; tests must start from source.
         shutil.copytree(FIXTURE, self.problem, ignore=shutil.ignore_patterns("*.so", "*.o", "__pycache__"))

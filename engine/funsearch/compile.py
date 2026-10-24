@@ -164,13 +164,22 @@ def try_worker_env(cfg):
     """Environment needed to load ASan candidates in a separate worker.
 
     None removes FS_MEMORY_MB: ASan's large virtual shadow mapping cannot
-    coexist with an RLIMIT_AS limit. ASan's own limits keep evaluator.memory_mb
-    instead: the worker aborts once its RSS exceeds it, and a larger single
-    allocation returns NULL. Normal workers retain the RLIMIT_AS limit.
+    coexist with an RLIMIT_AS limit. Linux ASan enforces evaluator.memory_mb
+    through its own RSS and allocation limits. Apple's runtime does not enforce
+    the RSS option, so the worker applies the resident-set limit with Mach.
+    Normal workers retain the RLIMIT_AS limit where the host supports it.
     """
     compiler = shlex.split(os.environ.get("CC", "cc"))
+    if sys.platform == "darwin":
+        runtime_name = "libclang_rt.asan_osx_dynamic.dylib"
+        preload_name = "DYLD_INSERT_LIBRARIES"
+        separator = os.pathsep
+    else:
+        runtime_name = "libasan.so"
+        preload_name = "LD_PRELOAD"
+        separator = " "
     try:
-        result = subprocess.run([*compiler, "-print-file-name=libasan.so"],
+        result = subprocess.run([*compiler, f"-print-file-name={runtime_name}"],
                                 capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"cannot locate ASan runtime: {exc}") from exc
@@ -178,13 +187,19 @@ def try_worker_env(cfg):
     if not runtime.is_file():
         raise RuntimeError(f"cannot locate ASan runtime: {result.stdout.strip()!r}")
     preload = str(runtime.resolve())
-    if os.environ.get("LD_PRELOAD"):
-        preload += " " + os.environ["LD_PRELOAD"]
+    if os.environ.get(preload_name):
+        preload += separator + os.environ[preload_name]
     memory_mb = int(cfg.evaluator.memory_mb)
-    return {"LD_PRELOAD": preload,
-            "ASAN_OPTIONS": (f"detect_leaks=0:abort_on_error=1:hard_rss_limit_mb={memory_mb}"
-                             f":max_allocation_size_mb={memory_mb}:allocator_may_return_null=1"),
-            "FS_MEMORY_MB": None}
+    asan_options = "detect_leaks=0:abort_on_error=1:"
+    if sys.platform != "darwin":
+        asan_options += f"hard_rss_limit_mb={memory_mb}:"
+    asan_options += f"max_allocation_size_mb={memory_mb}:allocator_may_return_null=1"
+    result = {preload_name: preload, "ASAN_OPTIONS": asan_options, "FS_MEMORY_MB": None}
+    if sys.platform == "darwin":
+        # Apple Clang's ASan runtime does not enforce hard_rss_limit_mb. The C
+        # worker uses this value for its Mach resident-size watchdog instead.
+        result["FS_MEMORY_RSS_MB"] = str(memory_mb)
+    return result
 
 
 def check_exports(so_path, exports, env):
@@ -197,9 +212,10 @@ def check_exports(so_path, exports, env):
     """
     path = str(Path(so_path).resolve())
     if shutil.which("nm"):
+        command = (["nm", "-gU", path] if sys.platform == "darwin"
+                   else ["nm", "-D", "--defined-only", path])
         try:
-            result = subprocess.run(["nm", "-D", "--defined-only", path],
-                                    capture_output=True, text=True, timeout=60)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as exc:
             return False, f"cannot inspect exports: {exc}"
         if result.returncode:
@@ -207,8 +223,12 @@ def check_exports(so_path, exports, env):
         defined = set()
         for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 3:
+            if len(parts) >= (2 if sys.platform == "darwin" else 3):
                 symbol = parts[-1]
+                # Mach-O prefixes C symbols with an underscore in nm output;
+                # problem.toml names the source-level C ABI symbol.
+                if sys.platform == "darwin" and symbol.startswith("_"):
+                    symbol = symbol[1:]
                 defined.add(symbol)
                 # @@ marks the default version resolvable by dlsym.
                 if "@@" in symbol:
@@ -288,6 +308,16 @@ def compile_candidate(cfg, src_path, out_dir, mode):
     template = cfg.candidate.compile_try if mode == "try" else cfg.candidate.compile
     substitutions = {"{src}": shlex.quote(str(source)), "{out}": shlex.quote(str(library))}
     command = re.sub(r"\{src\}|\{out\}", lambda match: substitutions[match[0]], template)
+    if sys.platform == "darwin" and re.search(r"(?<!\S)-shared(?!\S)", command):
+        command_args = shlex.split(command)
+        has_undefined_mode = any(
+            arg == "-undefined" or
+            (arg.startswith("-Wl,") and "-undefined" in arg.split(","))
+            for arg in command_args)
+        if not has_undefined_mode:
+            # Linux permits unresolved references in a shared object by default.
+            # ld64 needs this explicit mode for the same plugin-style contract.
+            command += " -Wl,-undefined,dynamic_lookup"
     ok, log = run_command(command, directory, COMPILE_TIMEOUT_S)
     if ok and not library.is_file():
         ok, message = False, f"compiler did not produce {library}"

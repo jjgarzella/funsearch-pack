@@ -66,6 +66,20 @@ needs neither the lock nor a writable pack. `Worker` and
 `WorkerPool` both support context managers and idempotent `close()`.
 
 A worker starts in a new process group with `FS_MEMORY_MB` from configuration.
+On macOS, dyld's shared-cache reservations can make the requested `RLIMIT_AS`
+lower than the process's existing virtual-address range. When Darwin rejects
+that limit with `EINVAL`, the worker enforces the same configured size as a
+resident-set limit through Mach task information. The worker disables process
+creation with `RLIMIT_NPROC=0`, so descendants cannot bypass the worker-local
+RSS cap; startup fails if that restriction cannot be installed. The watchdog
+samples every 20 ms while evaluator or candidate code runs, waits efficiently
+between requests, and samples once per second while idle. A failed Mach query
+aborts the worker instead of silently disabling enforcement. The engine also
+samples the worker PID through Darwin `libproc` at the same cadence, so an
+`exec` that replaces the worker image cannot discard the RSS cap; a failed
+process query or overage kills the worker group. Linux continues to enforce
+`RLIMIT_AS`. Apple ASan trials use this same RSS path because Apple's runtime
+does not enforce `hard_rss_limit_mb`.
 The engine sends a blank request and reads its `bad request` response to ensure
 `fs_init` has finished; the C protocol has no spontaneous ready response.
 A fatal response or exit code 3 raises `EvaluatorInitError`. Other startup
@@ -133,16 +147,20 @@ active requests, sends QUIT, and allows one second for shutdown before killing
 and reaping each process and cleaning up its pipes and stderr reader.
 
 Try workers need the ASan runtime before loading sanitized candidate libraries.
-`try_worker_env(cfg)` asks `${CC:-cc} -print-file-name=libasan.so` for that runtime,
-prepends it to `LD_PRELOAD`, and sets `ASAN_OPTIONS` to
-`detect_leaks=0:abort_on_error=1:hard_rss_limit_mb=M:max_allocation_size_mb=M:allocator_may_return_null=1`
-with `M = evaluator.memory_mb`. It also removes `FS_MEMORY_MB`:
+`try_worker_env(cfg)` asks the configured compiler for its ASan runtime and
+preloads it (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS). It sets
+`ASAN_OPTIONS` with `detect_leaks=0`, `abort_on_error=1`,
+`max_allocation_size_mb=M`, and `allocator_may_return_null=1`, with
+`M = evaluator.memory_mb`; Linux also sets `hard_rss_limit_mb=M`. It removes
+`FS_MEMORY_MB`:
 ASan reserves a large virtual shadow address range, so the normal `RLIMIT_AS`
 limit makes sanitizer workers abort with `Failed to mmap` before evaluation.
-The normal pool retains the configured address-space limit. Sanitizer trials
-keep the same bound in ASan's terms instead: a worker whose resident memory
-exceeds `memory_mb` aborts (an `ERROR` crash result and a replacement worker),
-and a single larger allocation returns NULL. The
+The normal pool retains the configured address-space limit where supported.
+Sanitizer trials keep the same bound in ASan's terms on Linux. Apple's ASan
+does not enforce `hard_rss_limit_mb`, so the worker uses the same Mach
+resident-set watchdog as the normal macOS fallback. A worker whose resident
+memory exceeds `memory_mb` aborts (an `ERROR` crash result and a replacement
+worker), and a single larger allocation returns NULL. The
 environment overlay accepts `None` to remove a variable explicitly.
 
 Run the pipeline acceptance checks from the pack root:

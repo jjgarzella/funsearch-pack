@@ -11,9 +11,19 @@
 # Gas City formulas and hooks connect runs to mutator slot beads.
 # Run state belongs to the problem directory and is never committed.
 # The bundled cap-set example demonstrates a Julia-backed evaluator.
-# The mutator role uses Claude Haiku with a per-session tool guard.
+# Mutators default to Claude Haiku; an optional guarded Codex pool uses gpt-6-luna.
 # Implemented under epic mc-h4zx; see README.md for the layout and status.
 
 [pack]
 name = "funsearch"
 schema = 2
+
+# Guarded Codex mutator provider. Its family resolves to builtin codex, so Gas
+# City projects the effective MCP into the agent WorkDir, outside the model's
+# slot/. The launcher drops every gc-appended argument (no "$@" forwarding);
+# codex_mutator_launch.py fixes its own Codex flags, sandbox mode and model.
+[providers.funsearch-codex]
+base = "builtin:codex"
+command = "./.funsearch-codex-launch"
+path_check = "sh"
+resume_command = "./.funsearch-codex-launch"

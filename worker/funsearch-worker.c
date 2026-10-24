@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include "funsearch.h"
@@ -7,11 +10,18 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/types.h>
+#endif
 
 static void *candidate_handle;
 static FILE *proto;
@@ -217,9 +227,163 @@ static ssize_t read_request(void)
     return (ssize_t)length;
 }
 
+#if defined(__APPLE__)
+static unsigned long long rss_limit_bytes;
+static pthread_mutex_t rss_watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rss_watchdog_condition = PTHREAD_COND_INITIALIZER;
+static int rss_watchdog_active = 1;
+static unsigned long rss_watchdog_activity_generation;
+
+static void rss_watchdog_abort(const char *message)
+{
+    fprintf(stderr, "resident-set watchdog failed: %s\n", message);
+    fflush(stderr);
+    raise(SIGABRT);
+    _exit(128 + SIGABRT);
+}
+
+static int rss_watchdog_wait_state(unsigned long *seen_generation)
+{
+    struct timespec deadline;
+    int error;
+    int active;
+
+    error = pthread_mutex_lock(&rss_watchdog_mutex);
+    if (error)
+        rss_watchdog_abort("cannot lock watchdog state");
+    while (!rss_watchdog_active &&
+           rss_watchdog_activity_generation == *seen_generation) {
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&rss_watchdog_mutex);
+            rss_watchdog_abort("cannot read clock for idle wait");
+        }
+        deadline.tv_sec += 1;
+        error = pthread_cond_timedwait(&rss_watchdog_condition,
+                                       &rss_watchdog_mutex, &deadline);
+        if (error == ETIMEDOUT)
+            break;
+        if (error) {
+            pthread_mutex_unlock(&rss_watchdog_mutex);
+            rss_watchdog_abort("cannot wait for watchdog state");
+        }
+    }
+    active = rss_watchdog_active;
+    *seen_generation = rss_watchdog_activity_generation;
+    error = pthread_mutex_unlock(&rss_watchdog_mutex);
+    if (error)
+        rss_watchdog_abort("cannot unlock watchdog state");
+    return active;
+}
+
+static void rss_watchdog_set_active(int active)
+{
+    int error = pthread_mutex_lock(&rss_watchdog_mutex);
+    if (error)
+        rss_watchdog_abort("cannot lock watchdog state");
+    if (active && !rss_watchdog_active)
+        ++rss_watchdog_activity_generation;
+    rss_watchdog_active = active;
+    error = pthread_cond_signal(&rss_watchdog_condition);
+    if (error) {
+        pthread_mutex_unlock(&rss_watchdog_mutex);
+        rss_watchdog_abort("cannot signal watchdog state");
+    }
+    error = pthread_mutex_unlock(&rss_watchdog_mutex);
+    if (error)
+        rss_watchdog_abort("cannot unlock watchdog state");
+}
+
+static kern_return_t rss_watchdog_task_info(mach_task_basic_info_data_t *info,
+                                            mach_msg_type_number_t *count)
+{
+#if defined(FUNSEARCH_TEST_TASK_INFO_FAILURE)
+    (void)info;
+    (void)count;
+    return KERN_FAILURE;
+#else
+    return task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                     (task_info_t)info, count);
+#endif
+}
+
+static int prevent_subprocesses(void)
+{
+    /* Child tasks would otherwise escape this worker's Mach RSS accounting. */
+    struct rlimit limit = { .rlim_cur = 0, .rlim_max = 0 };
+    if (geteuid() == 0 || getuid() == 0) {
+        fatal("cannot enforce resident-set memory limit for a privileged worker");
+        return -1;
+    }
+    if (setrlimit(RLIMIT_NPROC, &limit) != 0) {
+        fprintf(stderr, "cannot disable subprocess creation for resident-set memory limit: %s\n",
+                strerror(errno));
+        fatal("cannot disable subprocess creation for resident-set memory limit");
+        return -1;
+    }
+    fprintf(stderr, "macOS resident-set fallback disables subprocess creation\n");
+    return 0;
+}
+
+static void *rss_watchdog(void *unused)
+{
+    unsigned long seen_generation = 0;
+    (void)unused;
+    for (;;) {
+        mach_task_basic_info_data_t info = {0};
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        int active = rss_watchdog_wait_state(&seen_generation);
+        kern_return_t result = rss_watchdog_task_info(&info, &count);
+        if (result != KERN_SUCCESS) {
+            char message[96];
+            snprintf(message, sizeof(message), "task_info returned %d", result);
+            rss_watchdog_abort(message);
+        }
+        if (info.resident_size > rss_limit_bytes) {
+            fprintf(stderr, "worker resident-set limit exceeded\n");
+            fflush(stderr);
+            raise(SIGABRT);
+            _exit(128 + SIGABRT);
+        }
+        if (active) {
+            struct timespec delay = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+            nanosleep(&delay, NULL);
+        }
+    }
+    return NULL;
+}
+
+static int start_rss_watchdog(unsigned long long mb)
+{
+    pthread_t thread;
+    int error;
+    if (prevent_subprocesses() != 0)
+        return -1;
+    rss_limit_bytes = mb * 1024 * 1024;
+    error = pthread_create(&thread, NULL, rss_watchdog, NULL);
+    if (error) {
+        errno = error;
+        fatal("cannot start resident-set watchdog");
+        return -1;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+#else
+static void rss_watchdog_set_active(int active)
+{
+    (void)active;
+}
+#endif
+
 static int memory_limit(void)
 {
     const char *value = getenv("FS_MEMORY_MB");
+#if defined(__APPLE__)
+    const char *rss_value = getenv("FS_MEMORY_RSS_MB");
+    int use_rss = rss_value != NULL;
+    if (use_rss)
+        value = rss_value;
+#endif
     char *end;
     unsigned long long mb;
     struct rlimit limit;
@@ -229,11 +393,28 @@ static int memory_limit(void)
     mb = strtoull(value, &end, 10);
     if (errno || end == value || *end || *value == '-' ||
         mb > ((unsigned long long)RLIM_INFINITY - 1) / (1024 * 1024)) {
+#if defined(__APPLE__)
+        fatal(use_rss ? "invalid FS_MEMORY_RSS_MB" : "invalid FS_MEMORY_MB");
+#else
         fatal("invalid FS_MEMORY_MB");
+#endif
         return -1;
     }
+#if defined(__APPLE__)
+    if (use_rss)
+        return start_rss_watchdog(mb);
+#endif
     limit.rlim_cur = limit.rlim_max = (rlim_t)(mb * 1024 * 1024);
     if (setrlimit(RLIMIT_AS, &limit) != 0) {
+#if defined(__APPLE__)
+        /* Darwin reserves a large shared-cache address range in every
+         * process. A cap below that existing reservation is rejected with
+         * EINVAL, so keep the worker usable and enforce the limit by RSS. */
+        if (errno == EINVAL) {
+            fprintf(stderr, "FS_MEMORY_MB cannot be applied with RLIMIT_AS on macOS; using resident-set watchdog\n");
+            return start_rss_watchdog(mb);
+        }
+#endif
         fatal(strerror(errno));
         return -1;
     }
@@ -305,6 +486,7 @@ int main(int argc, char **argv)
             return 3;
         }
     }
+    rss_watchdog_set_active(0);
 
     /* Embedded runtimes such as Julia may make stdin nonblocking during
      * initialization. The host protocol waits for each engine request. */
@@ -350,17 +532,21 @@ int main(int argc, char **argv)
         size_t path_length = strlen(path) + 1;
         memmove(request, path, path_length);
         wipe(request + path_length, sizeof(request) - path_length);
+        rss_watchdog_set_active(1);
         candidate_handle = dlopen(request, RTLD_NOW | RTLD_LOCAL);
         wipe(request, sizeof(request));
         if (!candidate_handle) {
+            rss_watchdog_set_active(0);
             error_reply(dlerror());
             continue;
         }
         fs_result result = score(resolve, argv[2]);
         dlclose(candidate_handle);
         candidate_handle = NULL;
+        rss_watchdog_set_active(0);
         reply(result);
     }
+    rss_watchdog_set_active(1);
     if (fini)
         fini();
     dlclose(evaluator);

@@ -214,7 +214,7 @@ exports = ["priority"]           # symbols that must be present in the .so (chec
 build = "make -C evaluator"      # run once at run start in the problem dir; may be empty
 library = "evaluator/libevaluator.so"
 timeout_s = 30                   # per fs_score call
-memory_mb = 2048                 # RLIMIT_AS for the worker
+memory_mb = 2048                 # worker memory cap (resident-set fallback on macOS)
 
 [search]
 islands = 4
@@ -326,17 +326,30 @@ after evaluator initialization, including when embedded Julia changes its flags.
 
 The engine owns timeouts and crash handling: it kills the worker on timeout,
 records \code{ERROR} with ``timeout'' or ``worker crashed: signal N'', and
-starts a replacement worker. If \code{FS\_MEMORY\_MB} is set, the worker uses its value to apply the
-\code{RLIMIT\_AS} memory limit through \code{setrlimit}. It must not install SIGSEGV handlers:
-embedded Julia uses its own. The daemon creates separate final and sanitizer
+starts a replacement worker. If \code{FS\_MEMORY\_MB} is set, the worker applies its value as an
+\code{RLIMIT\_AS} memory limit through \code{setrlimit}. On macOS, Darwin can
+reject that limit with \code{EINVAL} when shared-cache reservations already
+exceed it; the worker then enforces the same cap with a Mach resident-set
+watchdog. That fallback sets \code{RLIMIT\_NPROC} to zero to prevent
+subprocesses from escaping the worker-local cap, and fails startup if the
+restriction cannot be installed. The watchdog samples every 20 ms while
+evaluator or candidate code runs and once per second while idle; a failed Mach
+query aborts the worker. The Python engine also samples the worker PID through
+Darwin \code{libproc} at the same cadence, so an \code{exec} cannot discard the
+RSS cap; a failed process query or overage kills the worker group. It must not
+install SIGSEGV handlers: embedded Julia uses its own.
+The daemon creates separate final and sanitizer
 pools, each with \code{search.workers} processes started eagerly and kept for
 the whole run, so a run holds twice that many resident evaluators and an idle
 pool cannot lend capacity to the other. Sanitizer workers preload
-libasan and remove \code{FS\_MEMORY\_MB}: ASan's virtual shadow mapping otherwise
-fails under \code{RLIMIT\_AS}. Final workers keep the configured address-space
-limit. Trials keep scoring timeouts and bound memory in ASan's terms instead:
-\code{hard\_rss\_limit\_mb} and \code{max\_allocation\_size\_mb} equal
-\code{evaluator.memory\_mb}. The engine
+the ASan runtime and remove \code{FS\_MEMORY\_MB}: ASan's virtual shadow
+mapping otherwise fails under \code{RLIMIT\_AS}. Final workers keep the
+configured address-space limit where supported, with the resident-set fallback
+on macOS. Trials keep scoring timeouts and bound memory in ASan's terms instead:
+Linux sets \code{hard\_rss\_limit\_mb} and all platforms set
+\code{max\_allocation\_size\_mb} to \code{evaluator.memory\_mb}. Apple's ASan
+does not enforce \code{hard\_rss\_limit\_mb}, so macOS sanitizer workers use
+the same Mach resident-set watchdog. The engine
 waits for worker initialization using a blank-request protocol probe; fatal
 initialization fails the run, while other startup failures have bounded retries.
 A warm evaluator process is therefore reused across
@@ -528,17 +541,43 @@ and wrong runs/slots/tasks are denied. File tools can read only the current
 Paths with shell metacharacters are unsupported; quoted spaces are allowed.
 
 \subsection{Trust model (v1)}
+The optional \code{[mutator] provider = "codex"} routes slots to
+\code{funsearch.mutator-codex}; the default remains Claude. An omitted model
+selects the provider default (\code{gpt-6-luna} for Codex), and explicit models
+remain slot \code{opt\_model} metadata. Each provider pool has its own cap.
+The Codex-only launcher pins CLI 0.164.0 and selects the host-native sandbox:
+macOS Seatbelt with a private \code{funsearch\_native} permission profile, or
+the existing Linux \code{workspace-write} path. Both disable shell networking,
+use approval \code{never}, add no write roots, and keep temporary directories
+read-only. The macOS profile also denies \code{~/.ssh} reads. Before claiming a
+slot, the launcher verifies effective configuration and executes a harmless
+command through the selected native sandbox. It uses no shared daemon and
+shares only authentication with its private Codex home. Hosted search, apps,
+plugins, subagents and other additional capabilities are disabled.
+
+The native Codex \code{PreToolUse} adapter reuses the original task policy.
+The model patches only a local staging \path{child.c}; the guard copies it into
+the current task before try/submit. Only trusted guard code performs approved
+engine/control operations outside the model shell sandbox, returning a private
+output receipt and the original exit status. Unified exec is disabled to avoid
+unchecked input to persistent shell processes. Codex hooks can fail open on
+runtime failure. Linux \code{workspace-write} allows broader filesystem reads;
+on macOS, task-only reads and child-only edits still rely on a functioning hook
+even though Seatbelt limits writes and denies \code{~/.ssh}. See
+\path{docs/codex-mutator.md} for the controls, limitations and separate live
+smoke-test gate. Unit/configuration checks alone are not live acceptance.
+
 Candidate C programs written by LLM mutators are compiled and run natively as
 the invoking user, with that user's filesystem and network access. The mutator
 tool guard and compile source policy keep honest mutators on task and catch
 accidents. They are \textbf{not a security boundary} and do not contain
-adversarial code. Use v1 only for trusted local experiments. OS-level isolation
-is future work, tracked in backlog bead \code{mc-v8f3.5}.
+adversarial code. Use v1 only for trusted local experiments. Broader evaluator
+isolation remains future work, tracked in backlog bead \code{mc-v8f3.5}.
 
-This enforces a Claude tool policy, and it is not a boundary against the
-mutator itself. Gas City's agent schema supplies no OS filesystem/network
-sandbox. The guard must allow \code{try} and \code{submit}, which compile and run
-the mutator's C with the host user's access; that code can rewrite the
+The task guard is not a boundary against evaluator code. Gas City's agent
+schema supplies no OS filesystem/network sandbox for candidate processes. The
+guard must allow \code{try} and \code{submit}, which compile and run the
+mutator's C with the host user's access; that code can rewrite the
 session's generated settings, slot context and run state, and use the city.
 \code{TASK.md} embeds other candidates' source, a prompt-injection channel.
 The compile source policy is a best-effort lint for common mutator accidents:

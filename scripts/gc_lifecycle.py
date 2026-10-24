@@ -147,13 +147,14 @@ def on_start(root):
             start_locked(root)
 
 
-def mutator_pool_cap():
+def mutator_pool_cap(provider="claude"):
     """The pack's mutator max_active_sessions, or None if it cannot be read.
 
     A city may patch the pool, so this is the pack default, not a guarantee.
     """
     try:
-        with MUTATOR_AGENT.open("rb") as handle:
+        agent = MUTATOR_AGENT if provider == "claude" else PACK / "agents/mutator-codex/agent.toml"
+        with agent.open("rb") as handle:
             return int(tomllib.load(handle)["max_active_sessions"])
     except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
         return None
@@ -167,6 +168,10 @@ def start_locked(root):
         return
     fs.update(city=str(city), rig=rig, notify=notify)
     cfg = metadata["config"]
+    # Refuse an unknown provider before any bead or registry entry exists.
+    provider = cfg["mutator"].get("provider", "claude")
+    if provider not in ("claude", "codex"):
+        raise ValueError("unknown mutator provider")
     # Informational only: liveness is the run directory's engine lock.
     pid = int((root / "engine.pid").read_text())
     registry = registry_path(city, metadata["run_id"])
@@ -184,7 +189,7 @@ def start_locked(root):
     entry = {"run_id": metadata["run_id"], "run_dir": str(root),
              "run_bead": fs["run_bead"], "rig": rig, "notify": notify}
     write_json(registry, entry)
-    cap = mutator_pool_cap()
+    cap = mutator_pool_cap(provider)
     if cap is not None and cfg["search"]["mutators"] > cap:
         # Slots beyond the pool cap wait for a free session; the cap is also
         # shared by every concurrent run in the rig.
@@ -198,14 +203,16 @@ def start_locked(root):
         if slot not in slots:
             fields = {"fs.run_dir": str(root), "fs.slot": slot,
                       "fs.tasks_per_session": str(cfg["search"]["tasks_per_session"]),
-                      "fs.run_bead": fs["run_bead"], "opt_model": cfg["mutator"]["model"]}
+                      "fs.run_bead": fs["run_bead"], "fs.provider": provider,
+                      "opt_model": cfg["mutator"]["model"]}
             slots[slot] = scoped_gc(city, rig, "bd", "create",
                 f"funsearch slot {metadata['run_id']}/{slot}", "--labels", "funsearch-slot",
                 "--parent", fs["run_bead"], "--metadata", json.dumps(fields),
                 "--description", "Follow the FunSearch mutator slot loop.", "--silent")
             write_lifecycle(root, fs)
         if slot not in routed:
-            scoped_gc(city, rig, "sling", f"{rig}/funsearch.mutator", slots[slot], "--no-formula")
+            role = "mutator" if provider == "claude" else "mutator-codex"
+            scoped_gc(city, rig, "sling", f"{rig}/funsearch.{role}", slots[slot], "--no-formula")
             routed.append(slot)
             write_lifecycle(root, fs)
 
@@ -282,7 +289,7 @@ def failed_summary(root, metadata):
     # The engine recovers authoritative counters and best.c from the live
     # database or its newest readable snapshot. Without either, keep what
     # the previous summary knew and mark the run failed.
-    result = subprocess.run([str(PACK / "bin" / "funsearch"), "run", "recover", str(root)],
+    result = subprocess.run([sys.executable, str(PACK / "bin" / "funsearch"), "run", "recover", str(root)],
                             capture_output=True, text=True, timeout=300)
     if result.returncode == 0:
         return
@@ -354,7 +361,7 @@ def launch(args):
         raise ValueError("notify is required; Gas City exports no reliable slinger recipient")
     env = os.environ.copy()
     env["FS_NOTIFY"] = args.notify
-    command = [str(PACK / "bin" / "funsearch"), "run", "start", args.problem]
+    command = [sys.executable, str(PACK / "bin" / "funsearch"), "run", "start", args.problem]
     if args.instance:
         command += ["--instance", args.instance]
     for override in shlex.split(args.overrides):

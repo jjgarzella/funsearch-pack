@@ -196,7 +196,7 @@ class RecoverTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.run = Path(temp.name) / "run"
+        self.run = Path(temp.name).resolve() / "run"
         (self.run / "snapshots").mkdir(parents=True)
         cfg = Config()
         cfg.search.islands = 1

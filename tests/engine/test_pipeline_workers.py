@@ -1,19 +1,566 @@
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import errno
+import json
 import os
 from pathlib import Path
 import random
+import select
 import signal
 import subprocess
+import sys
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from engine.funsearch._process import kill_group
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
     RECYCLE_SCORES, STDERR_LIMIT_BYTES, STDERR_TAIL_BYTES, EvaluatorInitError, Worker,
     WorkerError, WorkerPool, _StderrTail, _checked_reply, worker_binary)
 from tests.engine.pipeline_support import PipelineTestCase, ROOT
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_permission_error_reaps_worker_and_reports_possible_descendants(self):
+        for leader_status, should_kill in ((None, True), (-signal.SIGKILL, False)):
+            with self.subTest(leader_status=leader_status):
+                process = Mock(pid=123, poll=Mock(return_value=leader_status))
+                with patch("engine.funsearch._process.sys.platform", "linux"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=PermissionError("permission denied")) as killpg:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain"):
+                        kill_group(process)
+
+                killpg.assert_called_once_with(123, signal.SIGKILL)
+                process.poll.assert_called_once_with()
+                if should_kill:
+                    process.kill.assert_called_once_with()
+                else:
+                    process.kill.assert_not_called()
+                process.wait.assert_called_once_with()
+
+    def test_darwin_permission_error_for_zombie_only_group_is_ignored(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=False) as has_live_members:
+            kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        self.assertTrue(all(call.args == (123, signal.SIGKILL) for call in killpg.call_args_list))
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_retries_group_signal_after_reaping(self):
+        for retry_error in (None, ProcessLookupError("group no longer exists")):
+            with self.subTest(retry_error=retry_error):
+                events = []
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                process.wait.side_effect = lambda: events.append("wait")
+                attempts = 0
+
+                def killpg(pgid, sig):
+                    nonlocal attempts
+                    self.assertEqual((pgid, sig), (123, signal.SIGKILL))
+                    attempts += 1
+                    if attempts == 1:
+                        events.append("initial")
+                        raise PermissionError("permission denied")
+                    events.append("retry")
+                    if retry_error is not None:
+                        raise retry_error
+
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg", side_effect=killpg):
+                    kill_group(process)
+
+                self.assertEqual(events, ["initial", "wait", "retry"])
+                self.assertEqual(attempts, 2)
+                process.poll.assert_called_once_with()
+                process.wait.assert_called_once_with()
+
+    def test_darwin_permission_error_for_live_group_is_reported(self):
+        process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch("engine.funsearch._process.os.killpg",
+                      side_effect=PermissionError("permission denied")) as killpg, \
+                patch("engine.funsearch._process._darwin_group_has_live_members",
+                      return_value=True) as has_live_members:
+            with self.assertRaisesRegex(
+                    PermissionError,
+                    r"could not signal process group 123; descendants may remain"):
+                kill_group(process)
+
+        self.assertEqual(killpg.call_count, 2)
+        process.poll.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        has_live_members.assert_called_once_with(123)
+
+    def test_darwin_group_inspection_distinguishes_zombies_from_live_members(self):
+        from engine.funsearch._process import _darwin_group_has_live_members
+
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 Z+\n 456 S\n")):
+            self.assertFalse(_darwin_group_has_live_members(123))
+        with patch("engine.funsearch._process.subprocess.run",
+                   return_value=Mock(stdout=" 123 Z\n 123 S+\n")):
+            self.assertTrue(_darwin_group_has_live_members(123))
+
+    def test_darwin_unknown_group_inspection_preserves_permission_error(self):
+        unknown_queries = (
+            ("ps unavailable", OSError("ps unavailable")),
+            ("ps timeout", subprocess.TimeoutExpired(["ps"], 1)),
+            ("malformed output", Mock(stdout="not a ps row\n")),
+        )
+        for label, query_result in unknown_queries:
+            with self.subTest(query_result=label):
+                process = Mock(pid=123, poll=Mock(return_value=-signal.SIGKILL))
+                permission_error = PermissionError("permission denied")
+                is_error = isinstance(query_result, BaseException)
+                with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                        patch("engine.funsearch._process.os.killpg",
+                              side_effect=permission_error) as killpg, \
+                        patch("engine.funsearch._process.subprocess.run",
+                              side_effect=query_result if is_error else None,
+                              return_value=None if is_error else query_result) as ps:
+                    with self.assertRaisesRegex(
+                            PermissionError,
+                            r"could not signal process group 123; descendants may remain") as caught:
+                        kill_group(process)
+
+                self.assertIs(caught.exception.__cause__, permission_error)
+                self.assertEqual(killpg.call_count, 2)
+                ps.assert_called_once()
+                process.wait.assert_called_once_with()
+
+
+class WorkerWatchdogTests(unittest.TestCase):
+    def test_pool_initiated_watchdog_kill_reports_query_failure(self):
+        worker = Worker.__new__(Worker)
+
+        class StopAfterKill:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits > 1:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        class Process:
+            pid = 123
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        condition = StopAfterKill()
+        process = Process()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._rss_limit_bytes = 1024
+        worker.process = process
+
+        def kill_worker(killed_process):
+            self.assertIs(killed_process, process)
+            process.returncode = -signal.SIGKILL
+
+        failure = "worker resident-set query failed: simulated proc_pidinfo failure"
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=OSError("simulated proc_pidinfo failure")), \
+                patch("engine.funsearch.workers.kill_group", side_effect=kill_worker) as kill_group:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        kill_group.assert_called_once_with(process)
+        self.assertEqual(worker._pool_termination_reason, failure)
+        self.assertEqual(worker._exit_message(-signal.SIGKILL), failure)
+
+    def test_esrch_after_worker_exit_stops_watchdog_without_query_error(self):
+        worker = Worker.__new__(Worker)
+
+        class StopWhenInactive:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if not worker._rss_watchdog_active:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        condition = StopWhenInactive()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_thread = object()
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._rss_limit_bytes = 1024
+        # Model the exit race: proc_pidinfo sees ESRCH before Popen.poll has
+        # collected the child's status.
+        worker.process = Mock(pid=123, poll=Mock(return_value=None))
+
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=OSError(errno.ESRCH, "No such process")) as resident_bytes, \
+                patch("engine.funsearch.workers.kill_group") as kill_group:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        self.assertFalse(worker._rss_watchdog_active)
+        self.assertIsNone(worker._rss_watchdog_error)
+        worker.process.poll.assert_called_once_with()
+        resident_bytes.assert_called_once_with(123)
+        kill_group.assert_not_called()
+
+    def test_esrch_for_replaced_worker_keeps_watchdog_active(self):
+        worker = Worker.__new__(Worker)
+
+        class StopAfterThreeWaits:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits >= 3:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        condition = StopAfterThreeWaits()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._rss_limit_bytes = 1024
+        old_process = Mock(pid=123, poll=Mock(return_value=None))
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
+        worker.process = old_process
+
+        def query_resident_bytes(pid):
+            if pid == old_process.pid:
+                worker._set_process(replacement)
+                raise OSError(errno.ESRCH, "No such process")
+            return 512
+
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=query_resident_bytes) as resident_bytes, \
+                patch.object(worker, "_set_rss_watchdog_active") as set_active:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 3)
+        self.assertIs(worker.process, replacement)
+        self.assertTrue(worker._rss_watchdog_active)
+        self.assertEqual(
+            [call.args[0] for call in resident_bytes.call_args_list],
+            [old_process.pid, replacement.pid],
+        )
+        set_active.assert_not_called()
+
+    def test_watchdog_failure_for_replaced_worker_is_discarded(self):
+        worker = Worker.__new__(Worker)
+        old_process = Mock(pid=123, poll=Mock(return_value=None))
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
+
+        class ReplaceBeforeTerminationCheck:
+            def __init__(self):
+                self.lock = threading.Condition()
+                self.enters = 0
+                self.waits = 0
+
+            def __enter__(self):
+                self.enters += 1
+                if self.enters == 2:
+                    # The old process passes the watchdog's pre-lock identity
+                    # check, then a replacement wins the condition lock.
+                    with self.lock:
+                        worker.process = replacement
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self.lock.release()
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits >= 2:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        worker._rss_watchdog_condition = ReplaceBeforeTerminationCheck()
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_lock = threading.Lock()
+        worker._pool_termination_reason = None
+        worker._rss_limit_bytes = 1024
+        worker.process = old_process
+
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=OSError(errno.EIO, "simulated proc_pidinfo failure")), \
+                patch("engine.funsearch.workers.kill_group") as kill_group:
+            worker._watch_worker_rss()
+
+        self.assertIs(worker.process, replacement)
+        self.assertIsNone(worker._rss_watchdog_error)
+        self.assertIsNone(worker._pool_termination_reason)
+        kill_group.assert_not_called()
+
+    def test_starting_replacement_reactivates_watchdog(self):
+        worker = Worker.__new__(Worker)
+        worker._rss_watchdog_condition = threading.Condition()
+        worker._rss_watchdog_thread = object()
+        worker._rss_watchdog_active = False
+        worker._rss_watchdog_error = "stale worker failure"
+        worker._pool_termination_lock = threading.Lock()
+        worker._pool_termination_reason = "stale worker failure"
+        replacement = Mock(pid=456, poll=Mock(return_value=None))
+
+        worker._set_process(replacement)
+
+        self.assertIs(worker.process, replacement)
+        self.assertTrue(worker._rss_watchdog_active)
+        self.assertIsNone(worker._rss_watchdog_error)
+        self.assertIsNone(worker._pool_termination_reason)
+
+    def test_query_failure_during_activation_is_preserved(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=EOFError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_crash_message", return_value="worker crashed"), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
+    def test_query_failure_overrides_score_timeout(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=TimeoutError), \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+
+    def test_pool_watchdog_reason_is_returned_from_score_after_worker_exit(self):
+        worker = Worker.__new__(Worker)
+        worker._lock = threading.Lock()
+        worker._closed = False
+        worker._failure = None
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._recycle_due = False
+        failure = "worker resident-set query failed: simulated proc_pidinfo failure"
+
+        def activate_watchdog(active):
+            if active:
+                worker._rss_watchdog_error = failure
+                worker._record_pool_termination(failure)
+
+        with patch.object(worker, "_set_rss_watchdog_active", side_effect=activate_watchdog), \
+                patch.object(worker, "_stale_output", return_value=False), \
+                patch.object(worker, "_send"), \
+                patch.object(worker, "_line", side_effect=EOFError), \
+                patch.object(worker, "_exit_snapshot",
+                             return_value=(-signal.SIGKILL, False)) as exit_snapshot, \
+                patch.object(worker, "_dispose"), \
+                patch.object(worker, "_with_stderr", side_effect=lambda message: message), \
+                patch.object(worker, "_start"):
+            result = worker.score("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], failure)
+        exit_snapshot.assert_called_once_with()
+
+    def test_idle_watchdog_wake_does_not_inspect_worker(self):
+        worker = Worker.__new__(Worker)
+
+        class WakeTwiceThenStop:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits == 2:
+                    worker._rss_watchdog_stop = True
+
+        condition = WakeTwiceThenStop()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = False
+        worker._rss_watchdog_stop = False
+        worker.process = Mock(pid=123, poll=Mock(return_value=None))
+        worker._rss_limit_bytes = 1024
+
+        with patch("engine.funsearch.workers.process_resident_bytes", return_value=0) as resident_bytes:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        worker.process.poll.assert_not_called()
+        resident_bytes.assert_not_called()
+
+
+PORTABLE_MAIN_DATA_SCAN = r"""#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    const struct mach_header *raw = _dyld_get_image_header(0);
+    if (!raw || raw->magic != MH_MAGIC_64) return 0;
+    const struct mach_header_64 *header = (const struct mach_header_64 *)raw;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    const struct load_command *command = (const struct load_command *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if (command->cmdsize < sizeof(*command)) return 0;
+        if (command->cmd == LC_SEGMENT_64 &&
+            command->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if ((segment->initprot & (VM_PROT_READ | VM_PROT_WRITE)) ==
+                (VM_PROT_READ | VM_PROT_WRITE)) {
+                const unsigned char *base = (const unsigned char *)
+                    ((uintptr_t)segment->vmaddr + (uintptr_t)slide);
+                if (scan(base, (size_t)segment->vmsize, context)) return 1;
+            }
+        }
+        command = (const struct load_command *)((const char *)command + command->cmdsize);
+    }
+    return 0;
+}
+#else
+#include <link.h>
+typedef int (*main_data_scan_fn)(const unsigned char *, size_t, void *);
+struct main_data_scan_request { main_data_scan_fn scan; void *context; };
+static int scan_main_image(struct dl_phdr_info *image, size_t info_size, void *opaque) {
+    (void)info_size;
+    if (image->dlpi_name[0]) return 0;
+    struct main_data_scan_request *request = (struct main_data_scan_request *)opaque;
+    for (int i = 0; i < image->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *segment = &image->dlpi_phdr[i];
+        if (segment->p_type != PT_LOAD ||
+            (segment->p_flags & (PF_R | PF_W)) != (PF_R | PF_W)) continue;
+        const unsigned char *base = (const unsigned char *)
+            ((uintptr_t)image->dlpi_addr + (uintptr_t)segment->p_vaddr);
+        if (request->scan(base, (size_t)segment->p_memsz, request->context)) return 1;
+    }
+    return 0;
+}
+static int scan_main_data(main_data_scan_fn scan, void *context) {
+    struct main_data_scan_request request = {scan, context};
+    return dl_iterate_phdr(scan_main_image, &request);
+}
+#endif
+static int nonce_region(const unsigned char *bytes, size_t size, void *opaque) {
+    char *token = (char *)opaque;
+    for (size_t i = 1; i + 33 <= size; ++i) {
+        if (!bytes[i - 1] && !bytes[i + 32] &&
+            strspn((const char *)bytes + i, "0123456789abcdef") == 32) {
+            memcpy(token, bytes + i, 32);
+            token[32] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+static int find_main_nonce(char token[33]) {
+    token[0] = '\0';
+    return scan_main_data(nonce_region, token);
+}
+struct byte_search { const unsigned char *needle; size_t length; };
+static int bytes_region(const unsigned char *bytes, size_t size, void *opaque) {
+    const struct byte_search *search = (const struct byte_search *)opaque;
+    if (search->length > size) return 0;
+    for (size_t i = 0; i + search->length <= size; ++i)
+        if (!memcmp(bytes + i, search->needle, search->length)) return 1;
+    return 0;
+}
+static int main_data_contains(const void *needle, size_t length) {
+    struct byte_search search = {(const unsigned char *)needle, length};
+    return scan_main_data(bytes_region, &search);
+}
+"""
 
 
 class StderrTailTests(unittest.TestCase):
@@ -190,16 +737,22 @@ void fs_fini(void) {
         cfg.evaluator.memory_mb = 256
         pool = WorkerPool(cfg, self.evaluator(), "n=1", 1, try_worker_env(cfg))
         self.addCleanup(pool.close)
-        source = self.source("#include <stdlib.h>\n#include <string.h>\n"
+        source = self.source("#include <stdlib.h>\n"
                              "double f(void) { for (;;) { char *p = malloc(32 << 20);"
-                             " if (!p) return -1; memset(p, 1, 32 << 20); } }")
+                             " if (!p) return -1; volatile char *pages = p;"
+                             " for (size_t i = 0; i < (32u << 20); i += 4096) pages[i] = 1; } }")
         ok, library, log = compile_candidate(cfg, source, self.root / "hog", "try")
         self.assertTrue(ok, log)
         result = pool.score(library, 20)
         self.assertEqual(result["status"], "ERROR")
-        # ASan aborts at hard_rss_limit_mb rather than letting RSS grow.
-        self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
-                        result["msg"][:200])
+        if sys.platform == "darwin":
+            # The native Mach watchdog and parent monitor enforce the same
+            # cap; either can observe the overage first.
+            self.assertIn("resident-set limit exceeded", result["msg"])
+        else:
+            # ASan enforces hard_rss_limit_mb on Linux.
+            self.assertTrue(result["msg"].startswith(f"worker crashed: signal {signal.SIGABRT}"),
+                            result["msg"][:200])
         self.assertEqual(pool.score(self.candidate("good", "try"), 5)["status"], "OK")
 
     def test_oversized_reply_without_newline_fails_promptly(self):
@@ -268,32 +821,213 @@ double f(void) {
         self.assertIn("does not answer this request", result["msg"])
         self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
+    def test_pending_protocol_output_wins_a_race_with_clean_worker_exit(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        process = Mock(stdout=stdout, stdin=Mock(), poll=Mock(return_value=0),
+                       wait=Mock(return_value=0))
+        worker = Worker.__new__(Worker)
+        worker.process = process
+        worker._buffer = bytearray()
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._closed = False
+        worker._failure = None
+        worker._scores = 0
+        worker._send = Mock()
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        real_select = select.select
+        calls = 0
+
+        def miss_the_final_wakeup(readers, writers, exceptional, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # The child writes and exits just after select checks the pipe.
+                # The next pass must collect these bytes before classifying
+                # the already-observed clean exit.
+                writer.write(b'{"status":"OK","score":1e300,"sig":[],"msg":""}\n')
+                writer.close()
+                return [], [], []
+            return real_select(readers, writers, exceptional, 0)
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers.select.select",
+                      side_effect=miss_the_final_wakeup):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "worker protocol error: reply does not answer this request")
+        self.assertGreaterEqual(process.wait.call_count, 1)
+
+    def test_valid_score_reply_is_rejected_when_worker_exits_cleanly(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._scores = 0
+        worker._send = Mock()
+        worker._line = Mock(return_value=json.dumps({
+            "nonce": "score-nonce",
+            "status": "OK",
+            "score": 1.5,
+            "sig": [],
+            "msg": "",
+        }))
+        worker._sync = Mock()
+        worker._exit_snapshot = Mock(return_value=(0, False))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers.secrets.token_hex",
+                      return_value="score-nonce"):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "worker crashed: exit code 0")
+        self.assertEqual(worker._scores, 0)
+        worker._send.assert_called_once_with("SCORE #score-nonce candidate.so")
+        worker._sync.assert_called_once()
+        worker._dispose.assert_called_once_with()
+        worker._start.assert_called_once_with()
+
+    def test_late_score_reply_after_deadline_remains_a_timeout(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._send = Mock()
+        worker._line = Mock(side_effect=TimeoutError)
+        worker._exit_snapshot = Mock(return_value=(0, True))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["msg"], "timeout after 1s")
+        self.assertNotIn("protocol error", result["msg"])
+
+    def test_line_leaves_readable_reply_pending_at_deadline(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        reply = b'{"status":"OK","score":1,"sig":[],"msg":""}\n'
+        writer.write(reply)
+
+        worker = Worker.__new__(Worker)
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+
+        with patch("engine.funsearch.workers.time.monotonic", side_effect=[1.0, 2.0]), \
+                patch("engine.funsearch.workers.select.select",
+                      return_value=([stdout], [], [])):
+            with self.assertRaises(TimeoutError):
+                worker._line(2.0)
+
+        self.assertEqual(worker._buffer, bytearray())
+        self.assertEqual(os.read(stdout.fileno(), len(reply)), reply)
+
+    def test_sync_timeout_with_pending_bytes_remains_a_protocol_error(self):
+        worker = Worker.__new__(Worker)
+        worker._recycle_due = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._closed = False
+        worker._failure = None
+        worker._send = Mock()
+        worker._line = Mock(return_value="{}")
+        worker._sync = Mock(side_effect=TimeoutError)
+        worker._exit_snapshot = Mock(return_value=(0, True))
+        worker._dispose = Mock()
+        worker._with_stderr = lambda message: message
+        worker._start = Mock()
+
+        with patch.object(worker, "_stale_output", return_value=False), \
+                patch("engine.funsearch.workers._checked_reply", return_value={"status": "OK"}):
+            result = worker._score_locked("candidate.so", 1)
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(
+            result["msg"],
+            "worker protocol error: unexpected output after worker exit",
+        )
+
+    def test_post_exit_protocol_drain_rejects_oversized_pending_response(self):
+        worker = Worker.__new__(Worker)
+        stdout = Mock()
+        stdout.fileno.return_value = 123
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+        chunks = [b"x" * 4096 for _ in range(16)] + [b"x"]
+
+        with patch("engine.funsearch.workers.select.select",
+                   return_value=([stdout], [], [])), \
+                patch("engine.funsearch.workers.os.read", side_effect=chunks) as read:
+            with self.assertRaisesRegex(WorkerError, "worker response exceeds 64 KiB"):
+                worker._drain_protocol_after_exit()
+
+        self.assertEqual(read.call_count, 17)
+
+    def test_post_exit_protocol_drain_returns_while_descendant_holds_stdout_open(self):
+        read_fd, write_fd = os.pipe()
+        stdout = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        self.addCleanup(stdout.close)
+        self.addCleanup(writer.close)
+        worker = Worker.__new__(Worker)
+        worker.process = Mock(stdout=stdout)
+        worker._buffer = bytearray()
+        writer.write(b"late output\n")
+
+        errors = []
+
+        def drain():
+            try:
+                worker._drain_protocol_after_exit()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=drain, daemon=True)
+        thread.start()
+        thread.join(timeout=2)
+        returned_before_eof = not thread.is_alive()
+        if thread.is_alive():
+            writer.close()
+            thread.join(timeout=1)
+
+        self.assertTrue(
+            returned_before_eof,
+            "post-exit protocol drain waited for EOF while a descendant held stdout open",
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(worker._buffer, b"late output\n")
+
     def test_forged_reply_with_the_request_token_is_detected(self):
         # The token is not in any request buffer, but a candidate sharing the
         # process can still find the worker's copy. The SYNC barrier then sees
         # the worker's own reply as a second line.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <stdio.h>
-#include <string.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 double f(void) {
-    if (!dl_iterate_phdr(scan, NULL)) return -1;
+    if (!find_main_nonce(token)) return -1;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     return 0;
@@ -313,24 +1047,13 @@ double f(void) {
         # dlopen runs constructors, so the request buffer must no longer hold
         # "SCORE #<token>" by then. The needle is built at run time so the
         # candidate's own read-only literal cannot match.
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
-#include <string.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 static int found = -1;
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
+__attribute__((constructor)) static void probe(void) {
     char needle[8] = "SCORE ";
-    (void)size; (void)data;
     needle[6] = '#';
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        if (memmem((const char *)(info->dlpi_addr + ph->p_vaddr), ph->p_memsz, needle, 7))
-            return 1;
-    }
-    return 0;
+    found = main_data_contains(needle, 7);
 }
-__attribute__((constructor)) static void probe(void) { found = dl_iterate_phdr(scan, NULL); }
 double f(void) { return found == 0 ? 2 : found; }
 """)
         ok, library, log = compile_candidate(self.cfg, source, self.root / "ctor-scan", "final")
@@ -343,33 +1066,16 @@ double f(void) { return found == 0 ? 2 : found; }
     # isolation tracked as mc-v8f3.5; drop expectedFailure when that lands.
     @unittest.expectedFailure
     def test_candidate_reading_stdin_cannot_answer_the_barrier(self):
-        source = self.source(r"""#define _GNU_SOURCE
-#include <link.h>
+        source = self.source(PORTABLE_MAIN_DATA_SCAN + r"""
 #include <pthread.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 static char token[33];
-static int scan(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name[0]) return 0;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
-        const char *p = (const char *)(info->dlpi_addr + ph->p_vaddr);
-        for (size_t j = 1; j + 33 <= ph->p_memsz; ++j)
-            if (!p[j - 1] && !p[j + 32] && strspn(p + j, "0123456789abcdef") == 32) {
-                memcpy(token, p + j, 32);
-                return 1;
-            }
-    }
-    return 0;
-}
 static void *steal(void *unused) {
     char line[128];
     size_t n = 0;
     (void)unused;
-    if (!dl_iterate_phdr(scan, NULL)) return NULL;
+    if (!find_main_nonce(token)) return NULL;
     for (int fd = 3; fd < 64; ++fd)
         dprintf(fd, "{\"nonce\":\"%s\",\"status\":\"OK\",\"score\":1e300,\"sig\":[],\"msg\":\"\"}\n", token);
     while (n + 1 < sizeof(line) && read(0, line + n, 1) == 1 && line[n] != '\n')
@@ -391,6 +1097,8 @@ double f(void) {
         result = self.pool().score(library, 5)
         self.assertNotEqual(result["status"], "OK", result)
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_late_protocol_output_is_not_charged_to_the_next_request(self):
         source = self.source(r"""#define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -539,7 +1247,8 @@ double f(void) {
         private = {"GC_SESSION_ID": "s", "BEADS_DIR": "/b", "MY_API_TOKEN": "t",
                    "ANTHROPIC_API_KEY": "k", "SSH_AUTH_SOCK": "/agent", "FS_STORE": "/x",
                    "SOLVER_LICENSE": "l"}
-        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "SOLVER_LICENSE_FILE": "/opt/l"}
+        public = {"LC_ALL": "C", "TMPDIR": "/tmp", "DYLD_LIBRARY_PATH": "/opt/dyld",
+                  "SOLVER_LICENSE_FILE": "/opt/l"}
         self.cfg.evaluator.env = ["SOLVER_*_FILE"]
         with patch.dict(os.environ, {**private, **public}):
             pool = self.pool(extra_env={"KEEP_ME": "1"})
@@ -548,6 +1257,56 @@ double f(void) {
         self.assertLessEqual(public.items(), env.items())
         self.assertEqual(env["KEEP_ME"], "1")
         self.assertIn("PATH", env)
+
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_limit_survives_candidate_direct_exec(self):
+        self.cfg.evaluator.memory_mb = 64
+        python = json.dumps(sys.executable)
+        script = json.dumps(
+            "import mmap,time\n"
+            "size=256*1024*1024\n"
+            "memory=mmap.mmap(-1,size)\n"
+            "for i in range(0,size,4096): memory[i]=1\n"
+            "time.sleep(10)\n"
+        )
+        source = self.source(
+            "#include <unistd.h>\n"
+            "extern char **environ;\n"
+            f"double f(void) {{ char *const args[] = {{{python}, \"-c\", {script}, NULL}};\n"
+            f"    execve({python}, args, environ);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        ok, library, log = compile_candidate(self.cfg, source, self.root / "exec-rss", "final")
+        self.assertTrue(ok, log)
+        pool = self.pool()
+        result = pool.score(library, 10)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("worker resident-set limit exceeded", result["msg"])
+        self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
+    def test_rss_query_failure_aborts_live_worker(self):
+        self.cfg.evaluator.memory_mb = 64
+        should_fail = False
+        failed_once = False
+
+        def resident_bytes(pid):
+            nonlocal failed_once
+            if should_fail and pid != os.getpid() and not failed_once:
+                failed_once = True
+                raise OSError("simulated proc_pidinfo failure")
+            return 0
+
+        with patch("engine.funsearch.workers.process_resident_bytes", side_effect=resident_bytes):
+            pool = self.pool()
+            should_fail = True
+            result = pool.score(self.candidate("loop"), 5)
+            self.assertTrue(failed_once)
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("worker resident-set query failed: simulated proc_pidinfo failure",
+                          result["msg"])
+            self.assertEqual(pool.score(self.candidate("good"), 5)["score"], 3.5)
 
     def test_startup_failures_include_evaluator_stderr(self):
         init = self.source("#!/bin/sh\necho 'julia: no depot' >&2\nexit 3\n", "init-fail")
@@ -585,6 +1344,8 @@ double f(void) {
                 with self.assertRaisesRegex(WorkerError, "after 3 attempts.*startup timeout"):
                     self.pool()
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "Darwin RSS fallback disables subprocess creation in workers")
     def test_timeout_kills_process_group(self):
         marker = self.root / "child-pid"
         source = self.source('''#include <unistd.h>
