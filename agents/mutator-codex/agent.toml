@@ -11,4 +11,6 @@ idle_timeout = "30m"
 pre_start = ["sh '{{.ConfigDir}}/scripts/fs-python' '{{.ConfigDir}}/scripts/codex_mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
 prompt_mode = "none"
 lifecycle = "one_shot"
-process_names = ["codex"]
+# codex_mutator_launch.py runs a "funsearch-codex-launch" marker during its
+# preflight, before it execs codex; see LIVENESS_MARKER there.
+process_names = ["codex", "funsearch-codex-launch"]

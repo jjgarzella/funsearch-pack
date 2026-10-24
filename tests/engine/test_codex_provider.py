@@ -63,7 +63,8 @@ class CodexProviderTests(unittest.TestCase):
         self.assertEqual(agent["provider"], "funsearch-codex")
         self.assertNotIn("start_command", agent)
         self.assertEqual(agent["prompt_mode"], "none")
-        self.assertEqual(agent["process_names"], ["codex"])
+        from scripts.codex_mutator_launch import LIVENESS_MARKER
+        self.assertEqual(agent["process_names"], ["codex", LIVENESS_MARKER])
         self.assertEqual(agent["lifecycle"], "one_shot")
 
 

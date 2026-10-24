@@ -221,6 +221,20 @@ evaluated, and the effect is limited to that model's own task. CLI 0.164 has no
 switch found to disable parallel tool calls, so the prompt tells the model to
 make one tool call at a time and wait for the patch result before try/submit.
 
+### Session liveness during preflight
+
+Gas City starts a `one_shot` session and commits it `active` as soon as its
+tmux pane exists, without waiting for the agent process. Each reconciler tick
+then requires a process in the pane tree whose command or `argv[0]` basename
+is in the agent's `process_names`; otherwise it marks the session `asleep`
+(`runtime-missing`), and the model's first `gc hook --claim` is refused as a
+stale session. The launcher's preflight takes about 15 s before it execs
+`codex`, so in smoke attempt 6 two of four sessions were refused this way.
+The launcher therefore runs a sleeping child whose `argv[0]` is
+`funsearch-codex-launch` (listed in `process_names`) from its first line until
+just before the exec, and kills it on every other exit. The child has no
+other function and lives at most 300 s.
+
 ## Known limitations and smoke requirements
 
 This implementation combines a host-native OS sandbox with a task/tool policy;

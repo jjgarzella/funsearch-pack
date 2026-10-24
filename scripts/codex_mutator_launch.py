@@ -18,6 +18,13 @@ from scripts.codex_mutator_setup import PERMISSION_PROFILE, hooks_document, sand
 
 
 TESTED_CODEX_VERSION = "codex-cli 0.164.0"
+# Gas City commits a one_shot session active as soon as its pane exists and
+# then requires a process_names match in the pane. Until the exec below there
+# is no codex process, so a reconciler tick during preflight marks the session
+# asleep (runtime-missing) and the model's claim is refused as stale. This
+# sleeping child carries the agent's other process name until the exec.
+LIVENESS_MARKER = "funsearch-codex-launch"
+MARKER_LIFETIME = 300
 
 
 DISABLED = ("unified_exec", "shell_snapshot", "apps", "plugins", "multi_agent",
@@ -236,7 +243,26 @@ def verify_code_mode_host(env):
         raise ValueError(f"Codex code-mode host is missing: {host}; the model would have no working tool")
 
 
+def start_liveness_marker():
+    return subprocess.Popen([LIVENESS_MARKER, str(MARKER_LIFETIME)], executable=shutil.which("sleep"),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_liveness_marker(marker):
+    if marker.poll() is None:
+        marker.kill()
+        marker.wait()
+
+
 def launch(home, pack):
+    marker = start_liveness_marker()
+    try:
+        return launch_codex(home, pack, marker)
+    finally:
+        stop_liveness_marker(marker)
+
+
+def launch_codex(home, pack, marker):
     home, pack = Path(home).resolve(), Path(pack).resolve()
     backend = sandbox_backend()
     # Resolve the shared login before replacing CODEX_HOME with our private home.
@@ -292,6 +318,7 @@ def launch(home, pack):
         if backend == "linux":
             command.extend(["-s", "workspace-write"])
         command.extend(["-C", str(home), "exec", "--skip-git-repo-check", "-m", model, prompt])
+        stop_liveness_marker(marker)
         os.execvpe(command[0], command, env)
     except Exception as error:
         release_after_refusal(bead, error)

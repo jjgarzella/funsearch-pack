@@ -245,6 +245,19 @@ class CodexGuardTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_effective(modified, self.home, backend="seatbelt")
 
+    def test_liveness_marker_matches_gas_city_process_name_rules(self):
+        # Gas City matches the basename of argv[0] from `ps -o args`.
+        from scripts.codex_mutator_launch import LIVENESS_MARKER, start_liveness_marker, stop_liveness_marker
+        marker = start_liveness_marker()
+        try:
+            args = subprocess.run(["ps", "-p", str(marker.pid), "-o", "args="], capture_output=True,
+                                  text=True, check=True).stdout.split()
+            self.assertEqual(Path(args[0]).name, LIVENESS_MARKER)
+        finally:
+            stop_liveness_marker(marker)
+        self.assertIsNotNone(marker.poll())
+        stop_liveness_marker(marker)
+
     def test_launcher_uses_claimed_slot_model_and_fixed_native_options(self):
         self.check_launcher("workspace-write", "seatbelt")
 
@@ -267,7 +280,14 @@ class CodexGuardTests(unittest.TestCase):
         self.assertEqual(len(hooks), 1)
         self.assertEqual(hooks[0]["matcher"], "*")
         self.assertIn("scripts/codex_mutator_guard.py", hooks[0]["hooks"][0]["command"])
-        with patch("scripts.codex_mutator_launch.sandbox_backend", return_value=backend), \
+        from scripts.codex_mutator_launch import LIVENESS_MARKER, start_liveness_marker
+        markers, alive_at_exec = [], []
+
+        def spawn():
+            markers.append(start_liveness_marker())
+            return markers[-1]
+        with patch("scripts.codex_mutator_launch.start_liveness_marker", side_effect=spawn), \
+                patch("scripts.codex_mutator_launch.sandbox_backend", return_value=backend), \
                 patch("scripts.codex_mutator_launch.read_effective", return_value=config) as effective, \
                 patch("scripts.codex_mutator_launch.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.164.0\n")) as run, \
                 patch("scripts.gc_lifecycle.gc") as gc, \
@@ -275,7 +295,11 @@ class CodexGuardTests(unittest.TestCase):
                 patch("scripts.codex_mutator_launch.os.chdir"):
             gc.side_effect = [json.dumps({"action": "work", "bead_id": "fs-slot.1"}),
                               json.dumps({"id": "fs-slot.1", "metadata": {"fs.provider": "codex", "opt_model": "custom-model"}})]
+            execute.side_effect = lambda *args: alive_at_exec.append(markers[-1].poll() is None)
             launch(self.home, PACK)
+            self.assertEqual(markers[-1].args[0], LIVENESS_MARKER)
+            # The marker must be gone before codex replaces the launcher.
+            self.assertEqual(alive_at_exec, [False])
             self.assertEqual(gc.call_args_list[0].args, ("hook", "--claim", "--drain-ack", "--json"))
             argv, env = execute.call_args.args[1:]
             self.assertEqual(argv[argv.index("-m") + 1], "custom-model")
@@ -302,6 +326,7 @@ class CodexGuardTests(unittest.TestCase):
             gc.side_effect = [json.dumps({"action": "drain"})]
             self.assertEqual(launch(self.home, PACK), 0)
             execute.assert_not_called()
+            self.assertIsNotNone(markers[-1].poll())
         for feature in DISABLED:
             modified = dict(config, features=dict(config["features"], **{feature: True}))
             with self.subTest(feature=feature), self.assertRaises(ValueError):
