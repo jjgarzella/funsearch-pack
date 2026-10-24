@@ -203,6 +203,8 @@ class Worker:
         self._rss_watchdog_active = self._rss_limit_bytes is not None
         self._rss_watchdog_stop = False
         self._rss_watchdog_error = None
+        self._pool_termination_lock = threading.Lock()
+        self._pool_termination_reason = None
         self._rss_watchdog_thread = None
         if self._rss_limit_bytes is not None:
             try:
@@ -225,6 +227,20 @@ class Worker:
         with self._rss_watchdog_condition:
             self._rss_watchdog_active = active
             self._rss_watchdog_condition.notify_all()
+
+    def _pool_termination_guard(self):
+        lock = getattr(self, "_pool_termination_lock", None)
+        if lock is None:  # Worker.__new__ test doubles need no shared state.
+            lock = threading.Lock()
+            self._pool_termination_lock = lock
+        return lock
+
+    def _record_pool_termination(self, reason):
+        """Keep the first reason the pool chose to terminate this worker."""
+        with self._pool_termination_guard():
+            if self._pool_termination_reason is None:
+                self._pool_termination_reason = reason
+            return self._pool_termination_reason
 
     def _stop_rss_watchdog(self):
         thread = self._rss_watchdog_thread
@@ -279,6 +295,7 @@ class Worker:
                 if self._rss_watchdog_stop:
                     return
                 self._rss_watchdog_error = failure
+                self._record_pool_termination(failure)
             try:
                 kill_group(process)
             except OSError:
@@ -346,6 +363,9 @@ class Worker:
         return code, bool(self._buffer)
 
     def _exit_message(self, code):
+        termination_reason = getattr(self, "_pool_termination_reason", None)
+        if termination_reason is not None:
+            return termination_reason
         watchdog_error = self._rss_watchdog_error
         if watchdog_error and watchdog_error.startswith("worker resident-set limit exceeded"):
             return watchdog_error
@@ -497,10 +517,12 @@ class Worker:
                 raise WorkerError("worker is closed")
             if self._failure is not None:
                 raise self._failure
-            # Clear the previous request's result before waking the watchdog.
-            # Otherwise a fast query failure can set this field just before
-            # _score_locked clears it, losing the failure and timing out.
+            # Clear the previous request's watchdog result before waking the
+            # monitor. Otherwise a fast query failure can set this field just
+            # before _score_locked clears it, losing the failure and timing out.
             self._rss_watchdog_error = None
+            with self._pool_termination_guard():
+                self._pool_termination_reason = None
             self._set_rss_watchdog_active(True)
             try:
                 return self._score_locked(path, timeout_s)
@@ -535,7 +557,11 @@ class Worker:
                 elif exit_code is not None:
                     result = _error(self._exit_message(exit_code))
                 else:
-                    result = _error(self._rss_watchdog_error or f"timeout after {timeout_s:g}s")
+                    reason = self._pool_termination_reason or self._rss_watchdog_error
+                    if reason is None:
+                        reason = f"timeout after {timeout_s:g}s"
+                    reason = self._record_pool_termination(reason)
+                    result = _error(reason)
         except (EOFError, BrokenPipeError):
             try:
                 exit_code, pending = self._exit_snapshot()

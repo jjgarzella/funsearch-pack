@@ -142,6 +142,61 @@ class ProcessGroupTests(unittest.TestCase):
 
 
 class WorkerWatchdogTests(unittest.TestCase):
+    def test_pool_initiated_watchdog_kill_reports_query_failure(self):
+        worker = Worker.__new__(Worker)
+
+        class StopAfterKill:
+            def __init__(self):
+                self.waits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def wait(self, timeout):
+                self.waits += 1
+                if self.waits > 1:
+                    worker._rss_watchdog_stop = True
+
+            def notify_all(self):
+                pass
+
+        class Process:
+            pid = 123
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        condition = StopAfterKill()
+        process = Process()
+        worker._rss_watchdog_condition = condition
+        worker._rss_watchdog_active = True
+        worker._rss_watchdog_stop = False
+        worker._rss_watchdog_error = None
+        worker._pool_termination_reason = None
+        worker._rss_limit_bytes = 1024
+        worker.process = process
+
+        def kill_worker(killed_process):
+            self.assertIs(killed_process, process)
+            process.returncode = -signal.SIGKILL
+
+        failure = "worker resident-set query failed: simulated proc_pidinfo failure"
+        with patch("engine.funsearch.workers.process_resident_bytes",
+                   side_effect=OSError("simulated proc_pidinfo failure")), \
+                patch("engine.funsearch.workers.kill_group", side_effect=kill_worker) as kill_group:
+            worker._watch_worker_rss()
+
+        self.assertEqual(condition.waits, 2)
+        kill_group.assert_called_once_with(process)
+        self.assertEqual(worker._pool_termination_reason, failure)
+        self.assertEqual(worker._exit_message(-signal.SIGKILL), failure)
+
     def test_esrch_after_worker_exit_stops_watchdog_without_query_error(self):
         worker = Worker.__new__(Worker)
 
