@@ -289,7 +289,7 @@ def failed_summary(root, metadata):
     # The engine recovers authoritative counters and best.c from the live
     # database or its newest readable snapshot. Without either, keep what
     # the previous summary knew and mark the run failed.
-    result = subprocess.run([str(PACK / "bin" / "funsearch"), "run", "recover", str(root)],
+    result = subprocess.run([sys.executable, str(PACK / "bin" / "funsearch"), "run", "recover", str(root)],
                             capture_output=True, text=True, timeout=300)
     if result.returncode == 0:
         return
@@ -361,7 +361,7 @@ def launch(args):
         raise ValueError("notify is required; Gas City exports no reliable slinger recipient")
     env = os.environ.copy()
     env["FS_NOTIFY"] = args.notify
-    command = [str(PACK / "bin" / "funsearch"), "run", "start", args.problem]
+    command = [sys.executable, str(PACK / "bin" / "funsearch"), "run", "start", args.problem]
     if args.instance:
         command += ["--instance", args.instance]
     for override in shlex.split(args.overrides):

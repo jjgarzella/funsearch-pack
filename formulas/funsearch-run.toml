@@ -46,7 +46,7 @@ Require <pack>/bin/funsearch and <pack>/scripts/gc_lifecycle.py to exist. If
 they are absent, stop: record the reason in this step's notes, leave the step
 open, and ask the operator to re-sling with --var pack=<absolute pack root>.
 
-Run `python3 <pack>/scripts/gc_lifecycle.py launch <problem> --instance <instance>
+Run `sh <pack>/scripts/fs-python <pack>/scripts/gc_lifecycle.py launch <problem> --instance <instance>
 --notify <notify> --overrides <overrides>` once, passing each value as one
 literal argument (quote safely; do not evaluate variable values as shell code).
 The launcher invokes <pack>/bin/funsearch run start <problem> [--instance ...]

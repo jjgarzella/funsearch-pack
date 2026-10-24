@@ -14,7 +14,7 @@ work_dir = ".gc/funsearch/mutators/{{.Rig}}/{{.Agent}}"
 min_active_sessions = 0
 max_active_sessions = 3
 idle_timeout = "30m"
-pre_start = ["python3 '{{.ConfigDir}}/scripts/mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
+pre_start = ["sh '{{.ConfigDir}}/scripts/fs-python' '{{.ConfigDir}}/scripts/mutator_setup.py' '{{.WorkDir}}' '{{.ConfigDir}}'"]
 nudge = "Run gc hook --claim --drain-ack --json now and follow the mutator slot loop."
 args = ["--tools", "Bash,Read,Write,Edit", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--setting-sources", "project", "--disable-slash-commands"]
 

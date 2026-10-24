@@ -501,8 +501,10 @@ from scripts import gc_lifecycle as lifecycle
 original_run = lifecycle.subprocess.run
 recovery_bootstrap, engine_path = sys.argv[1:3]
 def observed_run(command, **kwargs):
-    if command[1:3] == ['run', 'recover']:
-        command = [sys.executable, '-c', recovery_bootstrap, engine_path, command[3], 'second', 'cli']
+    # The adapter runs bin/funsearch under its own interpreter.
+    args = command[1:] if command[:1] == [sys.executable] else command
+    if args[1:3] == ['run', 'recover']:
+        command = [sys.executable, '-c', recovery_bootstrap, engine_path, args[3], 'second', 'cli']
     return original_run(command, **kwargs)
 lifecycle.subprocess.run = observed_run
 sys.argv = ['gc_lifecycle.py', 'sweep']

@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$script_dir/gc_lifecycle.py" sweep-check "$@"
+exec sh "$script_dir/fs-python" "$script_dir/gc_lifecycle.py" sweep-check "$@"

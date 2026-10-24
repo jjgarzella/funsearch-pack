@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run a pack Python script with an interpreter that meets the pack's 3.11
+# minimum. A bare `python3` can resolve to an older system interpreter (macOS
+# /usr/bin/python3 is 3.9) when /usr/bin precedes other installations on PATH.
+# FS_PYTHON selects an explicit interpreter; otherwise the lowest supported
+# versioned python3.N on PATH is used (3.11 is the version the pack is gated
+# on), then python3, and anything older than 3.11 is refused rather than run.
+set -eu
+for candidate in "${FS_PYTHON:-}" python3.11 python3.12 python3.13 python3.14 python3; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+        exec "$candidate" "$@"
+    fi
+    if [ -n "${FS_PYTHON:-}" ] && [ "$candidate" = "$FS_PYTHON" ]; then
+        echo "fs-python: FS_PYTHON=$FS_PYTHON is not Python >= 3.11" >&2
+        exit 127
+    fi
+done
+echo "fs-python: no Python >= 3.11 found on PATH; set FS_PYTHON" >&2
+exit 127
