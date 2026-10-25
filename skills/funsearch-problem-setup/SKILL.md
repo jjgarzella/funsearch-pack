@@ -219,7 +219,7 @@ Choose these settings deliberately:
 | `stop.duration_s` | Maximum run duration in seconds. |
 | `stop.max_children` | Maximum number of scored submitted children. |
 | `stop.plateau_children` | Stop after this many children without improvement; `0` disables this condition. |
-| `mutator.provider` | `claude` (default) or `codex`; Codex requires the documented operator acknowledgment. |
+| `mutator.provider` | `claude` (default) or `codex`; before choosing Codex, the operator reviews the native-sandbox and trusted-local-evaluator limits in `docs/codex-mutator.md`; there is no acknowledgment variable or non-native fallback. |
 | `mutator.model` | Candidate author's model; select a model available in your city. |
 
 Duration and child limits are positive; whichever enabled stop condition is
