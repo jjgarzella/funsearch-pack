@@ -6,6 +6,13 @@ the engine's public surface: bin/funsearch verbs, and the Database class that
 owns the run schema. bin/funsearch hands its `slot` verb to slot_main here.
 """
 
+import os
+import sys
+
+if sys.version_info < (3, 11):
+    pin = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fs-python")
+    os.execv("/bin/sh", ["/bin/sh", pin, sys.argv[0], *sys.argv[1:]])
+
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -15,7 +22,6 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-import sys
 import time
 import tomllib
 

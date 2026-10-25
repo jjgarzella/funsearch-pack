@@ -79,6 +79,32 @@ class PythonPinTests(unittest.TestCase):
         formula = (PACK / "formulas" / "funsearch-run.toml").read_text()
         self.assertIn("sh <pack>/scripts/fs-python <pack>/scripts/gc_lifecycle.py launch", formula)
 
+    def test_direct_entry_points_reexec_from_old_macos_python(self):
+        if sys.platform != "darwin" or not Path("/usr/bin/python3").is_file():
+            self.skipTest("requires macOS system Python")
+        version = subprocess.run(
+            ["/usr/bin/python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=5)
+        if version.returncode or tuple(map(int, version.stdout.strip().split("."))) >= (3, 11):
+            self.skipTest("system Python is already >= 3.11")
+
+        interpreter_dir = Path(sys.executable).resolve().parent
+        if not (interpreter_dir / "python3.11").is_file():
+            self.skipTest("no python3.11 next to the test interpreter")
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "python3").symlink_to("/usr/bin/python3")
+            env = {"PATH": os.pathsep.join((directory, str(interpreter_dir), "/usr/bin", "/bin")),
+                   "HOME": os.environ.get("HOME", "/tmp"), "LANG": "C"}
+            results = [
+                subprocess.run([str(PACK / "bin/funsearch"), "--help"], cwd=PACK,
+                               env=env, capture_output=True, text=True, timeout=15),
+                subprocess.run(["/usr/bin/python3", str(PACK / "scripts/gc_lifecycle.py"), "--help"],
+                               cwd=PACK, env=env, capture_output=True, text=True, timeout=15),
+            ]
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage:", result.stdout.lower())
+
     def test_claude_guard_runs_under_the_setup_interpreter(self):
         with tempfile.TemporaryDirectory() as directory:
             setup(directory, PACK)

@@ -101,6 +101,10 @@ selects the correct rig even from another cwd. Direct hook launches require
 
 The engine needs Python 3.11 or later, a C compiler, the ASan runtime,
 `make`, and `flock`; its Python modules use only the standard library.
+Direct `bin/funsearch` and `scripts/gc_lifecycle.py` launches re-exec under
+Python 3.11 or later when `/usr/bin/env python3` selects an older interpreter.
+Set `FS_PYTHON` to choose an explicit supported interpreter; otherwise the
+entry points search for `python3.11` through `python3.14`, then `python3`.
 Every run initializes an ASan trial pool, even if no `try` calls are planned.
 Check that the compiler can locate the platform's ASan runtime:
 
@@ -356,6 +360,11 @@ Best-effort hygiene for trusted local experiments:
   gets an allowlisted environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
   `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`,
   plus the patterns in the problem's `evaluator.env`.
+  On macOS, a launcher can set `FS_DYLD_LIBRARY_PATH` to carry a library path
+  across `/bin/sh` or `/usr/bin/env` hops. If `DYLD_LIBRARY_PATH` is named in
+  `evaluator.env` and the worker has no explicit `DYLD_LIBRARY_PATH`, the
+  engine maps the carrier to it at worker creation. The carrier itself is not
+  passed to workers unless `evaluator.env` explicitly allows it.
   Gas City identity, store scope, agent sockets and credentials are not passed
   on unless a pattern names them.
 - On macOS, the worker uses a Mach resident-set watchdog when `RLIMIT_AS` fails

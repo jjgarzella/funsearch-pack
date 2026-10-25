@@ -40,9 +40,12 @@ for sanitizer trials because ASan reserves a large shadow mapping; final
 scoring retains the configured 4096 MB limit.
 
 On macOS, ASan trial workers also need Julia's bundled JLL libraries on the
-dynamic library search path. Set `DYLD_LIBRARY_PATH` to the `julia` subdirectory
-under `Base.LIBDIR` and keep `DYLD_LIBRARY_PATH` in `evaluator.env`; the test
-runner sets this path automatically.
+dynamic library search path. Set `FS_DYLD_LIBRARY_PATH` to the `julia`
+subdirectory under `Base.LIBDIR` and keep `DYLD_LIBRARY_PATH` in
+`evaluator.env`. macOS strips `DYLD_*` variables when a process crosses a
+protected shell or shebang launcher; FunSearch maps this carrier to
+`DYLD_LIBRARY_PATH` only in the worker environment. The test runner sets the
+carrier automatically.
 
 To save and independently check every verified cap during a run, set the
 dump directory before starting it (the engine and workers must inherit it;
