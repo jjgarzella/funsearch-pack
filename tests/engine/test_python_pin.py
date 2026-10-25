@@ -89,8 +89,11 @@ class PythonPinTests(unittest.TestCase):
             self.skipTest("system Python is already >= 3.11")
 
         interpreter_dir = Path(sys.executable).resolve().parent
-        if not (interpreter_dir / "python3.11").is_file():
-            self.skipTest("no python3.11 next to the test interpreter")
+        versioned_interpreters = tuple(
+            interpreter_dir / f"python3.{minor}" for minor in range(11, 15)
+        )
+        if not any(interpreter.is_file() for interpreter in versioned_interpreters):
+            self.skipTest("no Python 3.11-3.14 next to the test interpreter")
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "python3").symlink_to("/usr/bin/python3")
             env = {"PATH": os.pathsep.join((directory, str(interpreter_dir), "/usr/bin", "/bin")),
