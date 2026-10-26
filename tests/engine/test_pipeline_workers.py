@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from engine.funsearch._process import kill_group
+from engine.funsearch._process import kill_group, worker_environment
 from engine.funsearch.compile import compile_candidate, try_worker_env
 from engine.funsearch.workers import (
     RECYCLE_SCORES, STDERR_LIMIT_BYTES, STDERR_TAIL_BYTES, EvaluatorInitError, Worker,
@@ -1257,6 +1257,72 @@ double f(void) {
         self.assertLessEqual(public.items(), env.items())
         self.assertEqual(env["KEEP_ME"], "1")
         self.assertIn("PATH", env)
+
+    def test_dyld_carrier_mapping_rules(self):
+        with patch("engine.funsearch._process.sys.platform", "darwin"), \
+                patch.dict(os.environ, {"PATH": "/bin", "FS_DYLD_LIBRARY_PATH": "/carrier"},
+                           clear=True):
+            self.cfg.evaluator.env = ["DYLD_LIBRARY_PATH"]
+            env = worker_environment(self.cfg)
+            self.assertEqual(env["DYLD_LIBRARY_PATH"], "/carrier")
+            self.assertNotIn("FS_DYLD_LIBRARY_PATH", env)
+
+            os.environ["DYLD_LIBRARY_PATH"] = "/explicit"
+            env = worker_environment(self.cfg)
+            self.assertEqual(env["DYLD_LIBRARY_PATH"], "/explicit")
+
+            del os.environ["DYLD_LIBRARY_PATH"]
+            env = worker_environment(self.cfg, {"DYLD_LIBRARY_PATH": "/overlay"})
+            self.assertEqual(env["DYLD_LIBRARY_PATH"], "/overlay")
+
+            self.cfg.evaluator.env = []
+            env = worker_environment(self.cfg)
+            self.assertNotIn("DYLD_LIBRARY_PATH", env)
+            self.assertNotIn("FS_DYLD_LIBRARY_PATH", env)
+
+            self.cfg.evaluator.env = ["DYLD_LIBRARY_PATH", "FS_DYLD_LIBRARY_PATH"]
+            env = worker_environment(self.cfg)
+            self.assertEqual(env["DYLD_LIBRARY_PATH"], "/carrier")
+            self.assertEqual(env["FS_DYLD_LIBRARY_PATH"], "/carrier")
+
+        with patch("engine.funsearch._process.sys.platform", "linux"), \
+                patch.dict(os.environ, {"PATH": "/bin", "FS_DYLD_LIBRARY_PATH": "/carrier"},
+                           clear=True):
+            self.cfg.evaluator.env = ["DYLD_LIBRARY_PATH"]
+            env = worker_environment(self.cfg)
+        self.assertNotIn("DYLD_LIBRARY_PATH", env)
+        self.assertNotIn("FS_DYLD_LIBRARY_PATH", env)
+
+    @unittest.skipUnless(sys.platform == "darwin", "SIP strips DYLD variables across /bin/sh")
+    def test_try_worker_receives_dyld_carrier_across_shell_hop(self):
+        import shlex
+
+        evaluator = self.evaluator()
+        code = "\n".join((
+            "import json, sys",
+            "from engine.funsearch.compile import try_worker_env",
+            "from engine.funsearch.config import Config",
+            "from engine.funsearch.workers import WorkerPool",
+            "cfg = Config()",
+            "cfg.evaluator.env = ['DYLD_LIBRARY_PATH']",
+            "pool = WorkerPool(cfg, sys.argv[1], 'n=1', 1, try_worker_env(cfg))",
+            "try:",
+            "    env = pool.workers[0].env",
+            "    print(json.dumps({key: env[key] for key in",
+            "          ('DYLD_LIBRARY_PATH', 'FS_DYLD_LIBRARY_PATH') if key in env}))",
+            "finally:",
+            "    pool.close()",
+        ))
+        launcher_env = os.environ.copy()
+        launcher_env.pop("DYLD_LIBRARY_PATH", None)
+        launcher_env["FS_DYLD_LIBRARY_PATH"] = "/launcher/julia/lib"
+        shell_command = "exec " + shlex.join([sys.executable, "-c", code, str(evaluator)])
+        result = subprocess.run(["/bin/sh", "-c", shell_command], cwd=ROOT,
+                                env=launcher_env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worker_env = json.loads(result.stdout)
+        self.assertEqual(worker_env["DYLD_LIBRARY_PATH"], "/launcher/julia/lib")
+        self.assertNotIn("FS_DYLD_LIBRARY_PATH", worker_env)
 
     @unittest.skipUnless(sys.platform == "darwin", "external RSS monitoring is macOS-only")
     def test_rss_limit_survives_candidate_direct_exec(self):

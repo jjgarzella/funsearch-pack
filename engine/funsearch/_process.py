@@ -106,8 +106,26 @@ def worker_environment(cfg, extra_env=None):
     all use it, so constructors see what the worker will. extra_env is a
     mode overlay such as try_worker_env(cfg); None values remove variables.
     """
-    return candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **(extra_env or {})},
+    overlay = extra_env or {}
+    env = candidate_environment({"FS_MEMORY_MB": str(cfg.evaluator.memory_mb), **overlay},
                                  cfg.evaluator.env)
+    passthrough = cfg.evaluator.env
+    dyld_allowed = any(fnmatchcase("DYLD_LIBRARY_PATH", pattern) for pattern in passthrough)
+    carrier_allowed = any(fnmatchcase("FS_DYLD_LIBRARY_PATH", pattern) for pattern in passthrough)
+
+    # SIP removes DYLD_* variables when a process crosses protected executables
+    # such as /bin/sh and /usr/bin/env. FS_DYLD_LIBRARY_PATH survives those
+    # hops; translate it only at the final worker-environment boundary, and
+    # only for problems that explicitly allow DYLD_LIBRARY_PATH.
+    if not carrier_allowed:
+        env.pop("FS_DYLD_LIBRARY_PATH", None)
+    if (sys.platform == "darwin" and dyld_allowed
+            and "DYLD_LIBRARY_PATH" not in os.environ
+            and "DYLD_LIBRARY_PATH" not in overlay):
+        carrier = overlay.get("FS_DYLD_LIBRARY_PATH", os.environ.get("FS_DYLD_LIBRARY_PATH"))
+        if carrier is not None:
+            env["DYLD_LIBRARY_PATH"] = str(carrier)
+    return env
 
 
 def _darwin_group_has_live_members(pgid):

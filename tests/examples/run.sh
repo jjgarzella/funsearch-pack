@@ -6,11 +6,13 @@ make -C examples/cap-set/evaluator
 if [ "$(uname -s)" = Darwin ]; then
     JULIA_BIN=${JULIA:-julia}
     julia_lib=$("$JULIA_BIN" --startup-file=no -e 'print(abspath(Sys.BINDIR, Base.LIBDIR))')
-    if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
-        export DYLD_LIBRARY_PATH="$julia_lib/julia:$DYLD_LIBRARY_PATH"
+    loader_path=${FS_DYLD_LIBRARY_PATH:-${DYLD_LIBRARY_PATH:-}}
+    if [ -n "$loader_path" ]; then
+        export FS_DYLD_LIBRARY_PATH="$julia_lib/julia:$loader_path"
     else
-        export DYLD_LIBRARY_PATH="$julia_lib/julia"
+        export FS_DYLD_LIBRARY_PATH="$julia_lib/julia"
     fi
+    export DYLD_LIBRARY_PATH="$FS_DYLD_LIBRARY_PATH"
 fi
 mkdir -p build/examples
 shared_ldflags=

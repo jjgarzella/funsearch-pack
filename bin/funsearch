@@ -4,8 +4,16 @@
 `funsearch slot ...` is the Gas City mutator slot lifecycle. It lives in the
 pack's integration layer (scripts/gc_lifecycle.py), not in the engine.
 """
-from pathlib import Path
+import os
 import sys
+
+if sys.version_info < (3, 11):
+    pack = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    pin = os.path.join(pack, "scripts", "fs-python")
+    os.execv("/bin/sh", ["/bin/sh", pin, sys.argv[0], *sys.argv[1:]])
+
+from pathlib import Path
+
 PACK = Path(__file__).resolve().parents[1]
 if sys.argv[1:2] == ["slot"]:
     sys.path.insert(0, str(PACK / "scripts"))
