@@ -66,7 +66,9 @@ left it pointing at the shared file; the shared file's modification time did
 not change, so the session did not exercise refresh. Strings and this session
 do not establish whether refresh writes through the symlink in place or
 replaces it (for example, with a temporary file and rename), nor the exact
-scope of the home-symlink setting. The private home itself remains a real
+scope of the home-symlink setting. The 2026-10-24 live sessions (limitation
+4) also left the link and shared file unchanged, so they did not exercise
+refresh either. The private home itself remains a real
 directory; only `auth.json` is linked. Before production, the separate smoke
 test must verify the link and shared login after a mutator session that
 exercises refresh. Unit/config tests do not establish this. There is no
@@ -276,12 +278,15 @@ are:
    tamper with guard state or settings. The engine's lint/env/reply hygiene is
    unchanged; untrusted/adversarial candidates are unsupported. Broader
    evaluator isolation remains backlog `mc-v8f3.5`.
-4. Real CLI probes verified the 0.164 Seatbelt command path, but native hook
-   loading and a live model session remain unverified. The separate
-   resource-window smoke test must verify claim, read, local patch, try/submit,
-   retirement and drain, plus deliberate denied calls and no inherited tools.
-   Do not infer live acceptance from unit tests, containment probes or a config
-   preflight.
+4. Live sessions on Darwin arm64 (2026-10-24, `codex-cli 0.164.0`,
+   `gpt-6-luna`, native Seatbelt: smoke attempts 7-8 and the first one-hour
+   run) loaded the native hook and completed claim, read, local patch,
+   try/submit, retirement and drain, with live guard denials and no
+   unsupported-hook warning. They did not exercise login refresh, so refresh
+   through the `auth.json` symlink remains unverified (see above); a
+   successful session is not refresh evidence. Repeat the live smoke after a
+   CLI, hook or policy change. Do not infer live acceptance from unit tests,
+   containment probes or a config preflight.
 
 No acknowledgment variable or no-native-sandbox fallback is part of this
 policy. Changing the policy or CLI semantics requires review. Do not enable the

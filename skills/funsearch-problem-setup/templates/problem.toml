@@ -36,5 +36,5 @@ max_children = 100               # Positive limit on scored submitted children.
 plateau_children = 0             # 0 disables stopping on lack of improvement.
 
 [mutator]
-provider = "claude"              # "codex" requires operator sign-off; see docs/codex-mutator.md.
+provider = "claude"              # "codex": review limits in docs/codex-mutator.md first.
 model = "claude-haiku-4-5-20251001" # Choose a model available in your city.
